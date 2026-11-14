@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 构建产物：发布时放 GitHub Releases，不进仓库
+dist/
+build/
+*.spec
+
+# 运行时日志（正常不在这台机器上，防手滑）
+*.log
+
+# 编辑器 / 系统杂物
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
