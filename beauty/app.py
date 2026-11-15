@@ -146,7 +146,8 @@ class Controller(QObject):
         for box in list(self.store.boxes):
             self._spawn(box)
 
-        self.toast = Toast()
+        # 和卡片同一套玻璃浓度（默认 212），换主题时一起跟着变
+        self.toast = Toast(alpha=int(getattr(self.cfg, "glass_alpha", 212) or 212))
         # 任务栏上的入口（如果启用了）：自己画的那颗按钮
         self.button = None
         # 任务栏改成固定策略（面板里不再暴露开关）：
@@ -1407,6 +1408,8 @@ class Controller(QObject):
                 win.update()
             except (RuntimeError, TypeError):
                 continue
+        # 提示条跟卡片同一个浓度（它自己不是卡片，单独更新一次）
+        self.toast.glass_alpha = max(150, min(255, int(preset["card_alpha"])))
         _log(f"style preset: {preset['id']}")
 
     def apply_box_style(self) -> None:

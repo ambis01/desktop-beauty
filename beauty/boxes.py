@@ -39,8 +39,11 @@ def _log(msg: str, *args) -> None:
         pass
 
 
-def _protected_dirs() -> set[Path]:
-    """绝对不能整个搬进盒子的目录：桌面本身、用户目录。"""
+def _exact_protected() -> set[Path]:
+    """本身不能搬走的目录（但**里面**的子目录随便）。
+
+    桌面目录本身拖走等于把整个桌面搬进 AppData；用户目录同理。
+    """
     out: set[Path] = set()
     try:
         for d in di.desktop_dirs():
@@ -49,6 +52,26 @@ def _protected_dirs() -> set[Path]:
     except OSError:
         pass
     return out
+
+
+def _system_roots() -> list[Path]:
+    """连**里面**都不许碰的系统目录：Windows / Program Files / ProgramData。"""
+    out: list[Path] = []
+    for env_name in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
+        value = os.environ.get(env_name)
+        if value:
+            try:
+                out.append(Path(value).resolve())
+            except OSError:
+                pass
+    return out
+
+
+def _in_system_dir(path: Path) -> bool:
+    for root in _system_roots():
+        if path == root or root in path.parents:
+            return True
+    return False
 
 
 def _same_volume(a: Path, b: Path) -> bool:
@@ -121,9 +144,8 @@ def _acceptable(src: Path) -> bool:
     以前这里只放行 `.lnk` / `.url`（后来又放开到所有文件）。现在文件夹也收，
     但有几条硬保护 —— 文件夹挪走之后不好收拾，而且跨卷拷贝会卡死界面：
 
-    - 文件夹只收**桌面上的**（桌面目录或它下面的子目录），以及盒子里的那些
-      （盒子之间互相搬是正常操作）。从资源管理器随便拖一个 `C:/Windows/...` 不行
-    - 盘符根、桌面本身、用户目录：不收
+    - 文件夹哪儿的都行（桌面、D:/F: 的资源管理器窗口…），但下面这些不收
+    - 盘符根、桌面本身、用户目录、系统目录（Windows / Program Files / ProgramData）：不收
     - 别的卷上的东西：**只收 ≤ 256 MB 的**（同卷是 rename，跨卷是整棵拷贝）
     - `DATA_DIR` 内部（盒子目录除外）、以及 `DATA_DIR` 的**祖先**：不收
       （后者等于把装有数据的目录搬进它自己）
@@ -148,17 +170,15 @@ def _acceptable(src: Path) -> bool:
                 return False
         elif resolved in data.parents:
             return False
-        box_root = BOX_ROOT.resolve()
-        in_box = box_root in resolved.parents
         if is_dir:
             if resolved.parent == resolved:
                 return False      # 盘符根
-            if resolved in _protected_dirs():
-                return False
-            if not in_box and not _on_desktop(resolved):
-                return False      # 只收桌面上的文件夹
+            if resolved in _exact_protected():
+                return False      # 桌面本身 / 用户目录
+            if _in_system_dir(resolved):
+                return False      # Windows / Program Files / ProgramData 里的一律不收
         if not _same_volume(resolved, data) and not _size_within(resolved, CROSS_VOLUME_MAX):
-            return False          # 跨卷只收小的
+            return False          # 别的卷上只收小的（同卷 rename，多大都行）
         return True
     except OSError:
         return False

@@ -12,11 +12,18 @@ from .glass import GlassWindow
 
 
 class Toast(GlassWindow):
-    def __init__(self):
+    """和卡片同一套外观：浅色玻璃（`dark=False`）+ 卡片玻璃浓度，深色文字。
+
+    以前是深色玻璃（`dark=True`、alpha 232、白字）——在浅色壁纸/桌面上就是一个
+    突兀的黑框，用户嫌丑。
+    """
+
+    def __init__(self, alpha: int = 212):
         flags = (Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint
                  | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
-        super().__init__(None, flags, radius=14, activate=False, dark=True)
-        self.glass_alpha = 232
+        super().__init__(None, flags, radius=14, activate=False, dark=False)
+        self.glass_alpha = int(max(150, min(255, alpha or 212)))
+        self.tint = None
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.text = ""
         self._font = QFont("Microsoft YaHei UI")
@@ -45,6 +52,7 @@ class Toast(GlassWindow):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setFont(self._font)
-        p.setPen(QColor(255, 255, 255, 240))
+        # 卡片上的文字色（浅色玻璃上是深色字）
+        p.setPen(QColor(20, 26, 36, 232))
         p.drawText(self.rect().adjusted(16, 0, -16, 0),
                    Qt.AlignHCenter | Qt.AlignVCenter, self.text)
