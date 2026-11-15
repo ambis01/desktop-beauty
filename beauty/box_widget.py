@@ -318,33 +318,60 @@ def _log_force(msg: str, *args) -> None:
         pass
 
 
+# 放回桌面时「等图标出现」的耐心。explorer 的桌面视图批量刷新实测 485–1028ms，
+# 毁灭世界一次放回十几个更慢；原来只等 60×8 = 480ms 就放弃，放弃之后图标就停在
+# explorer 给的默认格子（桌面左上角第一格）——用户报的「直接跑到左上角」。
+_PLACE_WAIT_MS = 12
+_PLACE_TRIES = 240              # ≈ 2.9s
+_place_pending = 0              # 还有几个图标在等落位（卸载时要等它归零再退）
+
+
+def place_pending() -> int:
+    """还有多少个图标在等 explorer 把它们画出来（`wipe_and_quit` 用它收尾）。"""
+    return _place_pending
+
+
 def _place_icon_at(name: str, sx: int, sy: int, tries: int = 0) -> None:
     """把刚放回桌面的图标摆到指定屏幕位置（图标中心对准该点），不找格子。
 
-    explorer 建图标需要一点时间（已经用 SHChangeNotify 催过了，通常一帧就够），
-    找不到就隔 8ms 再看，最多等 0.5 秒。
+    explorer 建图标需要一点时间（已经用 SHChangeNotify 催过了），找不到就隔
+    12ms 再看，最多等约 2.9 秒。**放弃时图标会留在 explorer 默认的左上角**，
+    所以宁可多等一会儿。
     """
+    global _place_pending
+    if tries == 0:
+        _place_pending += 1
     try:
-        icons = di.list_icons()
-    except Exception:  # noqa: BLE001
-        return
-    low = name.strip().lower()
-    base = low.rsplit(".", 1)[0]
-    # 桌面显示名通常是去掉扩展名的（.lnk/.url/.txt 都可能被隐藏），两种都认
-    hit = next((i for i in icons
-                if i.name.strip().lower() in (low, base)), None)
-    if hit is None:
-        if tries < 60:
-            QTimer.singleShot(8, lambda: _place_icon_at(name, sx, sy, tries + 1))
-        return
-    try:
-        off = di.cell_center_offset()
-        # 放到「离这个点最近的空格子」：不让 explorer 自己把孩子塞到别处
-        di.place_in_slot(hit.index, sx, sy, offset=off)
-        _log("restored %s placed at %s,%s", name, sx, sy)
-        QTimer.singleShot(160, lambda: _verify_icon_at(name, sx, sy))
-    except Exception:  # noqa: BLE001
-        pass
+        try:
+            icons = di.list_icons()
+        except Exception:  # noqa: BLE001
+            icons = []
+        low = name.strip().lower()
+        base = low.rsplit(".", 1)[0]
+        # 桌面显示名可能带扩展名也可能不带（取决于「隐藏已知文件类型的扩展名」）：
+        # 名字和去后缀两种都认。调用方传**完整文件名**（`p.name`），这样两种都对得上。
+        hit = next((i for i in icons
+                    if i.name.strip().lower() in (low, base)), None)
+        if hit is None:
+            if tries < _PLACE_TRIES:
+                QTimer.singleShot(
+                    _PLACE_WAIT_MS, lambda: _place_icon_at(name, sx, sy, tries + 1))
+            else:
+                _log("place give up (icon never showed): %s", name)
+                _place_pending = max(0, _place_pending - 1)
+            return
+        try:
+            off = di.cell_center_offset()
+            # 放到「离这个点最近的空格子」：不让 explorer 自己把孩子塞到别处
+            di.place_in_slot(hit.index, sx, sy, offset=off)
+            _log("restored %s placed at %s,%s", name, sx, sy)
+            QTimer.singleShot(160, lambda: _verify_icon_at(name, sx, sy))
+        except Exception:  # noqa: BLE001
+            pass
+        _place_pending = max(0, _place_pending - 1)
+    except Exception:  # noqa: BLE001 - 收尾别把异常吞成「一直 pending」
+        _place_pending = max(0, _place_pending - 1)
+        raise
 
 
 def _verify_icon_at(name: str, sx: int, sy: int, tries: int = 0) -> None:
@@ -853,9 +880,8 @@ class BoxWidget(GlassWindow):
         cx = self.box.x + self._side_w // 2
         cy = self.box.y + self._collapsed_h() // 2
         px, py = screen.to_physical((cx, cy, cx, cy))[0:2]
-        names = [p.stem for p in self.store.items(self.box)]
-        ns_names = {p.stem for p in self.store.items(self.box)
-                    if self.store.is_ns(self.box, p)}
+        names = [(p.name, self.store.is_ns(self.box, p))
+                 for p in self.store.items(self.box)]
         self.dispose()
         for path in self.store.items(self.box):
             if self.store.is_ns(self.box, path):
@@ -874,8 +900,8 @@ class BoxWidget(GlassWindow):
         if self.store.get(self.box.id) is not None:
             self.store.delete(self.box)
         _log("thin box %s dissolved", self.box.id)
-        for name in names:
-            if name in ns_names:
+        for name, is_ns in names:
+            if is_ns:
                 continue   # 系统图标已经被放出来了，不用再摆位置
             _place_icon_at(name, px, py)
         self.close()
@@ -1058,8 +1084,9 @@ class BoxWidget(GlassWindow):
         except Exception:  # noqa: BLE001
             px, py = 400, 400
         items = list(self.store.items(self.box))
-        names = [p.stem for p in items]
-        ns_names = {p.stem for p in items if self.store.is_ns(self.box, p)}
+        # 完整文件名：桌面上普通文件是带扩展名显示的（.doc/.txt…），只拿 stem
+        # 去对名字永远匹配不上 → 图标会留在 explorer 默认的左上角格子
+        names = [(p.name, self.store.is_ns(self.box, p)) for p in items]
         self.dispose()          # 先停目录监听：还挂着这个目录 rmtree 可能删不掉
         for path in items:
             if self.store.is_ns(self.box, path):
@@ -1078,8 +1105,8 @@ class BoxWidget(GlassWindow):
             return False
         if self.store.get(self.box.id) is not None:
             self.store.delete(self.box)
-        for name in names:
-            if name in ns_names:
+        for name, is_ns in names:
+            if is_ns:
                 continue
             _place_icon_at(name, px, py)
         _log("box %s destroyed (%d items)", self.box.id, len(names))

@@ -2021,8 +2021,26 @@ class Controller(QObject):
             _log(f"uninstall wipe done: {n} boxes back to desktop")
         except Exception:  # noqa: BLE001
             _log("uninstall wipe 出错: " + traceback.format_exc())
-        # 留一点时间让图标位置 / 配置落盘，然后正常退出（走 aboutToQuit）
-        QTimer.singleShot(500, self.quit)
+        # 留一点时间让图标位置 / 配置落盘，然后正常退出（走 aboutToQuit）。
+        # 注意：放回桌面的图标要等 explorer 画出来才能摆位置（实测 0.5–1s，
+        # 十几个一起更慢），所以这里等 `place_pending()` 归零再退，
+        # 否则定时器被一起杀掉，图标就留在桌面左上角第一格。
+        QTimer.singleShot(500, lambda: self._quit_after_places())
+
+    def _quit_after_places(self, tries: int = 0) -> None:
+        try:
+            from . import box_widget as _bw
+            left = _bw.place_pending()
+        except Exception:  # noqa: BLE001
+            left = 0
+        if left and tries < 50:      # 50 × 100ms = 5s 封顶
+            QTimer.singleShot(100, lambda: self._quit_after_places(tries + 1))
+            return
+        if left:
+            _log(f"uninstall wipe: 还有 {left} 个图标没落位，先退出")
+        else:
+            _log("uninstall wipe: 图标都落位了")
+        self.quit()
 
     def uninstall_app(self) -> None:
         """面板里点「卸载 desktop beauty」：图标先回桌面，再删安装。

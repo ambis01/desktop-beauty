@@ -745,6 +745,39 @@ shell32.SHChangeNotify.restype = None
 shell32.SHChangeNotify.argtypes = [ctypes.c_long, wt.UINT, ctypes.c_void_p, ctypes.c_void_p]
 
 
+WM_CANCELMODE = 0x001F
+WM_LBUTTONUP = 0x0202
+
+
+def cancel_shell_drag() -> None:
+    """让 explorer 的桌面 ListView 彻底退出「拖拽中」状态。
+
+    `dragwatch` 为了不让 explorer 把「快捷方式丢到快捷方式上」当成「用目标程序
+    打开」，会把松手那一下**在全局钩子里吞掉**（钩子返回 1，任何窗口都收不到）。
+    后果是 explorer 的拖拽循环被 Esc 掐掉之后，桌面 ListView 还停在「鼠标按着」
+    的状态里 —— 偶发留下一个跟着鼠标跑的**残影**（用户报的那个 bug）。
+
+    这里补两下：先 WM_CANCELMODE 让它作废当前模式，再直接投递一个
+    WM_LBUTTONUP（坐标用当前光标的客户区坐标），最后让桌面重画一遍。
+    此刻 explorer 的拖拽已经被 Esc 取消了，所以这一下 up 只会被当成一次落空的
+    点击，不会触发「用 xx 打开」。
+    """
+    lv = _find_listview()
+    if not lv:
+        return
+    try:
+        _send(lv, WM_CANCELMODE)
+        pt = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        user32.ScreenToClient(lv, ctypes.byref(pt))
+        lparam = (pt.y << 16) | (pt.x & 0xFFFF)
+        _send(lv, WM_LBUTTONUP, 0, lparam)
+        user32.InvalidateRect(lv, None, True)
+        _log("shell drag cancelled (WM_CANCELMODE + WM_LBUTTONUP)")
+    except Exception:  # noqa: BLE001 - 收尾动作，失败也不该炸
+        pass
+
+
 def _notify(event: int, path) -> None:
     try:
         shell32.SHChangeNotify(event, SHCNF_PATHW | SHCNF_FLUSH, str(path), None)

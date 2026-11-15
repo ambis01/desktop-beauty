@@ -138,6 +138,7 @@ class DragWatcher(QObject):
         self._committed = False
         self._esc_sent = False
         self._swallow_up = False
+        self._ate_up = False
         self._hint_rect = None
         # 抢过 explorer 的拖拽之后，图标要由我们自己带着走
         self._own_drag = False
@@ -213,6 +214,7 @@ class DragWatcher(QObject):
                         _log("swallow up at %s,%s", self._x, self._y)
                         if not self._esc_sent:
                             self._swallow_up = True
+                            self._ate_up = True
                         return 1
             except Exception:  # noqa: BLE001 - 钩子里不能抛
                 pass
@@ -520,6 +522,12 @@ class DragWatcher(QObject):
             # 否则它一直以为鼠标还按着，后面每次拖拽都会错乱。
             self._swallow_up = False
             self._cancel_once()
+            if self._ate_up:
+                # 只发 Esc 不够：explorer 等不到那一下 up，桌面 ListView 会留在
+                # 「按着」状态，偶发留下跟着鼠标跑的残影。稍等它处理完 Esc，
+                # 再补 WM_CANCELMODE + 一个 WM_LBUTTONUP（见 desktop_icons）。
+                self._ate_up = False
+                QTimer.singleShot(60, di.cancel_shell_drag)
             self._take_over()
             if self._target is None:
                 # 松得太快，轮询还没来得及把「目标」记下来：按松手点现算一次
@@ -561,6 +569,7 @@ class DragWatcher(QObject):
         self._committed = False
         self._esc_sent = False
         self._swallow_up = False
+        self._ate_up = False
         self._own_drag = False
         self._src_home = None
         self._center_off = None
