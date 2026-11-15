@@ -3204,7 +3204,7 @@ class BoxWidget(GlassWindow):
                 self.changed.emit()
             elif paths:
                 # 静默吞掉最难查（「拖进来没反应」），说一句
-                self.warn.emit("这个文件夹搬不进来：别的盘、系统目录、或程序自己的数据目录")
+                self.warn.emit("这个文件夹搬不进来：只能收桌面上的文件夹；别的盘上的要小于 256 MB")
         finally:
             self._busy_drop = False
 

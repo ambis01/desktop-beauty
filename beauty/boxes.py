@@ -66,14 +66,65 @@ def _same_volume(a: Path, b: Path) -> bool:
             return False
 
 
+# 跨卷（不是同一个卷）只收这么大的东西：同卷 move 是 rename（瞬间），
+# 跨卷是整棵拷贝、还在主线程里搬 —— 太大会把界面卡住。约 256 MB。
+CROSS_VOLUME_MAX = 256 * 1024 * 1024
+
+
+def _size_within(path: Path, cap: int) -> bool:
+    """path 的总大小是否 <= cap（超了立刻停，不会把整棵大树扫完）。"""
+    total = 0
+    try:
+        if path.is_file():
+            return path.stat().st_size <= cap
+    except OSError:
+        return False
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        # 不跟符号链接：桌面上的快捷方式/junction 可能绕回自己
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        if total > cap:
+            return False
+    return True
+
+
+def _on_desktop(path: Path) -> bool:
+    """path 是不是「桌面上的」文件夹（桌面目录本身或它下面的子目录）。"""
+    try:
+        for d in di.desktop_dirs():
+            try:
+                root = d.resolve()
+            except OSError:
+                root = d
+            if path == root or root in path.parents:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _acceptable(src: Path) -> bool:
     """能收进盒子的东西：任意普通文件，或者**一个文件夹**。
 
     以前这里只放行 `.lnk` / `.url`（后来又放开到所有文件）。现在文件夹也收，
     但有几条硬保护 —— 文件夹挪走之后不好收拾，而且跨卷拷贝会卡死界面：
 
+    - 文件夹只收**桌面上的**（桌面目录或它下面的子目录），以及盒子里的那些
+      （盒子之间互相搬是正常操作）。从资源管理器随便拖一个 `C:/Windows/...` 不行
     - 盘符根、桌面本身、用户目录：不收
-    - 别的卷上的文件夹：不收（同卷是 rename，跨卷是整棵树拷贝）
+    - 别的卷上的东西：**只收 ≤ 256 MB 的**（同卷是 rename，跨卷是整棵拷贝）
     - `DATA_DIR` 内部（盒子目录除外）、以及 `DATA_DIR` 的**祖先**：不收
       （后者等于把装有数据的目录搬进它自己）
     """
@@ -97,13 +148,17 @@ def _acceptable(src: Path) -> bool:
                 return False
         elif resolved in data.parents:
             return False
+        box_root = BOX_ROOT.resolve()
+        in_box = box_root in resolved.parents
         if is_dir:
             if resolved.parent == resolved:
                 return False      # 盘符根
             if resolved in _protected_dirs():
                 return False
-            if not _same_volume(resolved, data):
-                return False
+            if not in_box and not _on_desktop(resolved):
+                return False      # 只收桌面上的文件夹
+        if not _same_volume(resolved, data) and not _size_within(resolved, CROSS_VOLUME_MAX):
+            return False          # 跨卷只收小的
         return True
     except OSError:
         return False
