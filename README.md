@@ -97,6 +97,23 @@ D:\tmp\buildenv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed
 
 打好的包在 `dist\desktop-beauty-1.0.0-win64.zip`（49 MB / 解压 128 MB）：解压出一个 `desktop beauty\` 文件夹，里面 `desktopbeauty.exe` + `app\`，双击 exe 就会弹出下面那块玻璃窗，点一下按钮装好。
 
+### 对方电脑弹「智能应用控制已阻止可能不安全的应用」
+
+这个 exe 没有代码签名，对方机器要是开着 Smart App Control（智能应用控制），双击就被拦，提示「已阻止 D:\...\desktopbeauty.exe，因为无法验证其发布者」。包本身没坏。
+
+SAC 的判断顺序是：先问云端这条 exe 安不安全 → 云端答不上来就查数字签名 → 没签名 / 签名无效一律当「不受信任」拦掉。它**没有白名单、没有「仍要运行」、也没有按单个应用放行的入口**（[Microsoft 官方 FAQ](https://support.microsoft.com/zh-cn/windows/security/threat-malware-protection/smart-app-control-frequently-asked-questions)：目前无法绕过针对单个应用的智能应用控制保护）。所以「右键 → 属性 → 解除锁定」清掉下载标记也没用——拦的依据是签名，不是 MOTW。
+
+两条路：
+
+1. **让对方关掉 SAC**（现在就能用）：设置 → 隐私和安全性 → Windows 安全中心 → 应用和浏览器控制 → 智能应用控制 → 关。较新的 Windows 更新支持之后重新打开（老版本关掉就只能重置系统才能开回来），关之前跟对方讲清楚。
+2. **给 exe 签名**（长期正路）：SAC 见到有效签名就放行（不需要攒信誉，这点和 SmartScreen 不同）。开源项目可以申请 [SignPath Foundation](https://signpath.org/) 的免费签名（要求 OSI 许可证、公开仓库、签名构建必须出自 CI、每个版本人工批准）；付费的话 Azure Artifact Signing（原 Trusted Signing）约 $10/月，个人也能过身份验证。签完 `desktopbeauty.exe` 和 `app\` 里的本体都得签。
+
+看对方机器开没开（`0` 关 / `1` 开 / `2` 评估模式，评估模式不拦）：
+
+```powershell
+Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' VerifiedAndReputablePolicyState
+```
+
 **安装**（`beauty/install.py`）做五件事，对方看到的只有一个玻璃窗：
 
 1. 把 `app\` + 转发器复制到 `%LOCALAPPDATA%\Programs\desktopbeauty\`
