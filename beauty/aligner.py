@@ -72,6 +72,10 @@ def stop_y(rect: QRect, want_top: int, others, gap: int) -> int | None:
 
     挡路只看**横向有交集**的矩形。已经跟谁叠着（距离 < 0）就返回 None —— 这时候
     动哪儿都还是叠着，用户要的是「距离小于 0 就直接不移动」。挪不动也返回 None。
+
+    上/下两个方向都要按整块算：往下走时挡住的是**下沿**，所以上限要减掉自身
+    高度（`o.top - gap - height`），不然算出来的位置会让 110px 高的一块整个
+    骑到障碍上。往上走时挡住的是上沿，直接 `o.bottom + gap + 1` 就对了。
     """
     cur = rect.top()
     if want_top == cur:
@@ -86,7 +90,7 @@ def stop_y(rect: QRect, want_top: int, others, gap: int) -> int | None:
                 if o.bottom() >= rect.top():
                     return None            # 已经叠着
                 continue                   # 在头顶上方：往下走碰不到
-            stop = min(stop, o.top() - gap - 1)
+            stop = min(stop, o.top() - gap - rect.height())
         else:
             if o.bottom() >= rect.top():
                 if o.top() <= rect.bottom():
@@ -115,7 +119,7 @@ def stop_x(rect: QRect, want_left: int, others, gap: int) -> int | None:
                 if o.right() >= rect.left():
                     return None
                 continue
-            stop = min(stop, o.left() - gap - 1)
+            stop = min(stop, o.left() - gap - rect.width())
         else:
             if o.right() >= rect.left():
                 if o.left() <= rect.right():

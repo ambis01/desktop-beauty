@@ -532,6 +532,10 @@ class BoxWidget(GlassWindow):
         self._shake_anim = None
         self._slide = None
         self._slide_timer = None
+        # 展开面往哪边长：right = 盒子左边往右（默认）；left = 右边对齐盒子右边、
+        # 往左长。底部放不下时 `_up` 往上长（底边不动）。都由 Controller 算。
+        self._expand_side = "right"
+        self._up = 0
         self._menu_busy = False   # 正弹着菜单：点菜单不算「点盒子外面」
         # 合并手势：拖动时压在另一个盒子的拖动区上
         self._merge_target = None
@@ -685,9 +689,38 @@ class BoxWidget(GlassWindow):
             return TITLE_H
         return self._side_h + TITLE_H
 
+    def _glass_top(self) -> int:
+        """玻璃左上角的 y。
+
+        `_up` 是「往上长」的偏移：底部放不下时展开面**底边不动、往上长**，
+        `box.y` 一个像素都不动，只是玻璃往上挪这么多（用户 2026-11-15 定的）。
+        """
+        return int(self.box.y - int(getattr(self, "_up", 0) or 0))
+
+    def set_up(self, up: int) -> None:
+        """设置「往上长」的偏移（Controller 算好的）。
+
+        ⚠️ 这里**不碰窗口位置**：调用方紧接着就起动画（`_set_bar` / `toggle`），
+        动画的起点是 `self.geometry()`、终点按 `_glass_top()` 算，底边对齐着长上
+        去才是「从下往上长」。以前这里顺手 `_apply_collapsed_geometry()`，展开前
+        窗口先被挪到上面去，看着就是「啪」地瞬移上去、再从上面往下展开（用户
+        2026-11-15 报的）。
+        """
+        up = max(0, int(up))
+        if up == int(getattr(self, "_up", 0) or 0):
+            return
+        self._up = up
+        self.update()
+
+    def _gear_up(self, target_h: int, cur_h: int) -> None:
+        """换高度时把「往上长」的偏移折回去：**底边不动**，上边跟着走。"""
+        if not int(getattr(self, "_up", 0) or 0):
+            return
+        self._up = max(0, int(self._up) + int(target_h) - int(cur_h))
+
     def collapsed_rect(self) -> QRect:
         """收起状态下盒子占的屏幕矩形（不含悬停放大）。"""
-        return QRect(self.box.x, self.box.y, self._side_w, self._collapsed_h())
+        return QRect(self.box.x, self._glass_top(), self._side_w, self._collapsed_h())
 
     def _win_margin(self) -> int:
         """窗口比盒子本体多出来的那一圈（尽量小，静止时完全透明）。
@@ -759,7 +792,7 @@ class BoxWidget(GlassWindow):
     def _apply_collapsed_geometry(self) -> None:
         """窗口位置固定（含余量），尺寸固定——悬停时只改 paint_scale。"""
         m = self._win_margin()
-        self.setGeometry(self.box.x - m, self.box.y - m,
+        self.setGeometry(self.box.x - m, self._glass_top() - m,
                          self._win_w(), self._win_h())
 
     def _on_hover_anim(self, value) -> None:
@@ -860,13 +893,12 @@ class BoxWidget(GlassWindow):
         self._dissolve_when_thin()
 
     def _notify_expanded(self) -> None:
-        """要展开了：让 Controller 把挡路的下方、侧面挤开。"""
+        """要展开了：让 Controller 定往哪边长（右/左、下/上）并把挡路的挤开。"""
         cb = getattr(self, "on_expanded", None)
         if cb is None:
             return
         try:
-            m = self._win_margin()
-            cb(self, self._expanded_rect().adjusted(m, m, -m, -m))
+            cb(self)
         except (RuntimeError, TypeError):
             pass
 
@@ -915,6 +947,9 @@ class BoxWidget(GlassWindow):
                 self.store.restore_ns(self.box, path)
             else:
                 self.store.remove_to(self.box, path)
+        if names:
+            # 同上：一批图标搬回去之后整块刷新一次，别留幽灵项
+            di.notify_desktop_refresh()
         if self.store.items(self.box):
             # 有文件放不回去 → 保留盒子，绝不丢文件
             try:
@@ -1121,6 +1156,11 @@ class BoxWidget(GlassWindow):
                 self.store.restore_ns(self.box, path)
             else:
                 self.store.remove_to(self.box, path)
+        if names:
+            # 一次搬一批回桌面，explorer 处理不过来的那一下会在桌面上留「幽灵项」
+            # （文件已经不在、双击/删除都报「找不到该项目」，用户报过卸载后这样）。
+            # 逐个 SHCNE_* 通知之后整块再刷一次，这种项就清掉了。
+            di.notify_desktop_refresh()
         if self.store.items(self.box):
             # 有文件放不回去（被占用等）→ 保留盒子，绝不清掉文件
             try:
@@ -1142,8 +1182,16 @@ class BoxWidget(GlassWindow):
         return True
 
     def _set_pinned(self, on: bool) -> None:
-        """常驻展开：开着的时候点盒子外面也不会收起。"""
-        self.box.pinned = bool(on)
+        """常驻展开：开着的时候点盒子外面也不会收起，双击横杠直接展回 1。
+
+        勾选之前先问 Controller 下方和侧面让不让得开（`on_pin_room`）；让不开就
+        **勾不成功**（抖一下、保持不勾），用户定的「展不成 1 就不许勾着」。
+        """
+        on = bool(on)
+        if on and not getattr(self.box, "pinned", False) and not self._pin_room():
+            self.shake()
+            return
+        self.box.pinned = on
         self.store.save()
         self._log_state(f"pinned={self.box.pinned}")
         if on:
@@ -1185,7 +1233,7 @@ class BoxWidget(GlassWindow):
                 cb = getattr(self, "on_grow_request", None)
                 if cb is not None:
                     try:
-                        cb(self, self.collapsed_rect())
+                        cb(self)
                     except (RuntimeError, TypeError):
                         pass
             elif shrank:
@@ -1415,15 +1463,25 @@ class BoxWidget(GlassWindow):
         return scr.availableGeometry()
 
     def _expanded_rect(self) -> QRect:
+        """展开面（玻璃）的窗口矩形。
+
+        往哪边长由 Controller 决定：`_expand_side` = right（默认，从盒子左边往右
+        长）/ left（右边对齐盒子右边、往**左**长，用户 2026-11-15 定的：编程在
+        屏幕右边、右边没地方，就该往左展开把左边的收纳盒挤开）；`_up` 同理是
+        「底边不动、往上长」。这里的屏幕夹取只是兜底。
+        """
         n = max(1, len(self._items))
         rows = max(1, math.ceil(n / COLS))
         w = PAD * 2 + COLS * CELL_W
         h = HEADER + rows * CELL_H + PAD
         avail = self._screen()
-        # 和收起状态一致：贴边（不留 8px 缝）
-        x = min(self.box.x, avail.right() + 1 - w)
-        y = min(self.box.y, avail.bottom() + 1 - h)
-        x = max(avail.left(), x)
+        x = self.box.x
+        if getattr(self, "_expand_side", "right") == "left":
+            x = self.box.x + self._side_w - w
+        x = max(avail.left(), min(x, avail.right() + 1 - w))
+        y = self._glass_top()
+        if y + h > avail.bottom() + 1:
+            y = avail.bottom() + 1 - h       # 兜底：往上夹进屏幕
         y = max(avail.top(), y)
         # 返回**窗口**矩形：玻璃左上角贴在 (x, y)，四周再让出阴影/放大用的余量
         m = self._win_margin()
@@ -1477,11 +1535,19 @@ class BoxWidget(GlassWindow):
         if self._editing:
             # 收起/展开时先把改名结束掉，别留一个输入框挂在窗口上
             self._finish_inline_rename(True)
+        if not target:
+            # 收起一截：底边不动，把「往上长」的偏移折回去（收到横杠时归 0，
+            # 盒子就回到 box.y；不收的话每来一轮就往上漂一截）
+            m = self._win_margin()
+            cur_h = (self._rect_expanded.height() - 2 * m if self._expanded
+                     else self._collapsed_h())
+            self._gear_up(self._collapsed_h(), cur_h)
+            self._expand_side = "right"
         self._expanded = target
         # 收 / 展开的时候，上一次双击还没落地的启动作废
         self.cancel_pending_launch()
         self._rect_collapsed = QRect(self.box.x - self._win_margin(),
-                                     self.box.y - self._win_margin(),
+                                     self._glass_top() - self._win_margin(),
                                      self._win_w(), self._win_h())
         self._rect_expanded = self._expanded_rect()
         self._anim_timer.stop()
@@ -1496,9 +1562,11 @@ class BoxWidget(GlassWindow):
         self._anim_to = 1.0 if target else 0.0
         self._anim_dur = 0.30 if target else 0.26
         self._anim_rect_from = self.geometry()
-        self._anim_rect_to = self._rect_expanded if target else self._rect_collapsed
         if target:
+            # 先让 Controller 选好往哪边长（右/左、下/上）再算落点
             self._notify_expanded()
+            self._rect_expanded = self._expanded_rect()
+        self._anim_rect_to = self._rect_expanded if target else self._rect_collapsed
         self._start_anim()
         # 展开时盯着「有没有点到盒子外面」
         if target:
@@ -1543,12 +1611,13 @@ class BoxWidget(GlassWindow):
             cb = getattr(self, "on_grow_request", None)
             if cb is not None:
                 try:
-                    if not cb(self, QRect(self.box.x, self.box.y,
-                                          self._side_w, self._side_h + TITLE_H)):
+                    if not cb(self):        # Controller 自己算 0 状态那块、往下还是往上
                         self.shake()
                         return
                 except (RuntimeError, TypeError):
                     pass
+        if on:
+            self._gear_up(TITLE_H, self._collapsed_h())   # 收到横杠：底边不动
         self._bar = on
         if self._expanded:
             return
@@ -1572,18 +1641,35 @@ class BoxWidget(GlassWindow):
         self._anim_dur = 0.24
         self._anim_rect_from = self.geometry()
         self._anim_rect_to = QRect(self.box.x - self._win_margin(),
-                                   self.box.y - self._win_margin(),
+                                   self._glass_top() - self._win_margin(),
                                    self._win_w(), self._win_h())
         self._start_anim()
 
     def slide_to(self, target_y: int, dur: float = 0.22) -> None:
         """把窗口平滑挪到新的玻璃 y（挤开、吸附都走这里，别瞬移）。"""
+        self._slide_axis("y", target_y, dur)
+
+    def slide_x_to(self, target_x: int, dur: float = 0.22) -> None:
+        """横向挤开 / 吸回也走动画。
+
+        以前横向是直接 `setGeometry` 瞬移的——展开时被推开的那个盒子「啪」地
+        就换了位置（用户 2026-11-15 报的「侧面推的动画很突兀，直接瞬移」）。
+        """
+        self._slide_axis("x", target_x, dur)
+
+    def _slide_axis(self, axis: str, target: int, dur: float = 0.22) -> None:
+        """起一段滑动动画：横竖各占一个槽，互不打断（可能一边被推开一边被吸）。"""
         pad = self._win_margin()
-        start = float(self.y())
-        end = float(target_y - pad)
+        if axis == "y":
+            start, end = float(self.y()), float(target - pad)
+        else:
+            start, end = float(self.x()), float(target - pad)
         if abs(start - end) < 0.5:
             return
-        self._slide = {"t0": time.perf_counter(), "a": start, "b": end, "dur": max(0.01, dur)}
+        slots = self._slide if isinstance(self._slide, dict) else {}
+        slots[axis] = {"t0": time.perf_counter(), "a": start, "b": end,
+                       "dur": max(0.01, dur)}
+        self._slide = slots
         if self._slide_timer is None:
             self._slide_timer = QTimer(self)
             self._slide_timer.setInterval(15)
@@ -1592,17 +1678,30 @@ class BoxWidget(GlassWindow):
 
     def _slide_tick(self) -> None:
         s = self._slide
-        if not s:
+        if not isinstance(s, dict) or not s:
             self._slide_timer.stop()
             return
-        t = (time.perf_counter() - s["t0"]) / s["dur"]
-        if t >= 1.0:
-            self.move(self.x(), int(round(s["b"])))
+        now = time.perf_counter()
+        x, y = self.x(), self.y()
+        for axis in ("x", "y"):
+            slot = s.get(axis)
+            if not slot:
+                continue
+            t = (now - slot["t0"]) / slot["dur"]
+            if t >= 1.0:
+                val = int(round(slot["b"]))
+                s.pop(axis, None)
+            else:
+                ease = 1.0 - (1.0 - t) ** 3
+                val = int(round(slot["a"] + (slot["b"] - slot["a"]) * ease))
+            if axis == "y":
+                y = val
+            else:
+                x = val
+        self.move(x, y)
+        if not s:
             self._slide = None
             self._slide_timer.stop()
-            return
-        ease = 1.0 - (1.0 - t) ** 3
-        self.move(self.x(), int(round(s["a"] + (s["b"] - s["a"]) * ease)))
 
     def shake(self) -> None:
         """长不出来：左右抖两下。"""
@@ -2514,6 +2613,34 @@ class BoxWidget(GlassWindow):
             return 1
         return -1 if self._bar else 0
 
+    def _pin_room(self) -> bool:
+        """问 Controller：展到 1 下方和侧面都让得开吗？没有这个回调就当让得开。"""
+        cb = getattr(self, "on_pin_room", None)
+        if cb is None:
+            return True
+        try:
+            return bool(cb(self))
+        except (RuntimeError, TypeError):
+            return True
+
+    def _open_pinned(self) -> bool:
+        """常驻展开的盒子双击横杠：有地方就直接展到 1（勾着就得是 1）。
+
+        没地方（下方/侧面让不开）就取消常驻、返回 False，让调用方按普通 0 展开。
+        """
+        if not getattr(self.box, "pinned", False):
+            return False
+        if not self._pin_room():
+            self._set_pinned(False)
+            return False
+        # 横杠形态先落回「缩略图标」：从横杠直接长到展开，中间那 0 态不该插一
+        # 脚（插了会先长到 0 再展开，用户看着就是两次动画）
+        self._bar = False
+        self._bar_t = 0.0
+        self._save_bar()
+        self.toggle(True)
+        return True
+
     def _grip_click(self, gpos: QPoint) -> None:
         """拖动区上一次完整的「按下 + 抬起」。
 
@@ -2521,7 +2648,7 @@ class BoxWidget(GlassWindow):
         连着两次完整点击（间隔在系统双击时间内、位置基本没挪）才算双击，
         按用户定的状态机走：
           1（展开）  --双击拖动区--> -1（只剩横杠）
-          -1（横杠） --双击拖动区--> 0（正常）
+          -1（横杠） --双击拖动区--> 0（正常）；**常驻展开的**直接回 1
           0（正常）  --双击拖动区--> -1（只剩横杠）
         ``mouseDoubleClickEvent`` 里那次按下也会走到这里，所以数的是**两次
         真正按下又抬起**，按住不放或者第二下拖走了都不算。
@@ -2539,7 +2666,9 @@ class BoxWidget(GlassWindow):
             self._grip_click_pos = None
             st = self._state()
             _log_force("grip double click box=%s dt=%.0fms %d->%d", self.box.id,
-                       (now - prev_t) * 1000.0, st, 0 if st == -1 else -1)
+                       (now - prev_t) * 1000.0, st,
+                       -1 if st != -1 else
+                       (1 if getattr(self.box, "pinned", False) else 0))
             if st == 1:
                 # 展开 → -1：一步收到只剩横杠（缩略图标这一路都不画，
                 # 不然动画最后一帧会「啪」地消失）
@@ -2548,8 +2677,11 @@ class BoxWidget(GlassWindow):
                 self._save_bar()
                 self.toggle(False)
             elif st == -1:
-                # -1 → 0：横杠长回正常大小，缩略图标跟着淡进来
-                self._set_bar(False)
+                # -1 → 0：横杠长回正常大小，缩略图标跟着淡进来。
+                # 常驻展开的盒子回到 1（用户报的：勾着常驻却展开成 0）；没地方
+                # 展到 1 就把常驻取消掉，按普通 0 展开（勾着就一定是 1）。
+                if not self._open_pinned():
+                    self._set_bar(False)
             else:
                 # 0 → -1：正常 → 只剩横杠
                 self._set_bar(True)

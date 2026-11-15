@@ -598,6 +598,9 @@ class BoxStore:
                 moved += 1
             else:
                 stuck.append(path.name)
+        if moved:
+            # 一批图标刚搬回桌面：整块刷新一次，免得 explorer 留下「找不到该项目」的幽灵项
+            di.notify_desktop_refresh()
         if stuck:
             _log("dissolve stuck: %s", stuck)
             self.save()

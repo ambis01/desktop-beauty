@@ -738,7 +738,9 @@ def place_in_slot(index: int, screen_x: int, screen_y: int,
 SHCNE_CREATE = 0x00000002
 SHCNE_DELETE = 0x00000004
 SHCNE_UPDATEITEM = 0x00002000
+SHCNE_ASSOCCHANGED = 0x08000000
 SHCNF_PATHW = 0x0005
+SHCNF_IDLIST = 0x0000
 SHCNF_FLUSH = 0x1000
 
 shell32.SHChangeNotify.restype = None
@@ -900,6 +902,23 @@ def notify_deleted(path) -> None:
 def notify_updated(path) -> None:
     """让 shell 重新读一遍这个文件的图标（快捷方式拖回桌面偶尔画成白纸）。"""
     _notify(SHCNE_UPDATEITEM, path)
+
+
+def notify_desktop_refresh() -> None:
+    """整块桌面重新读一遍（一次搬一批图标之后兜底）。
+
+    逐个 `SHCNE_CREATE` / `SHCNE_DELETE` 之间有个空档：explorer 那一瞬间没处理
+    完，桌面上就会留下「点得着、文件已经不在」的幽灵项——双击说「找不到该项目」，
+    右键删除也报同样的错（系统去找那个文件，找不到，于是既不打开也不删）。
+    用户报过卸载之后就是这个样子。批量搬完再整块刷一次，这种项会被清掉。
+
+    `SHCNF_IDLIST`（不是 PATHW）：整块刷新不带路径。
+    """
+    try:
+        shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH,
+                               None, None)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- 显示名 → 文件

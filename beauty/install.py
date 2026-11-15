@@ -186,13 +186,17 @@ def install(src: Path | None = None, force: bool = False) -> bool:
     if stopped == "timeout":
         raise RuntimeError("旧版本还在运行，文件被占着。先在面板里退出再点安装。")
 
-    # 0b. 自带的那份 TranslucentTB 要是正从安装目录跑着，也得先停：
-    #     它是注入在 explorer 里的独立进程，exe/dll 一样被占（升级到 1.0.2 之后才会撞上）
+    # 0b. 自带的那份 TranslucentTB 要是正跑着，也得先停：
+    #     它是注入在 explorer 里的独立进程，exe/dll 一样被占（升级到 1.0.2 之后才会撞上）。
+    #     除了安装目录里那份，**解压目录里那份也算**——便携版第一次启动时就是从解压目录
+    #     把 TB 拉起来的，装完以后用户通常马上把那个文件夹删掉，它不退出就删不动
+    #     （「TranslucentTB.exe 正在使用」）。停完第 6 步会从安装目录重新拉起。
+    low_src, low_dst = str(src).lower(), str(dst).lower()
     tb_was_running = False
     try:
         from . import taskbar as _tb
-        exe = _tb.exe_path()
-        if str(exe).lower().startswith(str(dst).lower()):
+        exe = str(_tb.exe_path()).lower()
+        if exe.startswith(low_dst) or exe.startswith(low_src):
             tb_was_running = _tb.is_running()
             if tb_was_running:
                 _tb.stop()
