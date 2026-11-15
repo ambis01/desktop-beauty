@@ -514,6 +514,7 @@ class BoxWidget(GlassWindow):
         self.on_toast = None
         self.on_merge = None
         self.on_merge_group = None    # 多选整组压到别的盒子上：整组并进去
+        self.allow_bar_merge = False   # 两个都是横杠（-1）时也不许并？默认不许
         self.on_grow_request = None   # 盒子要长高：先问 Controller 有没有地方
         self.on_shrunk = None         # 收到横杠：让下面的东西吸上来
         self.on_grew = None           # 自动变大之后：把被压住的盒子和桌面图标挪开
@@ -1874,6 +1875,7 @@ class BoxWidget(GlassWindow):
             return
         provider = getattr(self, "siblings", None)
         mine = self._grip_global()
+        mine_is_bar = self._state() == -1
         target = None
         if provider is not None:
             try:
@@ -1882,6 +1884,10 @@ class BoxWidget(GlassWindow):
                 others = []
             for w in others:
                 if w is self or not isinstance(w, BoxWidget) or not w.isVisible():
+                    continue
+                # 两个都只剩横杠：横杠又细又长，扫过去一碰就叠上，太容易误并
+                # （面板里「两个收起状态的收纳盒也能合并」可以放开）
+                if mine_is_bar and w._state() == -1 and not self.allow_bar_merge:
                     continue
                 # 多选一起搬的时候，组里那些盒子跟我同步移动，它们的拖动区也是
                 # 自己人：不能拿它们当合并目标（不然并到自己这一组身上）

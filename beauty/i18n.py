@@ -85,6 +85,8 @@ _STRINGS: dict[str, tuple[str, str]] = {
                             "Smart alignment (avoid overlaps after a drag)"),
     "settings.box_merge": ("允许收纳盒合并（把一个盒子拖到另一个上面）",
                            "Allow boxes to merge (drop one onto another)"),
+    "settings.box_merge_bar": ("两个收起状态的收纳盒也能合并",
+                               "Also merge two collapsed boxes"),
     "settings.dark": ("深色面板", "Dark panel"),
     "settings.language": ("语言 / Language", "Language"),
     "lang.head": ("界面语言", "Display language"),

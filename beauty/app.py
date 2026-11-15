@@ -1017,6 +1017,8 @@ class Controller(QObject):
         win.on_toast = lambda text: self.toast.show_text(text, 2200)
         win.on_merge = self.merge_boxes
         win.on_merge_group = self.merge_group
+        # 面板里的「两个收起状态的收纳盒也能合并」：默认关（横杠太细，容易误并）
+        win.allow_bar_merge = bool(getattr(self.cfg, "box_merge_bar", False))
         win.on_new_box = self._on_new_box
         win.on_new_box_from_selection = self._on_new_box_from_selection
         win.on_drag_preview = self._on_drag_preview
@@ -2042,6 +2044,16 @@ class Controller(QObject):
         """收纳盒合并开关：关掉之后把一个盒子拖到另一个上面不会合并。"""
         self.cfg.box_merge = bool(on)
         self.cfg.save()
+
+    def set_box_merge_bar(self, on: bool) -> None:
+        """两个都只剩横杠（状态 -1）的盒子要不要也能互相合并（默认不要）。"""
+        self.cfg.box_merge_bar = bool(on)
+        self.cfg.save()
+        for win in list(getattr(self, "windows", {}).values()):
+            try:
+                win.allow_bar_merge = bool(on)
+            except (RuntimeError, TypeError):
+                continue
 
     def set_lang(self, code: str) -> None:
         """换界面语言（zh / en）。

@@ -684,6 +684,13 @@ class SettingsWindow(GlassWindow):
         self.chk_box_merge.toggled.connect(self._on_box_merge)
         col.addWidget(self.chk_box_merge)
 
+        # 两个都只剩横杠（状态 -1）的盒子：横杠又细又长，扫过去一碰就叠上，
+        # 默认不让它们互相合并，免得误并；想要老行为就勾上这个
+        self.chk_box_merge_bar = GlassCheck(tr("settings.box_merge_bar"),
+                                            dark=self._dark)
+        self.chk_box_merge_bar.toggled.connect(self._on_box_merge_bar)
+        col.addWidget(self.chk_box_merge_bar)
+
         # 卸载：这一页最下面，隔一条线跟上面的开关分开（也离得远一点，免得手滑）
         col.addStretch(1)
         line = QFrame()
@@ -725,6 +732,11 @@ class SettingsWindow(GlassWindow):
         if self._building:
             return
         self.ctrl.set_box_merge(bool(on))
+
+    def _on_box_merge_bar(self, on: bool) -> None:
+        if self._building:
+            return
+        self.ctrl.set_box_merge_bar(bool(on))
 
     def _on_panel_dark(self, on: bool) -> None:
         if self._building:
@@ -863,7 +875,7 @@ class SettingsWindow(GlassWindow):
     def _apply_style(self) -> None:
         self.setStyleSheet(_QSS_DARK if self._dark else _QSS)
         for w in (self.chk_cursor, self.chk_fullscreen, self.chk_auto_align,
-                  self.chk_box_merge):
+                  self.chk_box_merge, self.chk_box_merge_bar):
             w.set_dark(self._dark)
         self.picker.set_dark(self._dark)
         self.cmb_scheme.set_light(not self._dark)
@@ -1020,6 +1032,8 @@ class SettingsWindow(GlassWindow):
                 bool(getattr(cfg, "hide_fullscreen", True)))
             self.chk_auto_align.setChecked(bool(getattr(cfg, "auto_align", True)))
             self.chk_box_merge.setChecked(bool(getattr(cfg, "box_merge", True)))
+            self.chk_box_merge_bar.setChecked(
+                bool(getattr(cfg, "box_merge_bar", False)))
             self.picker.set_current(str(getattr(cfg, "panel_theme", "light")))
             codes = [c for c, _ in LANGS]
             cur = str(getattr(cfg, "lang", "zh") or "zh")
