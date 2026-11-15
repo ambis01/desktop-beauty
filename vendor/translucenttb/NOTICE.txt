@@ -1,0 +1,18 @@
+TranslucentTB —— 任务栏背景透明（本程序随包分发的一份独立程序）
+================================================================
+
+上游：https://github.com/TranslucentTB/TranslucentTB
+版本：2026.2.0.d4636e4（与上游 Release 里的二进制一致，**未做任何修改**）
+许可：GPL-3.0（全文见同目录 LICENSE-GPL-3.0.txt）
+源码：https://github.com/TranslucentTB/TranslucentTB（同版本对应的 release tag）
+
+它和 desktop beauty 是两个独立程序（mere aggregation），桌面美化程序只是
+负责拉起它、看护它（explorer 重启后它会被带走）、并写它的 settings.json：
+
+    desktop_appearance.accent = "clear"   # 任务栏背景整个去掉
+    show_line = false                     # 去掉那条 1px 边线
+    hide_tray = true                      # 不在托盘里占位
+    disable_saving = true                 # 不让它自己回写配置
+
+不想要透明任务栏：删掉 desktopbeauty.exe 同级的 translucenttb\ 目录，
+或者把 settings.json 里的 accent 改回 "normal"。

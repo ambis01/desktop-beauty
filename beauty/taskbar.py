@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import subprocess
 import time
+import winreg
 from ctypes import wintypes as wt
 from pathlib import Path
 
@@ -25,10 +27,31 @@ TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_TERMINATE = 0x0001
 
 EXE_NAME = "TranslucentTB.exe"
+ADVANCED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+
+
+def _candidates() -> list[Path]:
+    """TranslucentTB 可能在哪：本程序自带的那份优先，最后才是用户自己装的。"""
+    out: list[Path] = []
+    try:
+        from . import install
+        out.append(install.install_dir() / "translucenttb" / EXE_NAME)
+        out.append(install.dist_root() / "translucenttb" / EXE_NAME)
+        # 源码跑的时候它放在仓库的 vendor\ 下
+        out.append(install.dist_root() / "vendor" / "translucenttb" / EXE_NAME)
+    except Exception:  # noqa: BLE001 - 拿不到安装路径就只找系统里那份
+        pass
+    out.append(Path.home() / "AppData" / "Local" / "Programs" / "TranslucentTB" / EXE_NAME)
+    return out
 
 
 def exe_path() -> Path:
-    return Path.home() / "AppData" / "Local" / "Programs" / "TranslucentTB" / EXE_NAME
+    """自带的优先（升级/装的时候会一起复制过去），没有再退回用户自己装的那份。"""
+    cands = _candidates()
+    for p in cands:
+        if p.is_file():
+            return p
+    return cands[-1]
 
 
 def available() -> bool:
@@ -165,3 +188,35 @@ def ensure(clear: bool, maximized: str) -> None:
     # 否则表现就是「任务栏黑边回来了，面板怎么点都没救」
     if not apply_settings(maximized, clear):
         start()
+
+
+# ---------------------------------------------------------------- 任务栏对齐
+def reg_key() -> str:
+    """测试时可用 DESKBEAUTY_TASKBAR_KEY 指到别的键，别动真设置。"""
+    return os.environ.get("DESKBEAUTY_TASKBAR_KEY") or ADVANCED_KEY
+
+
+def set_left_align(on: bool = True) -> bool:
+    """任务栏图标靠左：`TaskbarAl = 0`（1 = 居中）。返回有没有真的改动。
+
+    这是 Windows 自己的设置（任务栏设置 → 任务栏行为 → 任务栏对齐方式），
+    不需要注入、不用重启 explorer，改完当场生效。以前只在开发机上手动改过，
+    分出去的版本里没有，所以别人装完图标还是居中的。
+    只在启动时应用一次：watchdog 每 8 秒跑的那个循环里**不**反复写，
+    否则用户自己去设置里改成居中，会被我们一直掰回去。
+    """
+    want = 0 if on else 1
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key(), 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+            try:
+                current, _kind = winreg.QueryValueEx(key, "TaskbarAl")
+            except OSError:
+                current = None
+            if current == want:
+                return False
+            winreg.SetValueEx(key, "TaskbarAl", 0, winreg.REG_DWORD, want)
+            return True
+    except OSError:
+        return False
+

@@ -20,6 +20,15 @@ zip 里带的是 PyInstaller 的 onedir 产物，Qt 的 DLL 是**独立文件**�
 
 如果你把打包版变成自己产品的一部分对外分发，请自己再确认一遍 LGPL 的其余义务（附许可文本、保留声明等）。
 
+
+## 随包分发的独立程序（GPL）
+
+| 组件 | 许可 | 用在哪 | 备注 |
+| --- | --- | --- | --- |
+| [TranslucentTB](https://github.com/TranslucentTB/TranslucentTB) | **GPL-3.0** | 任务栏背景透明（`beauty/taskbar.py` 负责拉起 / 看护 / 写它的 `settings.json`） | 放在 zip 的 `translucenttb\` 目录里（安装后是 `%LOCALAPPDATA%\Programs\desktopbeauty\translucenttb\`），**未做任何修改**，与上游 Release 的二进制一致；许可全文 `LICENSE-GPL-3.0.txt`、来源说明 `NOTICE.txt` 都在那个目录里。它和本项目是两个独立程序（mere aggregation），本项目自身仍是 MIT |
+
+不想要它：删掉 `translucenttb\` 目录即可（任务栏就不透明了，其余功能不受影响）。
+
 ## 数据 / 服务
 
 | 服务 | 用途 | 许可/条款 |

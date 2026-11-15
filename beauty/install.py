@@ -186,6 +186,19 @@ def install(src: Path | None = None, force: bool = False) -> bool:
     if stopped == "timeout":
         raise RuntimeError("旧版本还在运行，文件被占着。先在面板里退出再点安装。")
 
+    # 0b. 自带的那份 TranslucentTB 要是正从安装目录跑着，也得先停：
+    #     它是注入在 explorer 里的独立进程，exe/dll 一样被占（升级到 1.0.2 之后才会撞上）
+    tb_was_running = False
+    try:
+        from . import taskbar as _tb
+        exe = _tb.exe_path()
+        if str(exe).lower().startswith(str(dst).lower()):
+            tb_was_running = _tb.is_running()
+            if tb_was_running:
+                _tb.stop()
+    except Exception:  # noqa: BLE001
+        pass
+
     # 1. 本体（PyInstaller 的 app 文件夹）
     app_src = src / APP_SUBDIR
     if not app_src.is_dir():
@@ -197,6 +210,12 @@ def install(src: Path | None = None, force: bool = False) -> bool:
     if not launcher_src.is_file():
         raise FileNotFoundError(f"打包目录里没有 {LAUNCHER}：{src}")
     shutil.copy2(launcher_src, dst / LAUNCHER)
+
+    # 2b. 自带的 TranslucentTB（任务栏去黑边靠它注入 explorer）。没有也能用，
+    #     只是任务栏不会透明 —— 以前只有开发机上另装了一份，分出去的包就没人管。
+    tb_src = src / "translucenttb"
+    if tb_src.is_dir():
+        shutil.copytree(tb_src, dst / "translucenttb", dirs_exist_ok=True)
 
     # 3. target.txt：第一行是程序本体（相对转发器所在目录），第二行是工作目录
     (dst / "target.txt").write_text(
@@ -219,6 +238,14 @@ def install(src: Path | None = None, force: bool = False) -> bool:
 
     # 5. 卸载项
     _write_uninstall_entry(dst, launcher, app_exe)
+
+    # 6. 刚才停掉的 TranslucentTB 再拉起来（不然任务栏会黑一下，要等 watchdog 8 秒）
+    if tb_was_running:
+        try:
+            from . import taskbar as _tb2
+            _tb2.start()
+        except Exception:  # noqa: BLE001
+            pass
     return True
 
 
@@ -441,6 +468,15 @@ def uninstall(remove_files: bool = True, wipe: bool = True) -> str:
             pass
     _delete_reg_key(reg_key())
     if remove_files:
+        # 自带的 TranslucentTB 要是正从安装目录跑着，先停掉再删目录
+        # （它注入在 explorer 里，光删文件它还会赖着）
+        try:
+            from . import taskbar as _tb
+            exe = _tb.exe_path()
+            if str(exe).lower().startswith(str(install_dir()).lower()):
+                _tb.stop()
+        except Exception:  # noqa: BLE001
+            pass
         _delete_dir_later(install_dir())
     return what
 

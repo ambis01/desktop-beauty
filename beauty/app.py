@@ -1904,7 +1904,18 @@ class Controller(QObject):
     # ------------------------------------------------------------ 任务栏外观
     def _start_taskbar_watch(self) -> None:
         """任务栏透明靠 TranslucentTB 注入 explorer，explorer 一重启它就没了，
-        所以这里常驻盯着，掉了就拉回来。"""
+        所以这里常驻盯着，掉了就拉回来。
+
+        顺带把「任务栏图标靠左」（`TaskbarAl = 0`）写一次——那是 Windows 自己的
+        设置，不需要注入；以前只在开发机上手动改过，分出去的版本里没有这个值，
+        别人装完图标还是居中的。只在启动时写一次，watchdog 里不重复写，
+        免得用户自己去设置里改成居中又被掰回来。
+        """
+        try:
+            if tb.set_left_align(getattr(self.cfg, "taskbar_left", True)):
+                _log("任务栏图标已改为靠左 (TaskbarAl=0)")
+        except Exception:  # noqa: BLE001 - 改不了对齐不影响别的
+            pass
         tb.ensure(self.cfg.taskbar_clear, self.cfg.taskbar_maximized)
         self._tb_timer = QTimer(self)
         self._tb_timer.setInterval(8000)

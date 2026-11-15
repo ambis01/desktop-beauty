@@ -43,6 +43,8 @@ jobs:
           New-Item -ItemType Directory -Force "$out\app" | Out-Null
           Copy-Item "bin\desktopbeauty.exe" $out -Force
           Copy-Item "dist-app\desktopbeauty-app\*" "$out\app" -Recurse -Force
+          # 自带的 TranslucentTB（任务栏透明，GPL-3.0，见 vendor/translucenttb/NOTICE.txt）
+          Copy-Item "vendor\translucenttb" $out -Recurse -Force
           # 转发器按这两行决定跑哪个本体（详见 README「转发器的两种目标」）
           $txt = "app\desktopbeauty-app.exe`napp`n"
           [IO.File]::WriteAllText(

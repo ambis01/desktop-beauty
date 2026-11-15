@@ -82,6 +82,7 @@ class Config:
     box_glass_alpha: int = 212           # 收纳盒玻璃浓度
     box_radius: int = 10                 # 收纳盒圆角（用户要小一点）
     style_preset: str = "mist"           # 选中的美化风格方案（见 style_presets）
+    taskbar_left: bool = True            # 任务栏图标靠左（TaskbarAl=0），启动时写一次
     taskbar_clear: bool = True           # 要不要把任务栏黑边去掉（托管 TranslucentTB）
     taskbar_maximized: str = "acrylic"    # 有窗口最大化时任务栏用哪种：acrylic/clear/normal
     cursor_dot: bool = True              # 桌面上用「圆点拖尾」指针
@@ -130,6 +131,7 @@ class Config:
         cfg.style_preset = str(raw.get("style_preset") or "mist")
         if cfg.style_preset not in ("mist", "gauze", "dense"):
             cfg.style_preset = "mist"
+        cfg.taskbar_left = bool(raw.get("taskbar_left", True))
         cfg.taskbar_clear = bool(raw.get("taskbar_clear", True))
         cfg.cursor_dot = bool(raw.get("cursor_dot", True))
         cfg.cursor_color = str(raw.get("cursor_color", "#2e3238") or "#2e3238")
@@ -201,6 +203,7 @@ class Config:
             "box_glass_alpha": int(self.box_glass_alpha),
             "box_radius": int(self.box_radius),
             "style_preset": str(self.style_preset),
+            "taskbar_left": bool(self.taskbar_left),
             "taskbar_clear": bool(self.taskbar_clear),
             "taskbar_maximized": str(self.taskbar_maximized),
             "cursor_dot": bool(self.cursor_dot),

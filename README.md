@@ -1,4 +1,4 @@
-# desktop beauty · 毛玻璃收纳盒
+﻿# desktop beauty · 毛玻璃收纳盒
 
 一个 Python + PySide6 的 Windows 11 桌面小工具：把桌面上的两个图标拖到一起，就生成一个**毛玻璃收纳盒**（图标从桌面收进去）；再配一组可自由摆放的**毛玻璃卡片**——时钟 / 待办 / 日历 / 倒计时 / 正在播放的音乐。界面全部自绘，不用任何原生控件。
 
@@ -503,11 +503,11 @@ for win in reversed(self._z_windows()):   # _z_windows() 是从下到上的期�
 
 | 改动 | 状态 | 做法 / 怎么恢复 |
 | --- | --- | --- |
-| **任务栏背景整个去掉**（图标直接浮在壁纸上） | 已生效，**由本程序托管** | 底层还是 **TranslucentTB**（`%LOCALAPPDATA%\Programs\TranslucentTB\`，靠 `ExplorerTAP.dll` 注入 explorer），但它的自启项已经删掉，改由 `beauty/taskbar.py` 负责：开机拉起、每 8 秒检查一次（explorer 一重启它就被带走）、面板里一个开关启停。备份在 `%APPDATA%\DeskBeauty\backups\TranslucentTB.lnk.bak` |
+| **任务栏背景整个去掉**（图标直接浮在壁纸上） | 已生效，**TranslucentTB 随包分发** | 底层是 **TranslucentTB**（GPL-3.0，靠 `ExplorerTAP.dll` 注入 explorer），zip 里带了一份（`translucenttb\`，安装后进 `%LOCALAPPDATA%\Programs\desktopbeauty\translucenttb\`），由 `beauty/taskbar.py` 负责：开机拉起、每 8 秒检查一次（explorer 一重启它就被带走）、写它的 `settings.json`。**以前只认 `%LOCALAPPDATA%\Programs\TranslucentTB\`，别人机器上没装这个目录 ⇒ 分出去的版本没有透明任务栏**，现在自带的优先、用户自己装的兜底 |
 | 有窗口最大化时 | 磨砂（`accent: acrylic`） | 以前是深色实底（看着就是一条黑边），现在改成磨砂模糊；面板里可切 磨砂 / 全透明 / 深色实底 |
 | **去掉任务栏中间的搜索框** | 已生效 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Search\SearchboxTaskbarMode = 0`（0=隐藏，1=只留图标，2=搜索框，3=搜索框+标签）。恢复：任务栏设置 → 任务栏项 → 搜索 → 选回「搜索框」；改完要重启 explorer 才生效 |
 | 任务栏自动隐藏 | **已撤销**（用户要求保留任务栏） | 想开：任务栏设置 → 任务栏行为 → 自动隐藏任务栏 |
-| **任务栏图标靠左** | 已生效 | `HKCU\…\Explorer\Advanced\TaskbarAl = 0`（1=居中）。实测 **改完当场生效**，不用重启 explorer；恢复：任务栏设置 → 任务栏行为 → 任务栏对齐方式 → 居中 |
+| **任务栏图标靠左** | 已生效，**程序启动时写一次** | `beauty/taskbar.py` 的 `set_left_align()` 写 `HKCU\…\Explorer\Advanced\TaskbarAl = 0`（1=居中；值已经对就不写）。实测改完当场生效，不用重启 explorer。只在启动时写一次（watchdog 不反复写，否则你手动改回居中会被掰回去）；不要的话把 `config.json` 的 `taskbar_left` 改成 `false`，恢复：任务栏设置 → 任务栏行为 → 任务栏对齐方式 → 居中 |
 
 为什么不能自己做进程序里：本机是 26100 版，任务栏背景是**任务栏自己的 XAML** 画的（不是 DWM 画的），那些「改 DWM 属性」的经典办法全部无效——实测过 `SetWindowCompositionAttribute`（亚克力 / 全透明渐变，调用返回成功但像素零变化）、`TaskbarAcrylicOpacity=0`、`UseOLEDTaskbarTransparency=1`，任务栏那一行亮度始终恒定为 96–110，壁纸变化完全透不出来。唯一的路是**往 explorer 里注入 DLL 改它的视觉树**，那正是 TranslucentTB 干的事。所以我们不自研注入器（等于重写它，还要跟 Windows 更新赛跑），而是把它收进来管。
 
@@ -532,7 +532,7 @@ Windows 默认把「把 A 拖到 B 图标上」当成**用 B 打开 A**。所以
 
 - 盒子数据：`%APPDATA%\DeskBeauty\boxes\<id>\`，每个盒子一个目录，里面就是被收进去的快捷方式文件
 - 索引：`%APPDATA%\DeskBeauty\boxes.json`（位置、顺序、每个文件原来的目录）
-- **只有 `.lnk` / `.url` 快捷方式会被收纳**，目录和普通文件一律拒绝
+- 收纳的是**任意普通文件**（快捷方式、文档、图片、压缩包…都是真的 `shutil.move` 进去），**目录不收**、`desktop.ini` / `thumbs.db` 不收；`origins` 里记着每个文件原来的目录，放回时优先回原目录
 - 解散/删除时如果某个图标挪不回原位（比如公共桌面需要管理员权限），**盒子会保留，绝不删文件**
 - 放回桌面优先回原目录（个人桌面 / 公共桌面），写不进去再退到个人桌面
 
@@ -655,6 +655,7 @@ beauty/              全部代码，按功能分模块
   setup_window.py    第一次双击时那块「安装到这台电脑」玻璃窗
   i18n.py            中英双语文案
 bin/launcher.cs      任务栏转发器源码（csc 编译成 desktopbeauty.exe）
+vendor/translucenttb/ 随包分发的 TranslucentTB（GPL-3.0，任务栏透明；见 NOTICE.txt）
 docs/                文档截图；make_panel_shot.py 用来重新生成面板图
 shots/               桌面截图
 dist/                打包产物（不进仓库，发布时放 Releases）
