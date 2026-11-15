@@ -34,7 +34,9 @@ from .box_widget import (
 from .boxes import BoxStore, acceptable as boxable
 from .calendar_widget import CalendarWidget
 from .clock_widget import ClockWidget
-from .config import DATA_DIR, CardData, Config, ensure_dirs
+from .config import (
+    DATA_DIR, CardData, Config, clamp_alpha, ensure_dirs, norm_color,
+)
 from .countdown_widget import CountdownWidget
 from .dragwatch import DragWatcher
 from .glass import GLOBAL_QSS
@@ -137,6 +139,11 @@ class Controller(QObject):
 
         self.watcher = DragWatcher()
         self.preview = BoxPreview()
+        # 拖两个图标到一起时那个「合成预览」也用盒子的外观
+        self.preview.glass_alpha = clamp_alpha(self.cfg.box_glass_alpha)
+        self.preview.radius = float(self.cfg.box_radius)
+        self.preview.glass_rgb = (QColor(self.cfg.box_color)
+                                  if self.cfg.box_color else None)
         self.watcher.armed.connect(self._on_armed)
         self.watcher.clear.connect(self.preview.hide)
         self.watcher.merged.connect(self._on_merged)
@@ -344,16 +351,16 @@ class Controller(QObject):
         """按卡片类型造窗口：时钟 / 待办 / 日历 / 倒计时。"""
         makers = {
             "clock": lambda: ClockWidget(card, self.cfg.save,
-                                         radius=self.cfg.box_radius),
+                                         radius=self.cfg.card_radius),
             "todo": lambda: TodoWidget(card, self.cfg.save, self.agenda,
-                                       radius=self.cfg.box_radius),
+                                       radius=self.cfg.card_radius),
             "calendar": lambda: CalendarWidget(card, self.cfg.save, self.agenda,
-                                               radius=self.cfg.box_radius),
+                                               radius=self.cfg.card_radius),
             "countdown": lambda: CountdownWidget(card, self.cfg.save, self.agenda,
-                                                 radius=self.cfg.box_radius),
+                                                 radius=self.cfg.card_radius),
             "music": lambda: MusicWidget(card, self.cfg.save,
                                          self.music.channel(card),
-                                         radius=self.cfg.box_radius),
+                                         radius=self.cfg.card_radius),
         }
         make = makers.get(str(getattr(card, "type", "clock")), makers["clock"])
         win = make()
@@ -373,6 +380,7 @@ class Controller(QObject):
                 win.set_weather_data(self.weather.get(card.city or ""))
             except (RuntimeError, TypeError):
                 pass
+        self._apply_card_look(win)
         return win
 
     def _agenda_changed(self) -> None:
@@ -1926,46 +1934,164 @@ class Controller(QObject):
                  % (moved, len(want), (t_walk - t_all) * 1000.0,
                     (time.perf_counter() - t_walk) * 1000.0))
 
+    # ------------------------------------------------- 外观：盒子 / 卡片
     def _apply_box_look(self, win) -> None:
-        """面板里改的玻璃浓度 / 圆角，盒子当场跟着变。"""
-        win.glass_alpha = int(self.cfg.box_glass_alpha)
+        """面板里改的颜色 / 浓度 / 圆角，盒子当场跟着变。"""
+        win.glass_alpha = clamp_alpha(self.cfg.box_glass_alpha)
         win.radius = float(self.cfg.box_radius)
+        win.glass_rgb = QColor(self.cfg.box_color) if self.cfg.box_color else None
+        win.update()
+
+    def _apply_card_look(self, win) -> None:
+        """卡片那三个参数和盒子是分开的：颜色 / 浓度 / 圆角各管各的。"""
+        win.glass_alpha = clamp_alpha(self.cfg.card_glass_alpha)
+        win.radius = float(self.cfg.card_radius)
+        win.glass_rgb = QColor(self.cfg.card_color) if self.cfg.card_color else None
         win.update()
 
     def apply_style_preset(self, preset_id: str) -> None:
-        """换美化风格：玻璃浓度 / 圆角 / 卡片玻璃浓度一次套上去。"""
+        """换内置风格：玻璃浓度 / 圆角 / 卡片玻璃浓度一次套上去（不动颜色）。"""
         from . import style_presets
         preset = style_presets.get(preset_id)
         if preset is None:
             return
         self.cfg.style_preset = preset["id"]
-        self.cfg.box_glass_alpha = int(preset["box_alpha"])
+        self.cfg.box_glass_alpha = clamp_alpha(preset["box_alpha"])
         self.cfg.box_radius = int(preset["radius"])
+        self.cfg.card_glass_alpha = clamp_alpha(preset["card_alpha"])
+        self.cfg.card_radius = int(preset["radius"])
         for card in self.cfg.cards:
-            card.glass_alpha = int(preset["card_alpha"])
+            card.glass_alpha = self.cfg.card_glass_alpha
         self.cfg.save()
         self.apply_box_style()
-        for win in self.card_widgets.values():
-            try:
-                win.glass_alpha = max(150, min(255, int(preset["card_alpha"])))
-                win.radius = float(self.cfg.box_radius)
-                win.update()
-            except (RuntimeError, TypeError):
-                continue
         # 提示条跟卡片同一个浓度（它自己不是卡片，单独更新一次）
-        self.toast.glass_alpha = max(150, min(255, int(preset["card_alpha"])))
+        try:
+            self.toast.glass_alpha = clamp_alpha(self.cfg.card_glass_alpha)
+        except (RuntimeError, AttributeError):
+            pass
         _log(f"style preset: {preset['id']}")
 
     def apply_box_style(self) -> None:
+        """把所有活着的窗口按配置重刷一遍（面板改外观、套方案都走这里）。"""
         for win in self.windows.values():
             self._apply_box_look(win)
-        # 卡片的圆角和盒子用同一个值
         for win in self.card_widgets.values():
-            win.radius = float(self.cfg.box_radius)
-            win.update()
-        self.preview.glass_alpha = int(self.cfg.box_glass_alpha)
-        self.preview.radius = float(self.cfg.box_radius)
-        self.preview.update()
+            try:
+                self._apply_card_look(win)
+            except (RuntimeError, TypeError):
+                continue
+        try:
+            self.preview.glass_alpha = clamp_alpha(self.cfg.box_glass_alpha)
+            self.preview.radius = float(self.cfg.box_radius)
+            self.preview.glass_rgb = (QColor(self.cfg.box_color)
+                                      if self.cfg.box_color else None)
+            self.preview.update()
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ---- 自定义外观 / 方案 ----
+    def style_values(self) -> dict:
+        """现在这套外观（存方案、写面板都用它）。"""
+        cfg = self.cfg
+        return {
+            "box_color": str(cfg.box_color),
+            "box_alpha": int(cfg.box_glass_alpha),
+            "box_radius": int(cfg.box_radius),
+            "card_color": str(cfg.card_color),
+            "card_alpha": int(cfg.card_glass_alpha),
+            "card_radius": int(cfg.card_radius),
+        }
+
+    def apply_style_values(self, item: dict) -> None:
+        """把一组外观参数套上去（颜色空 = 默认白玻璃）。"""
+        cfg = self.cfg
+        cfg.box_color = norm_color(item.get("box_color"))
+        cfg.card_color = norm_color(item.get("card_color"))
+        cfg.box_glass_alpha = clamp_alpha(item.get("box_alpha",
+                                                   cfg.box_glass_alpha))
+        cfg.card_glass_alpha = clamp_alpha(item.get("card_alpha",
+                                                    cfg.card_glass_alpha))
+        cfg.box_radius = max(0, min(30, int(item.get("box_radius",
+                                                     cfg.box_radius) or 0)))
+        cfg.card_radius = max(0, min(30, int(item.get("card_radius",
+                                                      cfg.card_radius) or 0)))
+        for card in cfg.cards:
+            card.glass_alpha = cfg.card_glass_alpha
+        cfg.save()
+        self.apply_box_style()
+
+    def set_style_color(self, which: str, color: str) -> None:
+        value = norm_color(color)
+        if which == "card":
+            self.cfg.card_color = value
+        else:
+            self.cfg.box_color = value
+        self.cfg.save()
+        self.apply_box_style()
+
+    def set_style_alpha(self, which: str, value) -> None:
+        alpha = clamp_alpha(value)
+        if which == "card":
+            self.cfg.card_glass_alpha = alpha
+            for card in self.cfg.cards:
+                card.glass_alpha = alpha
+        else:
+            self.cfg.box_glass_alpha = alpha
+        self.cfg.save()
+        self.apply_box_style()
+
+    def set_style_radius(self, which: str, value) -> None:
+        radius = max(0, min(30, int(value)))
+        if which == "card":
+            self.cfg.card_radius = radius
+        else:
+            self.cfg.box_radius = radius
+        self.cfg.save()
+        self.apply_box_style()
+
+    def apply_style_scheme(self, name: str) -> bool:
+        item = next((s for s in self.cfg.style_schemes
+                     if str(s.get("name")) == str(name)), None)
+        if item is None:
+            return False
+        self.apply_style_values(item)
+        _log(f"style scheme: {name}")
+        return True
+
+    def save_style_scheme(self, name: str) -> bool:
+        name = str(name or "").strip()
+        if not name:
+            return False
+        item = dict(self.style_values(), name=name)
+        self.cfg.style_schemes = [
+            s for s in self.cfg.style_schemes if str(s.get("name")) != name
+        ] + [item]
+        self.cfg.save()
+        return True
+
+    def del_style_scheme(self, name: str) -> None:
+        self.cfg.style_schemes = [
+            s for s in self.cfg.style_schemes if str(s.get("name")) != str(name)
+        ]
+        self.cfg.save()
+
+    def reset_style(self) -> None:
+        """恢复成现在这套默认外观：白玻璃、标准浓度、圆角 10。"""
+        self.apply_style_values({"box_color": "", "card_color": "",
+                                 "box_alpha": 212, "card_alpha": 212,
+                                 "box_radius": 10, "card_radius": 10})
+
+    def set_taskbar_align(self, code) -> None:
+        """任务栏图标靠左 / 居中：写 Windows 自己的 TaskbarAl，当场生效。"""
+        align = "center" if str(code) == "center" else "left"
+        self.cfg.taskbar_align = align
+        self.cfg.taskbar_left = align == "left"
+        self.cfg.save()
+        try:
+            tb.set_left_align(self.cfg.taskbar_left)
+        except Exception:  # noqa: BLE001 - 改不了对齐不影响别的
+            pass
+        _log(f"taskbar align: {align}")
 
     def _on_box_removed(self, box_id: str) -> None:
         """盒子把自己删掉了（里面的图标被拖空）。"""

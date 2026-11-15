@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .boxes import _name_key
-from .controls import ColorSwatches, GlassCheck, GlassCombo, ThemePicker
+from .controls import ColorSwatches, CleanSlider, GlassCheck, GlassCombo, ThemePicker
 from .glass import GlassMenu, GlassWindow, paint_frost, round_corners
 from .hotkey import (
     DEFAULT_PANEL, DEFAULT_TOGGLE, hotkey_text, normalize,
@@ -29,8 +29,25 @@ from .ui import PANEL_SIZE, panel_rect, scale_qss, u
 
 BOX_ALPHAS = (("清透", 190), ("标准", 212), ("厚一点", 240))
 BOX_RADII = (("小 10", 10), ("中 14", 14), ("大 20", 20))
+# 自定义外观的调色板：前几个偏中性（最常见），后面几个饱和色
+GLASS_PALETTE = ("#ffffff", "#f1f3f7", "#dfe5ee", "#cbd6e6", "#b6c6dd",
+                 "#e8d9f2", "#f4dede", "#fbe7cf", "#dcecdc", "#d6e7f2",
+                 "#e6e0f8", "#f6f1e3")
 DEFAULT_CURSOR_COLOR = "#2e3238"
 DEFAULT_CURSOR_ALPHA = 100
+STYLE_DEFAULT_ALPHA = 212
+STYLE_DEFAULT_RADIUS = 10
+
+
+def _alpha_to_percent(alpha: int) -> int:
+    """玻璃浓度（150~255）→ 面板上给人看的「透明度 %」（100% = 最透）。"""
+    a = max(150, min(255, int(alpha)))
+    return int(round((255 - a) * 100.0 / 105.0))
+
+
+def _percent_to_alpha(percent: int) -> int:
+    p = max(0, min(100, int(percent)))
+    return int(round(255 - p * 105.0 / 100.0))
 
 PAGES = ("cards", "boxes", "style", "mouse", "keys", "settings", "lang")
 
@@ -101,6 +118,12 @@ class SettingsWindow(GlassWindow):
         self.setStyleSheet(_QSS_DARK if self._dark else _QSS)
         self._building = False
         self._pending_page = "cards"
+        # 美化风格页那几个控件的引用（颜色 / 透明度 / 圆角，盒子与卡片各一套）
+        self._swatches: dict = {}
+        self._style_alpha_slider: dict = {}
+        self._style_alpha_label: dict = {}
+        self._style_radius_slider: dict = {}
+        self._style_radius_label: dict = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(u(18), u(14), u(18), u(16))
@@ -530,15 +553,101 @@ class SettingsWindow(GlassWindow):
         holder.setObjectName("cardholder")
         holder.setAutoFillBackground(False)
         self._styles_box = QVBoxLayout(holder)
-        self._styles_box.setContentsMargins(0, 0, 0, 0)
+        self._styles_box.setContentsMargins(0, 0, 0, u(6))
         self._styles_box.setSpacing(u(6))
         scroll.setWidget(holder)
         col.addWidget(scroll, 1)
+
+        # 内置方案（雾白 / 薄纱 / 浓雾），行由 _rebuild_styles 填
+        self._presets_box = QVBoxLayout()
+        self._presets_box.setSpacing(u(6))
+        self._styles_box.addLayout(self._presets_box)
+
+        self._styles_box.addSpacing(u(2))
+        self._styles_box.addWidget(_divider())
+        self._styles_box.addWidget(_head(tr("style.custom")))
+        self._build_style_group("box", tr("style.box"))
+        self._build_style_group("card", tr("style.card"))
+
+        row = QHBoxLayout()
+        row.setSpacing(u(8))
+        self.btn_style_save = QPushButton(tr("style.save_scheme"))
+        self.btn_style_save.clicked.connect(self._save_style_scheme)
+        row.addWidget(self.btn_style_save, 1)
+        self.btn_style_reset = QPushButton(tr("style.reset"))
+        self.btn_style_reset.clicked.connect(self._reset_style)
+        row.addWidget(self.btn_style_reset, 1)
+        self._styles_box.addLayout(row)
+
+        self._styles_box.addWidget(_divider())
+        self._styles_box.addWidget(_head(tr("style.schemes")))
+        self._schemes_box = QVBoxLayout()
+        self._schemes_box.setSpacing(u(6))
+        self._styles_box.addLayout(self._schemes_box)
+        self._styles_box.addStretch(1)
         self._rebuild_styles()
         return page
 
+    def _build_style_group(self, which: str, title: str) -> None:
+        """一组「颜色 + 透明度 + 圆角」：收纳盒一组、卡片一组，互不影响。"""
+        self._styles_box.addWidget(self._row_label(title))
+
+        sw = ColorSwatches(GLASS_PALETTE)
+        sw.picked.connect(lambda c, w=which: self._on_style_color(w, c))
+        self._swatches[which] = sw
+        self._styles_box.addWidget(sw)
+
+        colors = QHBoxLayout()
+        colors.setSpacing(u(8))
+        btn_default = QPushButton(tr("style.default_color"))
+        btn_default.setObjectName("ghost")
+        btn_default.clicked.connect(
+            lambda _=False, w=which: self._on_style_default(w))
+        colors.addWidget(btn_default)
+        btn_more = QPushButton(tr("style.more_color"))
+        btn_more.setObjectName("ghost")
+        btn_more.clicked.connect(
+            lambda _=False, w=which: self._pick_style_color(w))
+        colors.addWidget(btn_more)
+        colors.addStretch(1)
+        self._styles_box.addLayout(colors)
+
+        self._styles_box.addWidget(self._row_label(tr("style.alpha")))
+        slider = CleanSlider()
+        slider.setRange(0, 100)
+        alpha_label = QLabel("")
+        alpha_label.setObjectName("tag")
+        alpha_label.setMinimumWidth(u(38))
+        alpha_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        h = QHBoxLayout()
+        h.setSpacing(u(8))
+        h.addWidget(slider, 1)
+        h.addWidget(alpha_label)
+        slider.valueChanged.connect(
+            lambda value, w=which: self._on_style_alpha(w, value))
+        self._style_alpha_slider[which] = slider
+        self._style_alpha_label[which] = alpha_label
+        self._styles_box.addLayout(h)
+
+        self._styles_box.addWidget(self._row_label(tr("style.radius")))
+        rslider = CleanSlider()
+        rslider.setRange(0, 30)
+        radius_label = QLabel("")
+        radius_label.setObjectName("tag")
+        radius_label.setMinimumWidth(u(38))
+        radius_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        hr = QHBoxLayout()
+        hr.setSpacing(u(8))
+        hr.addWidget(rslider, 1)
+        hr.addWidget(radius_label)
+        rslider.valueChanged.connect(
+            lambda value, w=which: self._on_style_radius(w, value))
+        self._style_radius_slider[which] = rslider
+        self._style_radius_label[which] = radius_label
+        self._styles_box.addLayout(hr)
+
     def _rebuild_styles(self) -> None:
-        box = getattr(self, "_styles_box", None)
+        box = getattr(self, "_presets_box", None)
         if box is None:
             return
         _clear_layout(box)
@@ -561,13 +670,142 @@ class SettingsWindow(GlassWindow):
                 lambda _=False, pid=preset["id"]: self._use_style(pid))
             h.addWidget(btn)
             box.addWidget(row)
-        box.addStretch(1)
+        self._sync_style_controls()
+        self._rebuild_schemes()
+
+    def _sync_style_controls(self) -> None:
+        """把配置里的外观值同步到滑条 / 色板 / 标签上（不发信号给控制器）。"""
+        cfg = self.ctrl.cfg
+        prev = self._building
+        self._building = True
+        try:
+            for which in ("box", "card"):
+                color = str(getattr(cfg, "box_color" if which == "box"
+                                    else "card_color", "") or "")
+                sw = self._swatches.get(which)
+                if sw is not None and color:
+                    sw.set_current(QColor(color))
+                alpha = int(cfg.box_glass_alpha if which == "box"
+                            else cfg.card_glass_alpha)
+                percent = _alpha_to_percent(alpha)
+                slider = self._style_alpha_slider.get(which)
+                if slider is not None:
+                    slider.setValue(percent)
+                label = self._style_alpha_label.get(which)
+                if label is not None:
+                    label.setText(f"{percent}%")
+                radius = int(cfg.box_radius if which == "box" else cfg.card_radius)
+                rs = self._style_radius_slider.get(which)
+                if rs is not None:
+                    rs.setValue(radius)
+                rl = self._style_radius_label.get(which)
+                if rl is not None:
+                    rl.setText(str(radius))
+        finally:
+            self._building = prev
+
+    def _rebuild_schemes(self) -> None:
+        box = getattr(self, "_schemes_box", None)
+        if box is None:
+            return
+        _clear_layout(box)
+        schemes = list(getattr(self.ctrl.cfg, "style_schemes", []) or [])
+        if not schemes:
+            empty = QLabel(tr("style.schemes_empty"))
+            empty.setObjectName("tag")
+            box.addWidget(empty)
+            return
+        for item in schemes:
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            row = QFrame()
+            row.setObjectName("cardrow")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(u(12), u(8), u(8), u(8))
+            h.setSpacing(u(8))
+            label = QLabel(name)
+            label.setObjectName("cardname")
+            h.addWidget(label, 1)
+            apply_btn = QPushButton(tr("style.apply"))
+            apply_btn.setMinimumWidth(u(58))
+            apply_btn.clicked.connect(
+                lambda _=False, n=name: self._apply_scheme(n))
+            h.addWidget(apply_btn)
+            del_btn = QPushButton(tr("style.delete"))
+            del_btn.setMinimumWidth(u(58))
+            del_btn.clicked.connect(
+                lambda _=False, n=name: self._del_style_scheme(n))
+            h.addWidget(del_btn)
+            box.addWidget(row)
 
     def _use_style(self, preset_id: str) -> None:
         self.ctrl.apply_style_preset(preset_id)
         self.radius = float(getattr(self.ctrl.cfg, "box_radius", 10) or 10)
         self.update()
         self._rebuild_styles()
+
+    # ---- 自定义外观 ----
+    def _on_style_color(self, which: str, color: QColor) -> None:
+        if self._building:
+            return
+        self.ctrl.set_style_color(which, color.name())
+
+    def _on_style_default(self, which: str) -> None:
+        if self._building:
+            return
+        self.ctrl.set_style_color(which, "")
+        self._sync_style_controls()
+
+    def _pick_style_color(self, which: str) -> None:
+        cfg = self.ctrl.cfg
+        current = QColor(str(getattr(cfg, "box_color" if which == "box"
+                                    else "card_color", "") or "#ffffff"))
+        if not current.isValid():
+            current = QColor("#ffffff")
+        picked = ColorPicker.pick(current, 255, self._dark, self)
+        if picked is None or not picked.isValid():
+            return
+        self.ctrl.set_style_color(which, picked.name())
+        self._sync_style_controls()
+
+    def _on_style_alpha(self, which: str, value: int) -> None:
+        label = self._style_alpha_label.get(which)
+        if label is not None:
+            label.setText(f"{int(value)}%")
+        if self._building:
+            return
+        self.ctrl.set_style_alpha(which, _percent_to_alpha(value))
+
+    def _on_style_radius(self, which: str, value: int) -> None:
+        label = self._style_radius_label.get(which)
+        if label is not None:
+            label.setText(str(int(value)))
+        if self._building:
+            return
+        self.ctrl.set_style_radius(which, int(value))
+
+    def _save_style_scheme(self) -> None:
+        count = len(getattr(self.ctrl.cfg, "style_schemes", []) or [])
+        default = tr("mouse.scheme_n", n=count + 1)
+        name = GlassInput.prompt(tr("style.scheme_title"), tr("style.scheme_label"),
+                                 default, self._dark, self)
+        if not name:
+            return
+        self.ctrl.save_style_scheme(name)
+        self._rebuild_schemes()
+
+    def _apply_scheme(self, name: str) -> None:
+        if self.ctrl.apply_style_scheme(name):
+            self._sync_style_controls()
+
+    def _del_style_scheme(self, name: str) -> None:
+        self.ctrl.del_style_scheme(name)
+        self._rebuild_schemes()
+
+    def _reset_style(self) -> None:
+        self.ctrl.reset_style()
+        self._sync_style_controls()
 
     def _toggle_card(self, card_id: str, on: bool) -> None:
         self.ctrl.set_card_enabled(card_id, on)
@@ -707,6 +945,19 @@ class SettingsWindow(GlassWindow):
         col.addWidget(self._row_label(tr("settings.theme")))
         col.addWidget(self.picker)
 
+        # ---- 任务栏：图标对齐（靠左 / 居中）+ 要不要去掉黑边 ----
+        col.addSpacing(u(4))
+        col.addWidget(_divider())
+        col.addWidget(self._row_label(tr("settings.taskbar")))
+        self.cmb_align = GlassCombo(light=not self._dark)
+        self.cmb_align.setMaximumWidth(u(200))
+        self.cmb_align.changed.connect(self._on_taskbar_align)
+        col.addWidget(self.cmb_align)
+        self.chk_taskbar_clear = GlassCheck(tr("settings.taskbar_clear"),
+                                           dark=self._dark)
+        self.chk_taskbar_clear.toggled.connect(self._on_taskbar_clear)
+        col.addWidget(self.chk_taskbar_clear)
+
         self.chk_auto_align = GlassCheck(tr("settings.auto_align"), dark=self._dark)
         self.chk_auto_align.toggled.connect(self._on_auto_align)
         col.addWidget(self.chk_auto_align)
@@ -768,6 +1019,16 @@ class SettingsWindow(GlassWindow):
         if self._building:
             return
         self.ctrl.set_box_merge_bar(bool(on))
+
+    def _on_taskbar_align(self, data) -> None:
+        if self._building or not data:
+            return
+        self.ctrl.set_taskbar_align(str(data))
+
+    def _on_taskbar_clear(self, on: bool) -> None:
+        if self._building:
+            return
+        self.ctrl.set_taskbar_clear(bool(on))
 
     def _on_panel_dark(self, on: bool) -> None:
         if self._building:
@@ -1067,6 +1328,14 @@ class SettingsWindow(GlassWindow):
             self.chk_box_merge_bar.setChecked(
                 bool(getattr(cfg, "box_merge_bar", False)))
             self.picker.set_current(str(getattr(cfg, "panel_theme", "light")))
+            align = str(getattr(cfg, "taskbar_align", "") or "left")
+            if align not in ("left", "center"):
+                align = "left" if getattr(cfg, "taskbar_left", True) else "center"
+            self.cmb_align.set_items([(tr("settings.align_left"), "left"),
+                                      (tr("settings.align_center"), "center")],
+                                     0 if align == "left" else 1)
+            self.chk_taskbar_clear.setChecked(
+                bool(getattr(cfg, "taskbar_clear", True)))
             self.cmb_box_sort.set_current_data(
                 str(getattr(cfg, "box_sort", "name") or "name"))
             codes = [c for c, _ in LANGS]
@@ -1075,6 +1344,8 @@ class SettingsWindow(GlassWindow):
                                     codes.index(cur) if cur in codes else 0)
             self._sync_cursor()
             self._sync_hotkeys()
+            self._sync_style_controls()
+            self._rebuild_schemes()
             self._rebuild_cards()
             self._rebuild_boxes()
             self.radius = float(self.ctrl.cfg.box_radius or 10)

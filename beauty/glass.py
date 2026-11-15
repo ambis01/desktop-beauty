@@ -585,6 +585,9 @@ class GlassWindow(QWidget):
         self.dark = dark
         # 浅色玻璃上如果要配白字，叠一层很淡的冷灰底，字才看得清（不是黑卡）
         self.tint = None
+        # 玻璃本身的颜色（None = 默认白玻璃）。面板里可以按颜色调，
+        # 见 paint_frost 里那个 `if rgb is not None` 分支
+        self.glass_rgb = None
         self.glass_alpha = 150
         # 背景浓度（0~1）：只稀释玻璃本身，不动窗口里画的字
         # （setWindowOpacity 会把文字一起变淡，那是另一码事）
@@ -697,7 +700,21 @@ class GlassWindow(QWidget):
         # 加回来；盒子保持 1.0，就是最透的那种）
         frost = max(0.2, min(3.0, float(getattr(self, "frost", 1.0) or 1.0)))
         base = QLinearGradient(0.0, 0.0, 0.0, h)
-        if self.dark:
+        rgb = getattr(self, "glass_rgb", None)
+        if isinstance(rgb, QColor) and rgb.isValid():
+            # 自定义颜色：同一色相，上浅下深。透明度比默认那条白玻璃厚一档——
+            # 按白玻璃 0.36~0.52 的比例给彩色，选什么颜色都看不出来。
+            def _stop(target: tuple, t: float, k: float) -> QColor:
+                return QColor(
+                    int(round(rgb.red() * (1.0 - t) + target[0] * t)),
+                    int(round(rgb.green() * (1.0 - t) + target[1] * t)),
+                    int(round(rgb.blue() * (1.0 - t) + target[2] * t)),
+                    min(255, int(a * k * frost)))
+
+            base.setColorAt(0.0, _stop((255, 255, 255), 0.24, 0.52))
+            base.setColorAt(0.55, _stop((255, 255, 255), 0.10, 0.60))
+            base.setColorAt(1.0, _stop((0, 0, 0), 0.10, 0.68))
+        elif self.dark:
             base.setColorAt(0.0, QColor(46, 50, 63, int(a * 0.88)))
             base.setColorAt(0.55, QColor(26, 29, 38, int(a * 0.94)))
             base.setColorAt(1.0, QColor(16, 18, 24, a))

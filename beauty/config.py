@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -18,6 +19,25 @@ CONFIG_PATH = DATA_DIR / "config.json"
 BACKUP_DIR = DATA_DIR / "backups"
 
 DEFAULT_NOTE = "今天也要元气满满"
+
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def norm_color(value) -> str:
+    """把颜色规整成 `#rrggbb`；空 / 不合法一律当「默认白玻璃」（空串）。
+
+    配置是给人手改的，写错一个字符不该让整个玻璃变全黑，所以只认标准写法。
+    """
+    text = str(value or "").strip()
+    return text.lower() if COLOR_RE.match(text) else ""
+
+
+def clamp_alpha(value, default: int = 212) -> int:
+    """玻璃浓度：和 glass.paint_frost 里那段 clamp 保持同一个范围。"""
+    try:
+        return max(150, min(255, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def system_is_dark() -> bool:
@@ -81,8 +101,15 @@ class Config:
     taskbar_center: int = 0              # 任务栏按钮中心（物理像素），0=还没量过
     box_glass_alpha: int = 212           # 收纳盒玻璃浓度
     box_radius: int = 10                 # 收纳盒圆角（用户要小一点）
+    # ---- 外观自定义：空颜色 = 现在这套白玻璃（默认）----
+    box_color: str = ""                  # 收纳盒玻璃颜色 #rrggbb
+    card_color: str = ""                 # 卡片玻璃颜色 #rrggbb
+    card_radius: int = 10                # 卡片圆角（和收纳盒分开调）
+    card_glass_alpha: int = 212          # 卡片玻璃浓度（所有卡片共用一个）
+    style_schemes: list = field(default_factory=list)   # 自己保存的美化方案
     style_preset: str = "mist"           # 选中的美化风格方案（见 style_presets）
     taskbar_left: bool = True            # 任务栏图标靠左（TaskbarAl=0），启动时写一次
+    taskbar_align: str = "left"          # 任务栏图标对齐：left / center
     taskbar_clear: bool = True           # 要不要把任务栏黑边去掉（托管 TranslucentTB）
     taskbar_maximized: str = "acrylic"    # 有窗口最大化时任务栏用哪种：acrylic/clear/normal
     cursor_dot: bool = True              # 桌面上用「圆点拖尾」指针
@@ -130,10 +157,21 @@ class Config:
         cfg.taskbar_center = int(raw.get("taskbar_center", 0) or 0)
         cfg.box_glass_alpha = int(raw.get("box_glass_alpha", 212) or 212)
         cfg.box_radius = int(raw.get("box_radius", 20) or 20)
+        cfg.box_color = norm_color(raw.get("box_color"))
+        cfg.card_color = norm_color(raw.get("card_color"))
+        cfg.card_radius = int(raw.get("card_radius") or 0)
+        cfg.card_glass_alpha = clamp_alpha(raw.get("card_glass_alpha", 212))
+        cfg.style_schemes = [s for s in raw.get("style_schemes") or []
+                             if isinstance(s, dict)]
         cfg.style_preset = str(raw.get("style_preset") or "mist")
         if cfg.style_preset not in ("mist", "gauze", "dense"):
             cfg.style_preset = "mist"
         cfg.taskbar_left = bool(raw.get("taskbar_left", True))
+        align = str(raw.get("taskbar_align") or "").lower()
+        if align not in ("left", "center"):
+            align = "left" if cfg.taskbar_left else "center"
+        cfg.taskbar_align = align
+        cfg.taskbar_left = align == "left"
         cfg.taskbar_clear = bool(raw.get("taskbar_clear", True))
         cfg.cursor_dot = bool(raw.get("cursor_dot", True))
         cfg.cursor_color = str(raw.get("cursor_color", "#2e3238") or "#2e3238")
@@ -165,6 +203,12 @@ class Config:
         cards = raw.get("cards")
         if isinstance(cards, list):
             cfg.cards = [CardData.from_dict(c) for c in cards if isinstance(c, dict)]
+        # 老配置里卡片没有独立的圆角 / 浓度：跟着盒子和卡片里原来的值走，
+        # 别让升级一下圆角从 14 变回 10
+        if "card_radius" not in raw:
+            cfg.card_radius = int(cfg.box_radius)
+        if "card_glass_alpha" not in raw and cfg.cards:
+            cfg.card_glass_alpha = clamp_alpha(cfg.cards[0].glass_alpha)
         if cfg.style_preset == "mist" and str(raw.get("style_preset") or "") == "frost":
             # 以前那个「毛玻璃」方案已经去掉了：浓度是它留下的 0，恢复成标准值
             cfg.box_glass_alpha = 212
@@ -207,8 +251,14 @@ class Config:
             "taskbar_center": int(self.taskbar_center),
             "box_glass_alpha": int(self.box_glass_alpha),
             "box_radius": int(self.box_radius),
+            "box_color": str(self.box_color),
+            "card_color": str(self.card_color),
+            "card_radius": int(self.card_radius),
+            "card_glass_alpha": int(self.card_glass_alpha),
+            "style_schemes": list(self.style_schemes),
             "style_preset": str(self.style_preset),
             "taskbar_left": bool(self.taskbar_left),
+            "taskbar_align": str(self.taskbar_align),
             "taskbar_clear": bool(self.taskbar_clear),
             "taskbar_maximized": str(self.taskbar_maximized),
             "cursor_dot": bool(self.cursor_dot),
