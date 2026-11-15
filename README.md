@@ -20,7 +20,7 @@
 
 装好之后：`Ctrl+Space` 开关面板、`Shift+Space` 开关美化、桌面图标拖到一起就建盒。**任务栏那颗图标要自己右键固定一次**——Windows 11 只准人点，原因见「任务栏上的入口」。
 
-> 装好之后解压的文件夹可以删。如果删的时候提示「文件正在使用」，那是随包的 TranslucentTB 还从解压目录里跑着（它把 `ExplorerTAP.dll` 注进了 explorer，进程退了 dll 还挂着），**重启一次电脑再删**就干净了。1.0.13 起安装时会把它停掉并从安装目录重新拉起，装完立刻就能删。
+> 装好之后解压的文件夹可以删。自带的 TranslucentTB 现在一律复制到 `%APPDATA%\DeskBeauty\runtime\translucenttb` 再启动（它会往 explorer 里注入 dll，从解压目录启动的话 explorer 会一直钉着那两个文件），所以装完立刻就能删、不用重启。更早的版本（1.0.13 及以前）装完提示「文件正在使用」的话，**重启一次电脑**（或只重启资源管理器）让 explorer 松手，再删就干净了。
 
 只支持 **Windows 11**（24H2 上实测）。Win10 的任务栏、圆角、毛玻璃行为都不一样，没测过。
 
@@ -536,7 +536,7 @@ for win in reversed(self._z_windows()):   # _z_windows() 是从下到上的期�
 
 | 改动 | 状态 | 做法 / 怎么恢复 |
 | --- | --- | --- |
-| **任务栏背景整个去掉**（图标直接浮在壁纸上） | 已生效，**TranslucentTB 随包分发** | 底层是 **TranslucentTB**（GPL-3.0，靠 `ExplorerTAP.dll` 注入 explorer），zip 里带了一份（`translucenttb\`，安装后进 `%LOCALAPPDATA%\Programs\desktopbeauty\translucenttb\`），由 `beauty/taskbar.py` 负责：开机拉起、每 8 秒检查一次（explorer 一重启它就被带走）、写它的 `settings.json`。**以前只认 `%LOCALAPPDATA%\Programs\TranslucentTB\`，别人机器上没装这个目录 ⇒ 分出去的版本没有透明任务栏**，现在自带的优先、用户自己装的兜底 |
+| **任务栏背景整个去掉**（图标直接浮在壁纸上） | 已生效，**TranslucentTB 随包分发** | 底层是 **TranslucentTB**（GPL-3.0，靠 `ExplorerTAP.dll` 注入 explorer），zip 里带了一份（`translucenttb\`，安装后进 `%LOCALAPPDATA%\Programs\desktopbeauty\translucenttb\`），由 `beauty/taskbar.py` 负责：开机拉起、每 8 秒检查一次（explorer 一重启它就被带走）、写它的 `settings.json`。**便携版/源码版不从解压目录（或仓库 vendor）直接启动它**——先复制到 `%APPDATA%\DeskBeauty\runtime\translucenttb\` 再跑，否则它注入 explorer 的 dll 会一直钉着那个文件夹（用户报过「装完删不掉解压目录，提示还在运行」）。**以前只认 `%LOCALAPPDATA%\Programs\TranslucentTB\`，别人机器上没装这个目录 ⇒ 分出去的版本没有透明任务栏**，现在自带的优先、用户自己装的兜底 |
 | 有窗口最大化时 | 磨砂（`accent: acrylic`） | 以前是深色实底（看着就是一条黑边），现在改成磨砂模糊；面板里可切 磨砂 / 全透明 / 深色实底 |
 | **去掉任务栏中间的搜索框** | 已生效 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Search\SearchboxTaskbarMode = 0`（0=隐藏，1=只留图标，2=搜索框，3=搜索框+标签）。恢复：任务栏设置 → 任务栏项 → 搜索 → 选回「搜索框」；改完要重启 explorer 才生效 |
 | 任务栏自动隐藏 | **已撤销**（用户要求保留任务栏） | 想开：任务栏设置 → 任务栏行为 → 自动隐藏任务栏 |

@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import time
 import winreg
@@ -30,17 +31,53 @@ EXE_NAME = "TranslucentTB.exe"
 ADVANCED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
 
 
+def runtime_dir() -> Path:
+    """自带 TranslucentTB 的**运行副本**放哪。
+
+    不能直接在解压目录里跑它：TB 会把 `ExplorerTAP.dll` / `ExplorerHooks.dll`
+    注入 explorer.exe，进程退出以后 explorer 还映射着这两个文件——解压目录就
+    删不掉（用户报的「装完提示还在运行」）。复制到 `%APPDATA%\\DeskBeauty\\
+    runtime\\translucenttb` 再启动，解压出来的文件夹就永远不被占用。
+    """
+    from .config import DATA_DIR
+    return DATA_DIR / "runtime" / "translucenttb"
+
+
+def _runtime_exe() -> Path | None:
+    """把包里那份 TB 复制到运行目录，返回复制后的 exe；没有自带的那份就 None。"""
+    exe = runtime_dir() / EXE_NAME
+    if exe.is_file():
+        return exe
+    try:
+        from . import install
+    except Exception:  # noqa: BLE001 - 拿不到路径就当没自带
+        return None
+    for src in (install.dist_root() / "translucenttb",
+                install.dist_root() / "vendor" / "translucenttb"):
+        if not (src / EXE_NAME).is_file():
+            continue
+        try:
+            shutil.copytree(src, runtime_dir(), dirs_exist_ok=True)
+        except OSError:
+            return None
+        return exe if exe.is_file() else None
+    return None
+
+
 def _candidates() -> list[Path]:
-    """TranslucentTB 可能在哪：本程序自带的那份优先，最后才是用户自己装的。"""
+    """TranslucentTB 可能在哪：装好的那份优先，然后是运行副本，最后用户自己装的。"""
     out: list[Path] = []
     try:
         from . import install
         out.append(install.install_dir() / "translucenttb" / EXE_NAME)
-        out.append(install.dist_root() / "translucenttb" / EXE_NAME)
-        # 源码跑的时候它放在仓库的 vendor\ 下
-        out.append(install.dist_root() / "vendor" / "translucenttb" / EXE_NAME)
     except Exception:  # noqa: BLE001 - 拿不到安装路径就只找系统里那份
         pass
+    try:
+        runtime = _runtime_exe()
+    except Exception:  # noqa: BLE001 - 复制失败就当没有
+        runtime = None
+    if runtime is not None:
+        out.append(runtime)
     out.append(Path.home() / "AppData" / "Local" / "Programs" / "TranslucentTB" / EXE_NAME)
     return out
 

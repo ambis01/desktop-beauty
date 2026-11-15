@@ -186,20 +186,26 @@ def install(src: Path | None = None, force: bool = False) -> bool:
     if stopped == "timeout":
         raise RuntimeError("旧版本还在运行，文件被占着。先在面板里退出再点安装。")
 
-    # 0b. 自带的那份 TranslucentTB 要是正跑着，也得先停：
-    #     它是注入在 explorer 里的独立进程，exe/dll 一样被占（升级到 1.0.2 之后才会撞上）。
-    #     除了安装目录里那份，**解压目录里那份也算**——便携版第一次启动时就是从解压目录
-    #     把 TB 拉起来的，装完以后用户通常马上把那个文件夹删掉，它不退出就删不动
-    #     （「TranslucentTB.exe 正在使用」）。停完第 6 步会从安装目录重新拉起。
-    low_src, low_dst = str(src).lower(), str(dst).lower()
+    # 0b. 自带的那份 TranslucentTB 要是正跑着，也得先停：它是独立进程，注入在
+    #     explorer 里的 dll 也从它那个目录加载，不停的话升级时 dll 全被占着。
+    #     判据是「**正在跑的那个**镜像在不在我们自己这几个目录里」，不是
+    #     `exe_path()`——它只看谁先存在，跑着的可能是另一份（运行副本 / 解压目录）。
+    #     停完第 6 步会从安装目录重新拉起。
+    roots = (str(dst).lower(), str(src).lower())
     tb_was_running = False
     try:
         from . import taskbar as _tb
-        exe = str(_tb.exe_path()).lower()
-        if exe.startswith(low_dst) or exe.startswith(low_src):
-            tb_was_running = _tb.is_running()
-            if tb_was_running:
-                _tb.stop()
+        roots = roots + (str(_tb.runtime_dir()).lower(),)
+        for pid in _tb.pids():
+            image = _image_of(pid)
+            if image is None:
+                continue
+            low = str(image).lower()
+            if any(low.startswith(root) for root in roots):
+                tb_was_running = True
+                break
+        if tb_was_running:
+            _tb.stop()
     except Exception:  # noqa: BLE001
         pass
 
@@ -472,12 +478,14 @@ def uninstall(remove_files: bool = True, wipe: bool = True) -> str:
             pass
     _delete_reg_key(reg_key())
     if remove_files:
-        # 自带的 TranslucentTB 要是正从安装目录跑着，先停掉再删目录
-        # （它注入在 explorer 里，光删文件它还会赖着）
+        # 自带的 TranslucentTB 要是正跑着（安装目录那份，或者 APPDATA 里的运行副本），
+        # 先停掉：它注入在 explorer 里，光删文件它还会赖着，任务栏也还是透明的
         try:
             from . import taskbar as _tb
-            exe = _tb.exe_path()
-            if str(exe).lower().startswith(str(install_dir()).lower()):
+            roots = (str(install_dir()).lower(), str(_tb.runtime_dir()).lower())
+            if any(str(image or "").lower().startswith(root)
+                   for pid in _tb.pids() for image in (_image_of(pid),)
+                   for root in roots):
                 _tb.stop()
         except Exception:  # noqa: BLE001
             pass
