@@ -27,9 +27,11 @@ jobs:
       - name: 打包本体
         shell: pwsh
         run: |
-          # --add-data 的源路径必须是绝对的：specpath 换到别的目录之后相对路径会找不到
+          # --icon / --add-data 的源路径必须是绝对的：specpath 换到 build 之后，
+          # 相对路径会被按 workpath 解析（实测 Icon input file build\assets/app.ico not found）
           python -m PyInstaller --noconfirm --clean --windowed `
-            --name desktopbeauty-app --icon assets\app.ico --paths . `
+            --name desktopbeauty-app --icon "$env:GITHUB_WORKSPACE\assets\app.ico" `
+            --paths "$env:GITHUB_WORKSPACE" `
             --hidden-import beauty.install --hidden-import beauty.setup_window `
             --add-data "$env:GITHUB_WORKSPACE\assets;assets" `
             --distpath dist-app --workpath build --specpath build run.pyw
