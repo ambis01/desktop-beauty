@@ -81,7 +81,11 @@ class GlassCombo(QPushButton):
 
 
 class ColorSwatches(QWidget):
-    """一排色块（可多行）。点一下发 picked(QColor)。"""
+    """一排色块（可多行）。点一下发 picked(QColor)。
+
+    `cell` / `gap` / `cols` 可以调：面板里那些自定义外观的色板要小一号，
+    不然一排占掉半页，滑条被挤到贴边。
+    """
 
     picked = Signal(QColor)
 
@@ -89,8 +93,14 @@ class ColorSwatches(QWidget):
     CELL = u(30)
     GAP = u(6)
 
-    def __init__(self, colors=None, parent=None):
+    def __init__(self, colors=None, parent=None, cell=None, gap=None, cols=None):
         super().__init__(parent)
+        if cell:
+            self.CELL = u(int(cell))
+        if gap is not None:
+            self.GAP = u(int(gap))
+        if cols:
+            self.COLS = int(cols)
         self._colors = [QColor(c) for c in (colors or PALETTE)]
         self._current = self._colors[0] if self._colors else QColor("#60646c")
         rows = (len(self._colors) + self.COLS - 1) // self.COLS
@@ -165,11 +175,20 @@ class CleanSlider(QSlider):
         self.setFixedHeight(u(22))
 
     def mousePressEvent(self, event) -> None:
-        # 点轨道直接跳到那个位置，不用先拖
+        # 点轨道直接跳到那个位置，不用先拖；滚轮**故意不接**（见下）
         if event.button() == Qt.LeftButton:
             value = self._value_at(event.position().x())
             self.setValue(value)
         super().mousePressEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        """滚轮交给外层面板去滚动，别拿来改数值。
+
+        QSlider 默认滚轮一格就改一步——面板里滑条一多，往下滚页面时鼠标正好
+        从滑条上过，数值就被悄悄拖走了（用户报的「很容易误触」）。这里直接忽略，
+        事件会往上冒给 QScrollArea。
+        """
+        event.ignore()
 
     def _value_at(self, x: float) -> int:
         w = max(1, self.width())

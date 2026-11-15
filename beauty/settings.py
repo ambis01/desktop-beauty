@@ -566,17 +566,21 @@ class SettingsWindow(GlassWindow):
         self._styles_box.addSpacing(u(2))
         self._styles_box.addWidget(_divider())
         self._styles_box.addWidget(_head(tr("style.custom")))
+        self._styles_box.addSpacing(u(2))
         self._build_style_group("box", tr("style.box"))
         self._build_style_group("card", tr("style.card"))
 
         row = QHBoxLayout()
         row.setSpacing(u(8))
         self.btn_style_save = QPushButton(tr("style.save_scheme"))
+        self.btn_style_save.setMaximumWidth(u(160))
         self.btn_style_save.clicked.connect(self._save_style_scheme)
-        row.addWidget(self.btn_style_save, 1)
+        row.addWidget(self.btn_style_save)
         self.btn_style_reset = QPushButton(tr("style.reset"))
+        self.btn_style_reset.setMaximumWidth(u(150))
         self.btn_style_reset.clicked.connect(self._reset_style)
-        row.addWidget(self.btn_style_reset, 1)
+        row.addWidget(self.btn_style_reset)
+        row.addStretch(1)
         self._styles_box.addLayout(row)
 
         self._styles_box.addWidget(_divider())
@@ -592,54 +596,73 @@ class SettingsWindow(GlassWindow):
         """一组「颜色 + 透明度 + 圆角」：收纳盒一组、卡片一组，互不影响。"""
         self._styles_box.addWidget(self._row_label(title))
 
-        sw = ColorSwatches(GLASS_PALETTE)
+        # 颜色：标签在左，色板在右（同一行，省一半高度）
+        sw = ColorSwatches(GLASS_PALETTE, cell=20, gap=5)
         sw.picked.connect(lambda c, w=which: self._on_style_color(w, c))
         self._swatches[which] = sw
-        self._styles_box.addWidget(sw)
+        color_row = QHBoxLayout()
+        color_row.setSpacing(u(8))
+        color_lbl = self._row_label(tr("style.color"))
+        color_lbl.setFixedWidth(u(56))
+        color_row.addWidget(color_lbl, 0, Qt.AlignTop)
+        color_row.addWidget(sw)
+        color_row.addStretch(1)
+        self._styles_box.addLayout(color_row)
 
         colors = QHBoxLayout()
-        colors.setSpacing(u(8))
+        colors.setSpacing(u(6))
+        colors.addSpacing(u(64))
         btn_default = QPushButton(tr("style.default_color"))
         btn_default.setObjectName("ghost")
+        btn_default.setMaximumWidth(u(132))
         btn_default.clicked.connect(
             lambda _=False, w=which: self._on_style_default(w))
         colors.addWidget(btn_default)
         btn_more = QPushButton(tr("style.more_color"))
         btn_more.setObjectName("ghost")
+        btn_more.setMaximumWidth(u(112))
         btn_more.clicked.connect(
             lambda _=False, w=which: self._pick_style_color(w))
         colors.addWidget(btn_more)
         colors.addStretch(1)
         self._styles_box.addLayout(colors)
 
-        self._styles_box.addWidget(self._row_label(tr("style.alpha")))
-        slider = CleanSlider()
-        slider.setRange(0, 100)
-        alpha_label = QLabel("")
-        alpha_label.setObjectName("tag")
-        alpha_label.setMinimumWidth(u(38))
-        alpha_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         h = QHBoxLayout()
         h.setSpacing(u(8))
-        h.addWidget(slider, 1)
+        alpha_lbl = self._row_label(tr("style.alpha"))
+        alpha_lbl.setFixedWidth(u(56))
+        h.addWidget(alpha_lbl)
+        slider = CleanSlider()
+        slider.setRange(0, 100)
+        slider.setFixedWidth(u(170))
+        h.addWidget(slider)
+        alpha_label = QLabel("")
+        alpha_label.setObjectName("tag")
+        alpha_label.setMinimumWidth(u(34))
+        alpha_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         h.addWidget(alpha_label)
+        h.addStretch(1)
         slider.valueChanged.connect(
             lambda value, w=which: self._on_style_alpha(w, value))
         self._style_alpha_slider[which] = slider
         self._style_alpha_label[which] = alpha_label
         self._styles_box.addLayout(h)
 
-        self._styles_box.addWidget(self._row_label(tr("style.radius")))
-        rslider = CleanSlider()
-        rslider.setRange(0, 30)
-        radius_label = QLabel("")
-        radius_label.setObjectName("tag")
-        radius_label.setMinimumWidth(u(38))
-        radius_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         hr = QHBoxLayout()
         hr.setSpacing(u(8))
-        hr.addWidget(rslider, 1)
+        radius_lbl = self._row_label(tr("style.radius"))
+        radius_lbl.setFixedWidth(u(56))
+        hr.addWidget(radius_lbl)
+        rslider = CleanSlider()
+        rslider.setRange(0, 30)
+        rslider.setFixedWidth(u(170))
+        hr.addWidget(rslider)
+        radius_label = QLabel("")
+        radius_label.setObjectName("tag")
+        radius_label.setMinimumWidth(u(34))
+        radius_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         hr.addWidget(radius_label)
+        hr.addStretch(1)
         rslider.valueChanged.connect(
             lambda value, w=which: self._on_style_radius(w, value))
         self._style_radius_slider[which] = rslider
@@ -657,7 +680,7 @@ class SettingsWindow(GlassWindow):
             row = QFrame()
             row.setObjectName("cardrow")
             h = QHBoxLayout(row)
-            h.setContentsMargins(u(12), u(8), u(8), u(8))
+            h.setContentsMargins(u(10), u(6), u(6), u(6))
             h.setSpacing(u(8))
             name = QLabel(tr("style." + preset["id"]))
             name.setObjectName("cardname")
@@ -1450,9 +1473,26 @@ QLineEdit#search {
 QFrame#cardrow { border-radius: 10px; }
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
-QScrollBar:vertical { background: transparent; width: 6px; margin: 0px; }
-QScrollBar::handle:vertical { border-radius: 3px; min-height: 24px; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 2px 1px 2px 0;
+}
+QScrollBar::handle:vertical {
+    border-radius: 4px;
+    min-height: 36px;
+}
+QScrollBar::handle:vertical:hover { }
+QScrollBar::handle:vertical:pressed { }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px; width: 0px;
+}
+QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+    height: 0px; width: 0px;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
 QStackedWidget { background: transparent; }
 """
 
@@ -1498,7 +1538,9 @@ QPushButton#uninstall { color: #C0303A; }
 QPushButton#uninstall:hover { background: rgba(255, 190, 190, 175); }
 QLineEdit#search { background: rgba(255, 255, 255, 120); color: #2A3242; }
 QLineEdit#search:focus { background: rgba(255, 255, 255, 205); }
-QScrollBar::handle:vertical { background: rgba(60, 80, 110, 70); }
+QScrollBar::handle:vertical { background: rgba(58, 78, 108, 100); }
+QScrollBar::handle:vertical:hover { background: rgba(58, 78, 108, 165); }
+QScrollBar::handle:vertical:pressed { background: rgba(58, 78, 108, 200); }
 
 QSlider::groove:horizontal { height: 4px; background: rgba(40, 60, 100, 40); border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #6F8FE8; border-radius: 2px; }
@@ -1551,5 +1593,7 @@ QPushButton#uninstall { color: #FF8E93; }
 QPushButton#uninstall:hover { background: rgba(255, 120, 120, 60); }
 QLineEdit#search { background: rgba(255, 255, 255, 18); color: #E3E8F4; }
 QLineEdit#search:focus { background: rgba(255, 255, 255, 30); }
-QScrollBar::handle:vertical { background: rgba(255, 255, 255, 60); }
+QScrollBar::handle:vertical { background: rgba(255, 255, 255, 72); }
+QScrollBar::handle:vertical:hover { background: rgba(255, 255, 255, 125); }
+QScrollBar::handle:vertical:pressed { background: rgba(255, 255, 255, 165); }
 """)
