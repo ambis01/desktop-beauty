@@ -1208,19 +1208,28 @@ class Controller(QObject):
         return True
 
     def _axis_pos(self, w, is_box: bool, axis: str) -> int:
-        """某一块在某个轴上的位置（玻璃坐标：盒子是 box.x/y，卡片是 card.x/y）。"""
+        """某一块在某个轴上的位置（**玻璃坐标**）。
+
+        盒子往上长的时候 `box.y` 是不动的，玻璃在 `box.y - _up`（底边钉住，
+        见 `BoxWidget._glass_top`）。挤开/吸回全部按玻璃坐标算，所以这里要减掉
+        `_up`——不然一个往上长过的盒子会被当成还在下面 154px 处（用户报的
+        「展开 A 却把游戏启动收成横杠」就是这里算错了 cur）。
+        """
         if is_box:
-            return w.box.y if axis == "y" else w.box.x
+            if axis == "y":
+                return int(w.box.y) - int(getattr(w, "_up", 0) or 0)
+            return w.box.x
         return w.card.y if axis == "y" else w.card.x
 
     def _axis_move(self, w, is_box: bool, axis: str, value: int) -> None:
-        """沿一个轴挪过去（玻璃坐标），带滑动动画。"""
+        """沿一个轴挪过去（**玻璃坐标**），带滑动动画。"""
         if is_box:
             if axis == "y":
-                w.box.y = value
+                # value 是玻璃 y；box.y 得把往上长的偏移加回来
+                w.box.y = int(value) + int(getattr(w, "_up", 0) or 0)
                 w.store.move(w.box, w.box.x, w.box.y)
                 w.changed.emit()
-                w.slide_to(value)
+                w.slide_to(int(value))
             else:
                 w.box.x = value
                 w.store.move(w.box, w.box.x, w.box.y)
@@ -1578,7 +1587,7 @@ class Controller(QObject):
                 except (RuntimeError, TypeError):
                     pass
         for other, is_box, ny in up:
-            old = other.box.y if is_box else other.card.y
+            old = self._axis_pos(other, is_box, "y")
             try:
                 self._axis_move(other, is_box, "y", ny)
             except (RuntimeError, OSError, TypeError, AttributeError):
@@ -1586,7 +1595,7 @@ class Controller(QObject):
             _log(f"grow: up {self._label(other, is_box)} {old}->{ny}")
             saved.append((self._ident(other, is_box), is_box, "y", old, ny))
         for other, is_box, ny in moves:
-            old = other.box.y if is_box else other.card.y
+            old = self._axis_pos(other, is_box, "y")
             try:
                 self._axis_move(other, is_box, "y", ny)
             except (RuntimeError, OSError, TypeError, AttributeError):
@@ -1617,6 +1626,9 @@ class Controller(QObject):
         row = sorted(above, key=lambda it: -it[2].bottom())   # 离盒子近的先摆
         placed: list[tuple[int, int, int]] = []               # (left, right, top)
         moves: list[tuple] = []
+        pushed = {id(other) for other, _b, _r in row}
+        obstacles = [(o, r) for o, _b, r in self._snapshot(win)
+                     if id(o) not in pushed]
         for other, is_box, rect in row:
             h = rect.height()
             left, right = rect.left(), rect.right()
@@ -1626,6 +1638,20 @@ class Controller(QObject):
                 if left <= o_right and o_left <= right:
                     want = min(want, o_top - gap - h)
             ny = min(cur, want)
+            # 往上推的时候不能撞到**没人推**的那些（卡片、别的盒子）：
+            # 撞着就继续往上抬，抬到它们上面去；抬出屏幕就说明放不下
+            for _ in range(8):
+                probe = rect.translated(0, ny - rect.top())
+                clash = None
+                for o2, r2 in obstacles:
+                    if o2 is other:
+                        continue
+                    if probe.adjusted(-gap, -gap, gap, gap).intersects(r2):
+                        clash = r2
+                        break
+                if clash is None:
+                    break
+                ny = min(ny, clash.top() - gap - h)
             if ny != cur:
                 moves.append((other, is_box, ny))
             if ny < scr.top():
@@ -1674,8 +1700,7 @@ class Controller(QObject):
                 cur = self._axis_pos(other, is_box, "y")
                 need = 0
                 if left <= target.right() and target.left() <= right:
-                    need = target_bottom + gap
-                # 只有「同一列」的上方才继续往下挤；并排的互不影响
+                    need = target_bottom + gap                # 只有「同一列」的上方才继续往下挤；并排的互不影响
                 for o_left, o_right, o_bottom in placed:
                     if left <= o_right and o_left <= right:
                         need = max(need, o_bottom + gap)
@@ -1684,12 +1709,24 @@ class Controller(QObject):
                 if ny != cur:
                     moves.append((other, is_box, ny))
                 bottom = ny + h
+                import os as _dbg_os
+                if _dbg_os.environ.get("DB_DEBUG_BELOW"):
+                    print("   DBG item", self._label(other, is_box), "cur", cur,
+                          "need", need, "ny", ny, "h", h, "bottom", bottom,
+                          "stop", stop, "expanded", getattr(other, "is_expanded", None),
+                          "placed", placed, "target_bottom", target_bottom)
                 if bottom > stop:
                     return None
                 placed.append((left, right, bottom))
             return moves
 
         plan = sim(set(), False)
+        import os as _os
+        if _os.environ.get("DB_DEBUG_BELOW"):
+            print("DBG plan_below target", tuple(target.getRect()),
+                  "limit", limit, "row", [(self._label(o, b), tuple(r.getRect()))
+                                          for _t, b, o, r in row],
+                  "->", plan)
         if plan is not None:
             return plan, set(), row
         if not allow_collapse:
