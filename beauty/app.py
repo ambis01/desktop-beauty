@@ -1116,16 +1116,24 @@ class Controller(QObject):
         win._push_anim = anim
         anim.start(QAbstractAnimation.DeleteWhenStopped)
 
-    def _remember_grow(self, win, saved) -> None:
+    def _remember_grow(self, win, saved, height: int) -> None:
         """记下「盒子长开时把谁让到哪儿了」：缩回去时按这个放回原位。
 
         saved 里是 (id, 是否盒子, 原来的 y, 让到 y)。同一个盒子的记录会合并：
         已经记过原来的 y 就不覆盖（第二次长开时，邻居已经不在原位了）。
+
+        height 是**这次为它让出来的那个高度**：缩回去的时候拿盒子当时的收起高度
+        跟它比——展开完点到外面只会落回 0（一样大），那不算缩回去，不能还原。
         """
         table = getattr(self, "_grow_saved", None)
         if table is None:
             table = self._grow_saved = {}
-        entries = table.setdefault(win.box.id, [])
+        got = table.get(win.box.id)
+        if got is None or int(got[0]) != int(height):
+            entries: list[list] = []
+            table[win.box.id] = [int(height), entries]
+        else:
+            entries = got[1]
         have = {entry[0]: entry for entry in entries}
         for ident, is_box, old_y, new_y in saved:
             got = have.get(ident)
@@ -1136,16 +1144,28 @@ class Controller(QObject):
             entries.append([ident, is_box, old_y, new_y])
 
     def _restore_grow(self, win) -> bool:
-        """盒子缩回去：把刚才为它让开的东西按记录放回原位。
+        """盒子**真的缩回去**了：把刚才为它让开的东西按记录放回原位。
+
+        「真的缩回去」= 现在的收起高度比当初让出来的那个高度小。展开完点一下
+        盒子外面只是落回 0（跟长开时一样大），邻居还得让着，这时候还原就压住了。
 
         用户自己挪过的（不在当初让到的位置）不动——那是他的意思，不抢。
         """
         table = getattr(self, "_grow_saved", None)
         if not table:
             return False
-        entries = table.pop(getattr(getattr(win, "box", None), "id", ""), None)
-        if not entries:
+        key = getattr(getattr(win, "box", None), "id", "")
+        saved = table.get(key)
+        if not saved:
             return False
+        rec_h, entries = saved
+        try:
+            cur_h = win.collapsed_rect().height()
+        except (RuntimeError, TypeError, AttributeError):
+            cur_h = 0
+        if cur_h >= rec_h - 1:
+            return False          # 还是当初那个大小：不算缩回去，记录留着
+        table.pop(key, None)
         back = 0
         for ident, is_box, old_y, new_y in entries:
             other = (self.windows.get(ident) if is_box
@@ -1307,7 +1327,7 @@ class Controller(QObject):
                 except (RuntimeError, OSError, TypeError):
                     continue
             if saved and remember:
-                self._remember_grow(win, saved)
+                self._remember_grow(win, saved, target.height())
 
         plan = sim(set(), False)
         if plan is not None:
