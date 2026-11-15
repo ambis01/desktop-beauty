@@ -379,14 +379,19 @@ class BoxStore:
                 continue
         if moved is None:
             return None
-        # 放回桌面的文件要立刻长出图标，否则空等 explorer 批量刷新，看着像没反应
-        di.notify_created(moved)
-        # 快捷方式没写死图标时 explorer 会渲染成白纸，回去之前先给它补一个
+        # 快捷方式没写死图标时 explorer 会渲染成白纸（写死成「用 exe 自己的图标」
+        # 也一样慢到抠不出来），回去之前先把图标来源换成我们自己的 .ico
         try:
             from . import icons as _icons
             _icons.fix_shortcut_icon(moved)
         except Exception:  # noqa: BLE001 - 补图标失败不影响放回
             pass
+        # 放回桌面的文件要立刻长出图标，否则空等 explorer 批量刷新，看着像没反应
+        di.notify_created(moved)
+        # .lnk 刚从盒子目录搬回来，explorer 偶尔按旧路径缓存画成一张白纸，
+        # 再发一次「这一项变了」逼它重读图标（`_land_restored` 踩过同样的坑）
+        if moved.suffix.lower() in (".lnk", ".url"):
+            di.notify_updated(moved)
         box.order = [n for n in box.order if n != path.name]
         box.origins.pop(path.name, None)
         # 理论上 remove_to 不会被用来放回系统图标（走 restore_ns），这里兜一下：

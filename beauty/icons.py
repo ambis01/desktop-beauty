@@ -10,7 +10,7 @@ import ctypes.wintypes as wt
 import uuid
 
 from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPainter, QPixmap
 
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -167,18 +167,20 @@ def _hicon_to_image(hicon) -> QImage | None:
             gdi32.DeleteObject(info.hbmMask)
 
 
-def raw_image(path: str) -> QImage | None:
-    """按路径取系统图标（尽量 256px），返回**原始尺寸**的图，不做缩放。
+def raw_image(path: str, sizes=(SHIL_JUMBO, SHIL_EXTRALARGE)) -> QImage | None:
+    """按路径取系统图标（默认先 256px、再 48px），返回**原始尺寸**的图，不做缩放。
 
     调用方靠它的 width() 判断这份图标到底有多清楚：.url / 某些 .lnk 只能拿到
     16–32px 的图，放大会糊成一团，得换别的候选源。
+
+    `sizes` 可以逐张试：256px 那张有时是空画布，得单独回退到 48px 再判一次。
     """
     if not path:
         return None
     index = _sys_index(path)
     if index < 0:
         return None
-    for shil in (SHIL_JUMBO, SHIL_EXTRALARGE):
+    for shil in sizes:
         piml = _image_list(shil)
         if not piml:
             continue
@@ -247,30 +249,92 @@ def ink_image(path: str) -> QImage | None:
     return img.copy(bbox) if bbox is not None else img
 
 
-def write_ico(img: QImage, path) -> bool:
-    """把一张图写成一个 .ico（单张 PNG 压缩条目，Vista 以后都认）。"""
+def _ico_bytes(img: QImage) -> bytes | None:
+    """把一张图编成「单条目 .ico」（里面是一张 PNG，Vista 以后都认）。"""
     import struct
 
     from PySide6.QtCore import QBuffer, QIODevice
 
     if img is None or img.isNull():
-        return False
+        return None
     buf = QBuffer()
     buf.open(QIODevice.WriteOnly)
     if not img.save(buf, "PNG"):
-        return False
+        return None
     png = bytes(buf.data())
     buf.close()
     w = 0 if img.width() >= 256 else img.width()
     h = 0 if img.height() >= 256 else img.height()
     head = struct.pack("<HHH", 0, 1, 1)
     entry = struct.pack("<BBBBHHII", w, h, 0, 0, 1, 32, len(png), 22)
+    return head + entry + png
+
+
+def write_ico(img: QImage, path) -> bool:
+    """把一张图写成一个 .ico（单张 PNG 压缩条目，Vista 以后都认）。"""
+    data = _ico_bytes(img)
+    if data is None:
+        return False
     try:
         with open(str(path), "wb") as fh:
-            fh.write(head + entry + png)
+            fh.write(data)
     except OSError:
         return False
     return True
+
+
+def _square_ink(path: str, min_side: int = 16) -> QImage | None:
+    """取图标 → 裁掉透明边 → 补成正方形（结果尺寸 = 真正有内容的尺寸）。
+
+    踩过的坑：有些 exe 的 256px 资源是「大画布套小图」。无畏契约的启动器就是
+    256×256 里只有 50×50 有内容，整张写成 .ico 之后 explorer 会把整块画布缩到
+    48px 显示 ⇒ 桌面图标只剩 1/5 大（用户报的「图标特别小」）。裁掉空白就没这
+    问题；256px 那张要是整张空的，再回退到 48px 那张判一次。
+    """
+    best: QImage | None = None
+    best_side = 0
+    for shil in (SHIL_JUMBO, SHIL_EXTRALARGE):
+        raw = raw_image(path, (shil,))
+        if raw is None or raw.isNull():
+            continue
+        img = raw.convertToFormat(QImage.Format_ARGB32)
+        bbox = _ink_bbox(img)
+        if bbox is None:
+            continue
+        glyph = img.copy(bbox)
+        side = max(glyph.width(), glyph.height())
+        if side > best_side:
+            best, best_side = glyph, side
+        if best_side >= 96:
+            break
+    if best is None or best_side < min_side:
+        return None
+    if best.width() == best_side and best.height() == best_side:
+        return best
+    canvas = QImage(best_side, best_side, QImage.Format_ARGB32)
+    canvas.fill(Qt.transparent)
+    p = QPainter(canvas)
+    p.drawImage((best_side - best.width()) // 2,
+                (best_side - best.height()) // 2, best)
+    p.end()
+    return canvas
+
+
+def _looks_blank(img: QImage) -> bool:
+    """整张图几乎全是白色（或全透明）：写成 .ico 就是一张白纸。"""
+    small = img.scaled(16, 16, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    opaque = white = 0
+    for y in range(16):
+        for x in range(16):
+            c = small.pixelColor(x, y)
+            if c.alpha() <= 64:
+                continue
+            opaque += 1
+            if c.red() > 235 and c.green() > 235 and c.blue() > 235:
+                white += 1
+    if opaque == 0:
+        return True
+    return white >= opaque * 0.9
 
 
 def _replace_with_fixed(path, ico) -> bool:
@@ -312,13 +376,19 @@ def _replace_with_fixed(path, ico) -> bool:
 
 
 def fix_shortcut_icon(lnk) -> bool:
-    """给「图标全靠目标 exe」的 .lnk 写一个明确的图标来源。
+    """给 .lnk 换上一个「我们保证画得对」的图标文件，返回有没有动它。
 
-    用户报的 bug：NVIDIA App 拖出收纳盒之后，桌面图标变成一张白纸。
-    实测原因是这类快捷方式没有写死 IconLocation，explorer 自己那套「从目标 exe
-    取图标」的路径会失败（同一个文件拷一份新的也一样白），但只要给 .lnk 指一个
-    明确的 .ico 就立刻正常。所以这里用我们自己能取到的 256px 图生成一份 .ico，
-    再把快捷方式指过去（目标/参数/工作目录都不动）。
+    三个用户报过的 bug 都出在「图标从哪儿来」：
+    1. 快捷方式没写死 IconLocation（NVIDIA App）：explorer 自己从目标 exe
+       抠图标会失败，画成一张白纸；
+    2. 写死成「用 exe 自己的图标」（QQ音乐 → `QQMusic.exe,0`）：那个 exe 又大又
+       慢，批量刷新时 explorer 抠不出来，同样先画成白纸（白纸会一直挂着）；
+    3. 抠出来的是「256 画布套 50px 小图」（无畏契约）：整张写进 .ico，explorer
+       缩到 48px 显示就成了小人国。
+
+    所以统一处理：抠图 → 裁透明边 → 补正方形 → 写成 .ico（文件名 = **内容哈希**，
+    内容一变就是新路径，顺手绕开 explorer 那个按路径缓存的图标库）→ 把 .lnk 指过去。
+    目标、参数、工作目录一概不动；用户自己挑过 .ico / .png 的不碰。
     """
     from pathlib import Path
 
@@ -333,22 +403,34 @@ def fix_shortcut_icon(lnk) -> bool:
         if loc is None:
             return False
         icon_file, _index = loc
-        if icon_file and Path(icon_file).exists():
-            return False      # 已经写死了图标，别动用户的设置
+        icons_root = (DATA_DIR / "icons").resolve()
+        if icon_file:
+            ip = Path(icon_file)
+            if ip.suffix.lower() in (".ico", ".png", ".bmp"):
+                try:
+                    rp = ip.resolve()
+                except OSError:
+                    rp = ip
+                if rp != icons_root and icons_root not in rp.parents:
+                    return False    # 用户自己指定的图标文件，别抢
+            # 指向 .exe / .dll（或者空）只是「用程序自己的图标」，可以接手
         target = shortcut.target_of(p)
-        img = raw_image(str(target) if target else str(p))
-        if img is None or img.isNull() or img.width() < 32:
+        img = _square_ink(str(target) if target else str(p))
+        if img is None or _looks_blank(img):
+            return False
+        data = _ico_bytes(img)
+        if data is None:
             return False
         import hashlib
-        tag = hashlib.sha1(str(str(target) or str(p)).lower().encode("utf-8"))
-        folder = DATA_DIR / "icons" / "lnk"
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return False
-        out = folder / f"{tag.hexdigest()[:16]}.ico"
-        if not out.exists() and not write_ico(img, out):
-            return False
+        out = DATA_DIR / "icons" / "lnk" / (hashlib.sha1(data).hexdigest()[:16] + ".ico")
+        if not out.exists():
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(data)
+            except OSError:
+                return False
+        if icon_file and str(Path(icon_file)).lower() == str(out).lower():
+            return False            # 已经指着这一份了
         if not shortcut.set_icon_location(p, out, 0):
             # 管理员装出来的快捷方式，普通用户只有「删除」权限，内容改不了。
             # 那就照内容复制一份（新文件继承桌面目录的权限）→ 删原文件 → 挪回来。
