@@ -51,6 +51,9 @@ def _acceptable(src: Path) -> bool:
             return False
         if not src.is_file():
             return False
+        # 桌面的系统文件：收进去 explorer 会重新生成一份，没意义还可能惹事
+        if src.name.lower() in ("desktop.ini", "thumbs.db"):
+            return False
         # 盒子之间互相搬图标是正常操作，所以盒子目录里的文件要放行；
         # 但 DATA_DIR 底下别的（配置 / 日志 / 图标缓存）绝对不许进来。
         resolved = src.resolve()
