@@ -101,7 +101,7 @@ class Launcher
         catch { }
     }
 
-    static bool StartApp(bool panel)
+    static bool StartApp(string extraArg)
     {
         string exe, dir;
         ReadTarget(out exe, out dir);
@@ -113,13 +113,13 @@ class Launcher
             string script = Path.Combine(dir, "run.pyw");
             if (!File.Exists(script)) return false;
             file = exe;
-            args = "\"" + script + "\"" + (panel ? " --panel" : "");
+            args = "\"" + script + "\"" + extraArg;
             cwd = dir;
         }
         else
         {
             file = exe;
-            args = panel ? "--panel" : "";
+            args = extraArg;
             cwd = dir;
         }
         try
@@ -136,11 +136,40 @@ class Launcher
         catch { return false; }
     }
 
+    static string InstalledDir
+    {
+        get
+        {
+            return Path.Combine(Environment.GetFolderPath(
+                Environment.SpecialFolder.LocalApplicationData),
+                @"Programs\desktopbeauty");
+        }
+    }
+
+    // 从**解压目录**双击（没有参数）、而且这台已经装过一份 → 这是「升级」：
+    // 拉起本包里那份 --setup，让它把旧版本停掉再覆盖过去。
+    // 不做这个判断的话这里只会发一个 toggle 信号，用户看着就是「双击没反应」。
+    static bool WantsUpgrade()
+    {
+        try
+        {
+            string installed = Path.Combine(InstalledDir, "desktopbeauty.exe");
+            if (!File.Exists(installed)) return false;
+            string a = Path.GetFullPath(BaseDir).TrimEnd('\\');
+            string b = Path.GetFullPath(InstalledDir).TrimEnd('\\');
+            return !string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
     [STAThread]
     static int Main(string[] args)
     {
         string name = args.Length > 0 ? args[0] : "toggle";
         if ((GetAsyncKeyState(0x10) & 0x8000) != 0) name = "panel";   // VK_SHIFT
+
+        if (args.Length == 0 && WantsUpgrade())
+            return StartApp(" --setup") ? 0 : 1;
 
         IntPtr h = OpenEvent(0x0002, false, @"Local\desktopbeauty." + name);
         if (h != IntPtr.Zero)
@@ -151,6 +180,6 @@ class Launcher
 
         // 没在跑：quit 没有意义，其余一律拉起来。
         if (name == "quit") return 1;
-        return StartApp(name == "panel") ? 0 : 1;
+        return StartApp(name == "panel" ? " --panel" : "") ? 0 : 1;
     }
 }

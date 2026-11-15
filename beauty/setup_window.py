@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QPushButton,
                                QVBoxLayout)
 
-from . import install
+from . import __version__, install
 from .glass import GlassWindow, paint_frost
 from .ui import panel_rect, u
 
@@ -37,9 +37,10 @@ class SetupWindow(GlassWindow):
 
     done = Signal(bool, str)
 
-    def __init__(self, radius: int = 16):
+    def __init__(self, radius: int = 16, upgrade: bool = False):
         flags = Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint
         super().__init__(None, flags, radius=int(radius), activate=True, dark=False)
+        self.upgrade = bool(upgrade)
         self.real_blur = False
         self.glass_alpha = 168
         self.tint = QColor(255, 255, 255, 40)
@@ -90,6 +91,14 @@ class SetupWindow(GlassWindow):
         self.btn_later.setFixedHeight(u(30))
         self.btn_later.clicked.connect(self.dismiss)
         outer.addWidget(self.btn_later)
+
+        if self.upgrade:
+            # 覆盖安装：这里没有「先用着」这回事——旧版本这时候还在跑
+            old = install.installed_version()
+            self.btn_install.setText("覆盖安装")
+            self.btn_later.setText("关闭")
+            if old and old != __version__:
+                self.status.setText(f"已安装 {old}，将覆盖为 {__version__}")
 
         self.done.connect(self._finished)
         self._place()

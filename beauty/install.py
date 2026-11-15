@@ -181,6 +181,11 @@ def install(src: Path | None = None, force: bool = False) -> bool:
     dst = install_dir()
     dst.mkdir(parents=True, exist_ok=True)
 
+    # 0. 覆盖安装：旧版本要是正从安装目录跑着，先请它退出，否则文件全被占着
+    stopped = stop_installed()
+    if stopped == "timeout":
+        raise RuntimeError("旧版本还在运行，文件被占着。先在面板里退出再点安装。")
+
     # 1. 本体（PyInstaller 的 app 文件夹）
     app_src = src / APP_SUBDIR
     if not app_src.is_dir():
@@ -318,6 +323,45 @@ def _is_our_instance() -> bool:
         return image.resolve() == installed_app_exe().resolve()
     except OSError:
         return False
+
+
+def installed_version() -> str:
+    """注册表里记的已装版本；没装过返回空串。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key()) as key:
+            value, _kind = winreg.QueryValueEx(key, "DisplayVersion")
+            return str(value)
+    except OSError:
+        return ""
+
+
+def stop_installed(timeout: float = 20.0) -> str:
+    """覆盖安装前把「这份安装」里正在跑的实例停掉。
+
+    不停的话 `app\\desktopbeauty-app.exe` 和 `app\\_internal\\*.dll` 全被占着，
+    `copytree` 直接 PermissionError。只认自己这份安装的进程（镜像路径 = 安装目录
+    里那个本体），源码版或者别的目录里的副本不动。
+
+    返回：none（没在跑）/ other（跑的是别的实例，不动）/ stopped / timeout。
+    """
+    from . import signal as sig
+
+    pid = running_app_pid()
+    if not pid or _image_of(pid) is None:
+        return "none"
+    if not _is_our_instance():
+        return "other"
+    # 不能只发一次：进程刚启动的那几百毫秒里，锁已经写好了、但信号事件还没建出来
+    # （main() 先 tryLock 再构造 Controller），这时 send 会失败，之后就再也等不到。
+    deadline = time.time() + timeout
+    sent = False
+    while time.time() < deadline:
+        if not sent:
+            sent = sig.send("quit")
+        if _image_of(pid) is None:
+            return "stopped"
+        time.sleep(0.1)
+    return "timeout"
 
 
 def _boxes_left() -> int:

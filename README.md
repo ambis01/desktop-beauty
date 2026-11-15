@@ -14,7 +14,7 @@
 
 | 方式 | 适合 | 做法 |
 | --- | --- | --- |
-| **免安装 exe** | 只想用 | 下 Release 里的 `desktop-beauty-1.0.0-win64.zip` → 解压 → 双击 `desktopbeauty.exe` → 点「安装到这台电脑」 |
+| **免安装 exe** | 只想用 | 下 Release 里的 `desktop-beauty-1.0.1-win64.zip` → 解压 → 双击 `desktopbeauty.exe` → 点「安装到这台电脑」 |
 | **源码运行** | 想改代码 | Python 3.12 + `pip install -r requirements.txt` → 双击 `启动.cmd`（等价于 `pythonw run.pyw`） |
 | **自己打包** | 想分发 | 见下面「给别人用：打包 + 一键安装」 |
 
@@ -95,7 +95,19 @@ D:\tmp\buildenv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed
 
 `--add-data "assets;assets"` 是必须的：`assets/logo.png`（面板标题徽标）和 `app.ico` 走的是 `Path(__file__).parent.parent / "assets"`，冻结之后 `_MEIPASS` 就是 `app\_internal`，所以数据要落在 `_internal\assets`。
 
-打好的包在 `dist\desktop-beauty-1.0.0-win64.zip`（49 MB / 解压 128 MB）：解压出一个 `desktop beauty\` 文件夹，里面 `desktopbeauty.exe` + `app\`，双击 exe 就会弹出下面那块玻璃窗，点一下按钮装好。
+打好的包在 `dist\desktop-beauty-1.0.1-win64.zip`（49.3 MB / 解压 128 MB，SHA256 `33A24078…606D5C`）：解压出一个 `desktop beauty\` 文件夹，里面 `desktopbeauty.exe` + `app\`，双击 exe 就会弹出下面那块玻璃窗，点一下按钮装好。
+
+### 覆盖安装（升级到新版本）
+
+已经装过旧版的人，把新包解压到**任意目录**（不要解压到 `%LOCALAPPDATA%\Programs\desktopbeauty` 里）→ 双击 `desktopbeauty.exe` → 玻璃窗上写「覆盖安装」→ 点一下，旧版本自动退出、文件被覆盖，然后新版自己起来。整个换文件过程实测 **2.5 秒**。
+
+三处配合才成立，少一个都升不了级：
+
+1. **转发器**（`bin/launcher.cs` → `WantsUpgrade()`）：没有参数被双击、而且 `%LOCALAPPDATA%\Programs\desktopbeauty\desktopbeauty.exe` 存在、又**不是自己这个目录** → 判定为「拿新版在旧机器上装」，于是用 `--setup` 拉起本包里的本体。以前这里只会发一个 `toggle` 信号，用户看到的就是「双击没反应」。
+2. **`--setup` 模式**（`beauty/app.py` 的 `_run_setup_only`）：只弹安装窗，**不抢 `%TEMP%\deskbeauty.lock`**、不建 Controller（盒子/卡片/快捷键/鼠标钩子都不碰）。抢锁的话旧版本正跑着，新进程会一刀切退出。
+3. **`install.stop_installed()`**：覆盖前先把「这份安装」的常驻实例停掉（发 `quit` 事件 + 轮询 pid 是否消失，最多 20 秒），否则 `app\desktopbeauty-app.exe` 和 `app\_internal\*.dll` 全被占着，`copytree` 直接 `WinError 32`。只认自己这份安装的进程——源码版或者别处的副本不动。
+
+用户数据（`%APPDATA%\DeskBeauty`：桌面收纳盒、卡片、主题、快捷键）不在安装目录里，升级不会碰它；卸载项里的 `DisplayVersion` 会跟着更新。
 
 **也可以让 GitHub 打**：`.github/workflows/release.yml` 在推 `v*` 标签或手动 dispatch 时，用 `windows-latest` 跑同一套 PyInstaller 命令、组装目录、打 zip，标签的话顺带挂到 Release 上（里面带 SHA256）。签名还没接，见 [docs/code-signing.md](docs/code-signing.md)。
 
@@ -568,6 +580,7 @@ Windows 默认把「把 A 拖到 B 图标上」当成**用 B 打开 A**。所以
 18. **悬停放大时四个角变成直角**：为了让轮廓能连续变大，曾经把窗口固定 = 玻璃、靠 `paint_scale` 放大画面——但窗口只有玻璃那么大，放大出去的部分要么被窗口矩形切掉（直角），要么被圆角裁剪路径裁回原尺寸（等于白放大）。根因是**玻璃必须画在一个比它大的窗口里**。现在窗口每边比玻璃大 4–6px，玻璃在这圈余量里放大，不裁不切、圆角永远是圆的。这圈余量试过用阴影填（用户先说可以、要薄，做完又说「算了，这阴影显得好突兀」），最终**保持纯透明**——透明像素合成后就是壁纸，看不出来，还省得画。
 19. **毁灭世界之后图标缩水 / 又变白纸**（无畏契约、QQ音乐）：第 9 条那套「生成 .ico 指过去」用了 `raw_image`，拿的是**没裁透明边**的原图。无畏契约的启动器 256×256 里只有 50×50 有内容（`400333fb….ico` 实测 ink 比例 0.2），explorer 把整块画布缩到 48px 显示 ⇒ 图标只剩 1/5 大。QQ音乐那边更隐蔽：它的快捷方式把 `IconLocation` 写死成 `QQMusic.exe,0`，旧代码「已经写死了就跳过」，于是只能由 explorer 从那个大 exe 里抠图标，批量刷新时抠不出来就画成白纸。现在 `fix_shortcut_icon()` 改成 `_square_ink()`（抠图 → 裁透明边 → 补正方形）+ **接管**「写死指向 exe」的快捷方式（指向 `.ico`/`.png` 的不碰），`.ico` 文件名用**内容哈希**——内容一变就是新路径，顺手绕开 explorer 按路径缓存的图标库。放回桌面时顺序也调了：先修图标 → `notify_created` → 再补一发 `notify_updated`。
 20. **普通文件收不进盒子**（用户报的「只适配了图标，桌面上的文件不适配」）：`boxes._acceptable()` 里写死了 `if src.suffix.lower() not in SHORTCUT_EXT: return False`，只有 `.lnk`/`.url` 能进，文档拖进来被**静默**吞掉（`add_paths` 里 `_log("reject …")` 只在 `DESKBEAUTY_DEBUG` 下才写日志，界面上一点反馈都没有）。而且 `desktop_icons.desktop_index()` 只给快捷方式登记了「去掉后缀」的别名，所以就算放行，按桌面显示名（`校园论坛`）也找不到 `校园论坛.doc`。现在：`_acceptable` 收所有普通文件（目录仍然拒绝、DATA_DIR 内部仍然拒绝），新增 `boxes.acceptable()` 给 `app.py` 的三处（拖到一起建盒 / 盒子图标压到桌面图标建盒 / 滚轮选中建盒）和 `dragwatch._path_for()` 共用，`desktop_index()` 给所有文件登记 stem。`.url` 的图标修补也补上了（`_fix_url_icon`：只改 `IconFile=` 那行，Steam 那些「256 画布套小图」的缓存 ico 会被换成填满画布的版本）。
+21. **下新版本、双击没反应 / 覆盖安装报 `WinError 32`**：转发器（`bin/launcher.cs`）在没有参数时一律当成 `toggle` 信号发给常驻实例——旧版本正跑着的时候，双击新版 `desktopbeauty.exe` 只是把旧版本的开关键按了一下，安装窗根本不弹。就算弹了也没用：`app\desktopbeauty-app.exe` 正被旧进程占着，`copytree` 会把 `desktopbeauty-app.exe`、`_internal\*.dll` 一长串列进 `shutil.Error`。现在三处配合：转发器 `WantsUpgrade()` 认出「这个目录不是安装目录」就用 `--setup` 拉起新版本体；`--setup` 只弹安装窗、**不抢 `%TEMP%\deskbeauty.lock`**（旧版本正拿着它）；`install.stop_installed()` 在复制前发 `quit` 并轮询 pid 到它真的消失（最多 20 秒，而且**重发**——`main()` 是先 `tryLock` 再建 Controller 的，头几百毫秒里事件还没建出来，只发一次会扑空）。实测 1.0.0 常驻 → 覆盖成 1.0.1：2.5 秒、旧进程退出、本体和转发器哈希与新版一致、快捷方式/开机自启/卸载项都刷新。
 
 ## 分辨率和多显示器
 

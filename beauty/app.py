@@ -2264,6 +2264,29 @@ def _shot(app: QApplication, ctrl: Controller, out_dir: str) -> None:
     QTimer.singleShot(1200, step)
 
 
+def _run_setup_only(app: QApplication) -> int:
+    """升级 / 覆盖安装：只弹那块安装窗。
+
+    不建 Controller（盒子、卡片、快捷键、鼠标钩子全都不碰），也不抢
+    `%TEMP%\\deskbeauty.lock`——旧版本很可能正跑着，抢锁会让本进程直接退出，
+    用户看到的就是「双击了新版却没反应」。安装动作本身（停旧实例 + 覆盖复制）
+    在 `install.install()` 里。
+    """
+    from .config import Config
+    from .setup_window import SetupWindow
+
+    _log("setup-only 模式（升级 / 覆盖安装）")
+    try:
+        cfg = Config.load()
+        radius = int(getattr(cfg, "box_radius", 0) or 10)
+    except Exception:  # noqa: BLE001 - 配置坏了也得能装
+        radius = 10
+    app.setQuitOnLastWindowClosed(True)
+    win = SetupWindow(radius=radius, upgrade=True)
+    win.show()
+    return app.exec()
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     ensure_dirs()
@@ -2298,6 +2321,9 @@ def main(argv: list[str] | None = None) -> int:
     font.setPixelSize(12)
     app.setFont(font)
     app.setStyleSheet(GLOBAL_QSS)
+
+    if "--setup" in argv:
+        return _run_setup_only(app)
 
     lock = QLockFile(str(Path(tempfile.gettempdir()) / "deskbeauty.lock"))
     if not lock.tryLock(120):
