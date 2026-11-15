@@ -1011,6 +1011,9 @@ class Controller(QObject):
         win.on_widget_press = self._on_widget_press
         # 展开时要把「压住的那些窗口」糊掉，得能拿到所有兄弟窗口
         win.siblings = self._siblings
+        # 面板里的「自适应对齐」开关：以前只设到卡片上，盒子永远当它是开的，
+        # 于是关掉开关盒子照样被推走（用户以为开关坏了）
+        win.auto_align = bool(getattr(self.cfg, "auto_align", True))
         self._apply_box_look(win)
         win.show()
         self.windows[box.id] = win
@@ -1966,10 +1969,14 @@ class Controller(QObject):
         self.cfg.save()
 
     def set_auto_align(self, on: bool) -> None:
-        """自适应对齐：关掉之后拖卡片不再自动避让/贴边（面板里那个开关）。"""
+        """自适应对齐：关掉之后拖卡片/收纳盒松手都不再吸边、也不避让。
+
+        以前这里只往卡片上设，盒子那边根本读不到这个值；现在两边都设
+        （盒子在 `_avoid_overlap` 里判断）。
+        """
         self.cfg.auto_align = bool(on)
         self.cfg.save()
-        for win in self.card_widgets.values():
+        for win in list(self.card_widgets.values()) + list(self.windows.values()):
             try:
                 win.auto_align = bool(on)
             except (RuntimeError, TypeError):

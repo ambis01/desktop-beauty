@@ -4,8 +4,13 @@
 1. 曾经做「边对边吸附」——用户嫌吸附范围太大、会被拽到同一高度，撤了；
 2. 后来又按「最短方向推出」——往右半边放会被推到正上方 / 正下方 / 正右边同高，
    用户三次报「强制在上面 / 在下面 / 强制等高」；
-3. 现在是：**先只横着让，上下高度一个像素都不动**；横着让不开（贴屏幕边、
-   挤了一排）才竖着让；再不行才退回最短位移。任何情况下都不做对齐。
+3. 再后来只留「先横着让，上下一个像素都不动」，横着让不开才竖着让——结果用户
+   报「把一个盒子放在两个盒子中间，根本不对齐，只会掉到下面去」（`place_clear`
+   同时被两个盒子夹住时四条边全堵死，返回 None，盒子原地压着不动）。
+4. 现在是：**先找「贴着别人边角」的最近空位（`corner_slot`）**——盒子落在两个
+   盒子的交界处时，哪一半多就往哪个空角里放（上半多 → 交界处右上，下半多 →
+   左下），只挪被拖的这个、绝不去推别人。找不到贴着别人边角的空位，才退回
+   `place_clear` 的最短位移推出。
 
 桌面图标不在这里算——那是「谁被压住谁让」的事，压着的图标由
 `BoxWidget._push_desktop_icons` / `DesktopIcons.make_room` 挪开。
@@ -103,3 +108,62 @@ def place_clear(rect: QRect, others, gap: int, clamp,
         if not hits(cand, others, gap):
             return cand
     return None
+
+
+# --------------------------------------------------------------- 贴边角对齐
+# 松手时的「贴边距」：和 `GAP`（盒子之间留的缝）同一个数量级，看着才像「本来
+# 就摆在那儿」，不像被硬推过去的。
+SNAP_GAP = 8
+# 判定「压着」的容差：留 2px 不算压着（免得为了 2 个像素把盒子挪走）
+CLEAR_GAP = 2
+
+
+def _hug_offsets(o: QRect, w: int, h: int, gap: int) -> tuple[tuple[int, int], ...]:
+    """贴着这个障碍物放时，左上角该在哪儿（右/左 × 上/下 四个角）。"""
+    return ((o.right() + 1 + gap, o.top() - gap - h),      # 它右边、它上面
+            (o.right() + 1 + gap, o.bottom() + 1 + gap),   # 它右边、它下面
+            (o.left() - gap - w, o.top() - gap - h),       # 它左边、它上面
+            (o.left() - gap - w, o.bottom() + 1 + gap))    # 它左边、它下面
+
+
+def corner_slot(rect: QRect, others, clamp, max_shift: int | None = None,
+                snap_gap: int = SNAP_GAP, clear_gap: int = CLEAR_GAP) -> QRect | None:
+    """压着别人的时候：找**贴着别人边角**的最近空位，而不是把盒子推出老远。
+
+    用户要的原话（2026-11-15）：「自适应对齐不要挤开别的收纳盒，C 在 AB 交界处
+    上面那部分比较多，就对齐在交界处的右上边区域；下面那部分比较多，就对齐在
+    左下边区域」。所以：
+
+      * 候选位置 = 所有障碍物的「左/右边」× 所有障碍物的「上/下边」的组合，
+        加上自己现在的 x / y（允许只挪一个方向）。**跨障碍物组合**是关键：右上
+        那个角常常是「A 的右边 + B 的上边」，不是同一个盒子的两条边。
+      * 夹进屏幕后还能不压着别人的才要；取**挪得最少**的那个，所以盒子落在
+        交界处哪一半，最后就进哪个角——不用再单独判断「上半多还是下半多」。
+      * 距离一样时优先「贴两条边」的（真正的角），其次优先上下不动。
+      * 只管自己，**绝不动别人**；也绝不把盒子甩到屏幕另一头（`max_shift`）。
+
+    没压着别人就原样返回；贴不到任何边角就返回 None，交给 `place_clear`。
+    """
+    if not hits(rect, others, clear_gap):
+        return rect
+    w, h = rect.width(), rect.height()
+    xs: list[tuple[int, int]] = [(rect.left(), 0)]      # (坐标, 是不是贴着别人的边)
+    ys: list[tuple[int, int]] = [(rect.top(), 0)]
+    for o in others:
+        for cx, cy in _hug_offsets(o, w, h, snap_gap):
+            xs.append((cx, 1))
+            ys.append((cy, 1))
+    best: QRect | None = None
+    best_key: tuple[int, int, int] | None = None
+    for x, hx in xs:
+        for y, hy in ys:
+            cand = clamp(QRect(x, y, w, h))
+            if hits(cand, others, clear_gap):
+                continue
+            dist = abs(cand.left() - rect.left()) + abs(cand.top() - rect.top())
+            if max_shift is not None and dist > max_shift:
+                continue
+            key = (dist, -(hx + hy), abs(cand.top() - rect.top()))
+            if best_key is None or key < best_key:
+                best, best_key = cand, key
+    return best

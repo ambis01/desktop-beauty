@@ -1227,9 +1227,12 @@ class BoxWidget(GlassWindow):
         return QPoint(x, y)
 
     def _avoid_overlap(self) -> None:
-        """松手后别跟别的盒子叠着：**沿重叠最浅的那条边推出去**。
+        """松手后别跟别的盒子叠着：先贴边角，实在贴不上才推出去。
 
-        这一块的规矩被用户来回纠正过四次，别再自作聪明：
+        这一块的规矩被用户来回纠正过五次，别再自作聪明：
+          0. **先找「贴着别人边角」的最近空位**（`aligner.corner_slot`）：盒子
+             落在两个盒子交界处时，哪一半多就进哪个空角（上半多 → 交界处右上，
+             下半多 → 左下），只挪自己、不推别人。找不到这样的空位才走下面。
           1. **推最近的一条边**：放上面就往上、放右边就往右，距离永远是最小的；
              固定「水平优先」会让「放在别人上面只压住几像素」被甩到侧边去。
           2. **横竖差不多远时判横向**（`aligner.X_BIAS`）：「往右半边放」是用户
@@ -1240,6 +1243,9 @@ class BoxWidget(GlassWindow):
         桌面图标不算障碍（`_push_desktop_icons` 会挪图标）；卡片也不算
         （见 `_sibling_rects` 的说明）；展开着的盒子按**展开矩形**算。
         """
+        if not getattr(self, "auto_align", True):
+            # 面板里关掉了「自适应对齐」：松手停在原地，不吸边也不推自己
+            return
         if self._expanded:
             m = self._win_margin()
             mine = self._expanded_rect().adjusted(m, m, -m, -m)
@@ -1252,8 +1258,11 @@ class BoxWidget(GlassWindow):
         def clamp(r: QRect) -> QRect:
             return QRect(self._clamp_pos(r.topLeft(), size), size)
 
-        landed = aligner.place_clear(mine, others, gap, clamp,
-                                     max_shift=max(size.width(), size.height()))
+        max_shift = max(size.width(), size.height())
+        landed = aligner.corner_slot(mine, others, clamp, max_shift=max_shift)
+        if landed is None:
+            landed = aligner.place_clear(mine, others, gap, clamp,
+                                         max_shift=max_shift)
         if landed is None or landed.topLeft() == mine.topLeft():
             return
         self.box.x, self.box.y = landed.x(), landed.y()
