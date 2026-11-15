@@ -1263,6 +1263,12 @@ class Controller(QObject):
             return "skip"           # 整个在上面
         if r.bottom() <= base.top() + 1:
             return "above"          # 整个在盒子上沿之上：往上推开
+        # 只是**往下长高**（宽度没变，比如横杠 → 0 状态）：这时候没有「往旁边让」
+        # 这条路可走，展开面下面压着的东西一律往下让，斜着错开的也算。
+        # 不这么判的话，边界正好斜着交叠的两块（用户报的「视听变回正常就压在编程
+        # 身上」）会落到「侧下方不推」里，只能盖住。
+        if target.width() <= base.width() + 1 and r.top() >= base.top() - 1:
+            return "below"
         cx = (r.left() + r.right()) / 2.0
         if base.left() <= cx <= base.right():
             return "below"
@@ -1503,6 +1509,12 @@ class Controller(QObject):
 
         「让得开」= `_plan_all` 算得出来，而且**侧面没有 blocked**（侧面盖住是
         允许的，所以只有算不出来才淘汰）。
+
+        另外排序按「盖住的东西越少越好」：屏幕底部那种情况，往下展开会压住下面
+        那个盒子（它斜着错开一点，按「斜下方不推」的规矩不会被推开），上面明明
+        还有地方——那就该往上长。所以四个候选按
+        （要盖住几个没让开的, 要不要把邻居收横杠, 侧面有几个推不开）比大小，
+        全零直接定。都不好就挑最小的那个。
         """
         cur_h = base.height()
         top0 = int(base.top())
@@ -1511,7 +1523,8 @@ class Controller(QObject):
             scr = (win.screen() or self.app.primaryScreen()).availableGeometry()
         except (RuntimeError, TypeError):
             return None
-        first = None            # 第一个「放得下但有人推不开」的方案（兜底用）
+        best = None
+        best_key = None
         for side in sides:
             for up in (False, True):
                 y = bottom - h if up else top0
@@ -1527,11 +1540,21 @@ class Controller(QObject):
                 plan = self._plan_all(win, want, items, base, allow_collapse)
                 if plan is None:
                     continue
-                if not plan[5]:
-                    return want, side, up, plan
-                if first is None:
-                    first = (want, side, up, plan)
-        return first
+                moved = {id(entry[0]) for entry in plan[0]}      # 往下让的
+                moved |= {id(entry[0]) for entry in plan[3]}     # 往上让的
+                moved |= {id(entry[0]) for entry in plan[4]}     # 往侧边让的
+                covered = 0
+                for other, _is_box, rect in items:
+                    if id(other) in moved:
+                        continue
+                    if rect.intersects(want):
+                        covered += 1
+                key = (covered, 1 if plan[1] else 0, len(plan[5]))
+                if best_key is None or key < best_key:
+                    best_key, best = key, (want, side, up, plan)
+                if key == (0, 0, 0):
+                    return want, side, up, plan      # 谁都不挡、也不用收横杠
+        return best
 
     def _apply_plan(self, win, target, plan, remember: bool) -> None:
         """把方案搬到窗口上：收横杠、往下推、往上推、往左右推，全记进 `_grow_saved`。"""
