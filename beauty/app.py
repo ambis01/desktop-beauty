@@ -1188,6 +1188,25 @@ class Controller(QObject):
                 continue
         return out
 
+    def _free_at(self, rect: QRect, others, gap: int, axis: str, value: int) -> bool:
+        """沿某个轴挪到 value 之后，那块地方是空的吗（离别人至少留一个空隙）。
+
+        为什么需要它：`aligner.stop_x / stop_y` 是「一路滑到撞上为止」的语义，
+        **不允许从别的盒子上面越过去**。可一排邻居是一起往外让的，排在第二位的
+        那个最终位置其实在前面那位的外侧——用 stop_* 判断会一路停在它面前，看着
+        就是「展开了却不让开」或者「收起时第一个回去了、第二个卡住不回来」。
+        """
+        moved = (rect.translated(value - rect.left(), 0) if axis == "x"
+                 else rect.translated(0, value - rect.top()))
+        probe = moved.adjusted(-gap, -gap, gap, gap)
+        for other in others:
+            try:
+                if probe.intersects(other):
+                    return False
+            except (TypeError, AttributeError):
+                continue
+        return True
+
     def _axis_pos(self, w, is_box: bool, axis: str) -> int:
         """某一块在某个轴上的位置（玻璃坐标：盒子是 box.x/y，卡片是 card.x/y）。"""
         if is_box:
@@ -1374,11 +1393,13 @@ class Controller(QObject):
                     if abs(self._axis_pos(other, is_box, axis) - new) > gap:
                         continue              # 你已经挪过它：这一环不抢
                     rect = self._flat_rect(other)
-                    stop = (aligner.stop_y(rect, old,
-                                           self._rects_except([other], virt), gap)
-                            if axis == "y" else
-                            aligner.stop_x(rect, old,
-                                           self._rects_except([other], virt), gap))
+                    others = self._rects_except([other], virt)
+                    if self._free_at(rect, others, gap, axis, old):
+                        stop = old             # 原位空着：直接回去（可以越过让开的那几个）
+                    else:
+                        stop = (aligner.stop_y(rect, old, others, gap)
+                                if axis == "y" else
+                                aligner.stop_x(rect, old, others, gap))
                     if stop is None:
                         continue              # 原位/被挡：这一环不动
                     self._axis_move(other, is_box, axis, stop)
@@ -1667,6 +1688,11 @@ class Controller(QObject):
         moves = [(other, 是不是盒子, 轴 "x", 原来 x, 推到 x)]；
         blocked = 推不开、只能被盖住的那几个（勾常驻展开时见到它就勾不上）。
         只有展开面**比盒子现在宽**时才做（-1 → 0 只是变高，侧面不动）。
+
+        **不会跨到另一侧**：右边的东西只往右让、左边的只往左让。它自己那一侧
+        没地方就进 blocked（盖住 + 模糊）——用户报过「展开外设控制，它跟收纳盒
+        换位了」，就是右边被挡住时把收纳盒推到了左边去。同一排已经让开的会连在
+        一起（后一块排在先走的那个外面），所以一排邻居是整体往右/往左挪。
         """
         try:
             cur_w = win.collapsed_rect().width()
@@ -1699,15 +1725,21 @@ class Controller(QObject):
             got = None
             right = target.right() + 1 + gap
             left = target.left() - gap - rect.width()
+            # 同一排已经让开的那几个要连起来：它们先走了，后面的就跟在它们外侧，
+            # 一排东西一起往右让，而不是第二块又叠回第一个的位置上
+            for vr in virt.values():
+                if rect.top() < vr.bottom() and vr.top() < rect.bottom():
+                    right = max(right, vr.right() + 1 + gap)
+                    left = min(left, vr.left() - gap - rect.width())
+            # 只能往**自己那一侧**推：右边的东西往右让，左边的东西往左让。
+            # 以前只看哪边有地方——右边被挡住（比如同一排已经排满）时会把它推到
+            # 左边去，整块跨过展开面，看着就是「展开外设控制，它跟收纳盒换位了」。
+            on_right = rect.center().x() > target.center().x()
             for want, roomy in ((right, right + rect.width() - 1 <= scr.right()),
                                 (left, left >= scr.left())):
-                if not roomy:
+                if not roomy or (want == right) != on_right:
                     continue
-                try:
-                    stop = aligner.stop_x(rect, want, others, gap)
-                except (RuntimeError, TypeError):
-                    continue
-                if stop is not None and stop == want:
+                if self._free_at(rect, others, gap, "x", want):
                     got = want
                     break
             if got is None:
