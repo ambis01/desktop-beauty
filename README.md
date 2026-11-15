@@ -97,6 +97,9 @@ D:\tmp\buildenv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed
 
 打好的包在 `dist\desktop-beauty-1.0.0-win64.zip`（49 MB / 解压 128 MB）：解压出一个 `desktop beauty\` 文件夹，里面 `desktopbeauty.exe` + `app\`，双击 exe 就会弹出下面那块玻璃窗，点一下按钮装好。
 
+**也可以让 GitHub 打**：`.github/workflows/release.yml` 在推 `v*` 标签或手动 dispatch 时，用 `windows-latest` 跑同一套 PyInstaller 命令、组装目录、打 zip，标签的话顺带挂到 Release 上（里面带 SHA256）。签名还没接，见 [docs/code-signing.md](docs/code-signing.md)。
+
+
 ### 对方电脑弹「智能应用控制已阻止可能不安全的应用」
 
 这个 exe 没有代码签名，对方机器要是开着 Smart App Control（智能应用控制），双击就被拦，提示「已阻止 D:\...\desktopbeauty.exe，因为无法验证其发布者」。包本身没坏。
@@ -559,6 +562,7 @@ Windows 默认把「把 A 拖到 B 图标上」当成**用 B 打开 A**。所以
 16. **桌面图标看着在、点不着**：写测试脚本时用了没声明 DPI 感知的 python 进程去 `GetWindowRect` / `WindowFromPoint` / `SetCursorPos`，Windows 会把坐标按 1.25 倍**虚拟化**，算出来的窗口位置和真实位置差 37px；右键点在了隔壁 Microsoft Edge 上，弹出来的是它的快捷方式菜单（一度以为图标没被点到）。凡是跨进程查窗口坐标、或者要往屏幕上发点击，先 `SetProcessDpiAwarenessContext(-4)`（或者先建 `QApplication` 再查）。反过来说：图标本身没问题，是测量工具瞎了。
 17. **改一下 `config.json` 就把设置丢了**：PowerShell 5.1 的 `Set-Content -Encoding UTF8` 写的是**带 BOM** 的 UTF-8，`Config.load()` 按 `utf-8` 读 → `JSONDecodeError` → 整份配置退回默认值（卡片换回默认便签、位置跳回右上角默认值），而且下次退出还会把这个默认值写回去。现在 `Config.load()` 用 `utf-8-sig` 读。**别用 PowerShell 改程序的 JSON**：要改就用 python 的 `json` 写（`p.write_text(json.dumps(...), "utf-8")`），或者干脆在面板里改。
 18. **悬停放大时四个角变成直角**：为了让轮廓能连续变大，曾经把窗口固定 = 玻璃、靠 `paint_scale` 放大画面——但窗口只有玻璃那么大，放大出去的部分要么被窗口矩形切掉（直角），要么被圆角裁剪路径裁回原尺寸（等于白放大）。根因是**玻璃必须画在一个比它大的窗口里**。现在窗口每边比玻璃大 4–6px，玻璃在这圈余量里放大，不裁不切、圆角永远是圆的。这圈余量试过用阴影填（用户先说可以、要薄，做完又说「算了，这阴影显得好突兀」），最终**保持纯透明**——透明像素合成后就是壁纸，看不出来，还省得画。
+19. **毁灭世界之后图标缩水 / 又变白纸**（无畏契约、QQ音乐）：第 9 条那套「生成 .ico 指过去」用了 `raw_image`，拿的是**没裁透明边**的原图。无畏契约的启动器 256×256 里只有 50×50 有内容（`400333fb….ico` 实测 ink 比例 0.2），explorer 把整块画布缩到 48px 显示 ⇒ 图标只剩 1/5 大。QQ音乐那边更隐蔽：它的快捷方式把 `IconLocation` 写死成 `QQMusic.exe,0`，旧代码「已经写死了就跳过」，于是只能由 explorer 从那个大 exe 里抠图标，批量刷新时抠不出来就画成白纸。现在 `fix_shortcut_icon()` 改成 `_square_ink()`（抠图 → 裁透明边 → 补正方形）+ **接管**「写死指向 exe」的快捷方式（指向 `.ico`/`.png` 的不碰），`.ico` 文件名用**内容哈希**——内容一变就是新路径，顺手绕开 explorer 按路径缓存的图标库。放回桌面时顺序也调了：先修图标 → `notify_created` → 再补一发 `notify_updated`。
 
 ## 分辨率和多显示器
 

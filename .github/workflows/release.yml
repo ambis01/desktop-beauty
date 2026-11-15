@@ -1,0 +1,100 @@
+name: 打包发版
+
+# 手动点一次，或者推一个 v* 标签，就在 GitHub 上打出和本机一样的 zip。
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller==6.22.3
+
+      - name: 打包本体
+        shell: pwsh
+        run: |
+          # --add-data 的源路径必须是绝对的：specpath 换到别的目录之后相对路径会找不到
+          python -m PyInstaller --noconfirm --clean --windowed `
+            --name desktopbeauty-app --icon assets\app.ico --paths . `
+            --hidden-import beauty.install --hidden-import beauty.setup_window `
+            --add-data "$env:GITHUB_WORKSPACE\assets;assets" `
+            --distpath dist-app --workpath build --specpath build run.pyw
+
+      - name: 组装目录
+        shell: pwsh
+        run: |
+          $out = "dist\desktop beauty"
+          New-Item -ItemType Directory -Force "$out\app" | Out-Null
+          Copy-Item "bin\desktopbeauty.exe" $out -Force
+          Copy-Item "dist-app\desktopbeauty-app\*" "$out\app" -Recurse -Force
+          # 转发器按这两行决定跑哪个本体（详见 README「转发器的两种目标」）
+          $txt = "app\desktopbeauty-app.exe`napp`n"
+          [IO.File]::WriteAllText(
+            (Join-Path $out "target.txt"), $txt, [Text.UTF8Encoding]::new($false))
+          Get-ChildItem $out, "$out\app" | Select-Object Name, Length
+
+      - name: 上传待签名目录
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned
+          path: dist/desktop beauty
+          if-no-files-found: error
+
+      # ---- 签名（SignPath 批下来之后再启用；必须在打 zip 之前，详见 docs/code-signing.md）----
+      # - name: 签名
+      #   uses: signpath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+      #     project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      #     signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+      #     github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+      #     wait-for-completion: true
+      #     output-artifact-directory: dist-signpath
+      # - name: 换成签过名的文件
+      #   shell: pwsh
+      #   run: Copy-Item dist-signpath\* "dist\desktop beauty" -Recurse -Force
+
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $name = "desktop-beauty-$tag-win64.zip"
+          Compress-Archive -Path "dist\desktop beauty" -DestinationPath "dist\$name"
+          $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash
+          "ASSET_SHA256=$hash" >> $env:GITHUB_ENV
+          "{0}  {1} bytes  sha256={2}" -f $name, (Get-Item "dist\$name").Length, $hash
+
+      - name: 留个包
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-beauty-win64
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: 挂到 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          body: |
+            解压后双击 `desktopbeauty.exe` →「安装到这台电脑」。
+
+            SHA256: `${{ env.ASSET_SHA256 }}`
+
+            如果双击被「智能应用控制」拦下，见 README 里那一节的处理办法。
