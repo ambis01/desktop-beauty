@@ -187,7 +187,9 @@ def show_for_item(box, index: int, global_pos: QPoint) -> None:
     def run(cmd: str) -> None:
         """菜单选完之后执行。系统动词自己会弹框，别在 exec 的嵌套循环里做。"""
         if cmd == "open":
-            box._launch(index)
+            # 按**路径**启动：菜单开着的时候列表可能已经变了（拖进文件 / 合并 /
+            # 文件监听刷新），按下标会打开另一个文件
+            box._launch(path)
         elif cmd == "rename":
             box._rename_item(index)
         elif cmd == "more":

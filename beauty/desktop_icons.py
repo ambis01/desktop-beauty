@@ -748,9 +748,111 @@ shell32.SHChangeNotify.argtypes = [ctypes.c_long, wt.UINT, ctypes.c_void_p, ctyp
 WM_CANCELMODE = 0x001F
 WM_LBUTTONUP = 0x0202
 
+# explorer 那个界面线程的鼠标捕获状态：拖拽循环还在跑的时候，捕获攥在拖拽源
+# （就是桌面 ListView）手里；它退干净之后捕获就放掉了。`dragwatch` 用它判断
+# 「现在补那一下 WM_LBUTTONUP 会不会被拖拽循环吃掉」。
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("flags", wt.DWORD),
+        ("hwndActive", wt.HWND),
+        ("hwndFocus", wt.HWND),
+        ("hwndCapture", wt.HWND),
+        ("hwndMenuOwner", wt.HWND),
+        ("hwndMoveSize", wt.HWND),
+        ("hwndCaret", wt.HWND),
+        ("rcCaret", _RECT),
+    ]
+
+
+user32.GetGUIThreadInfo.argtypes = [wt.DWORD, ctypes.POINTER(_GUITHREADINFO)]
+
+
+def shell_capture() -> int:
+    """桌面 ListView 那个线程现在攥着鼠标捕获的窗口（0 = 没攥着）。
+
+    拖拽退出过程中它会先把捕获放掉；拖拽还活着时拿到的一般就是桌面 ListView 自己。
+    """
+    lv = _find_listview()
+    if not lv:
+        return 0
+    tid = user32.GetWindowThreadProcessId(lv, None)
+    if not tid:
+        return 0
+    info = _GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+    if not user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+        return 0
+    return int(info.hwndCapture or 0)
+
+
+def drag_still_active() -> bool:
+    """explorer 的桌面拖拽还没退干净（捕获还攥在 ListView 上）。"""
+    lv = _find_listview()
+    return bool(lv) and shell_capture() == int(lv)
+
+
+def shell_pid() -> int:
+    """桌面 ListView 属于哪个进程（正常情况下就是 explorer.exe）。"""
+    lv = _find_listview()
+    if not lv:
+        return 0
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(lv, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def drag_image_windows(shell_pid_value: int = 0) -> list[int]:
+    """explorer 拖拽循环用的「拖拽影子」窗口（类名 `SysDragImage`，可见的那些）。
+
+    实测（2026-11-15）：把「图标拖到另一个图标上」那一下 up 吞掉之后，explorer
+    的拖拽循环有时候还活着，会**不停新建/重画**这个影子窗口，位置严格跟着鼠标走
+    —— 用户报的「图标残影跟着鼠标跑」就是它。补 Esc、给捕获窗口发 message、
+    抢掉鼠标捕获都收不掉它（四种方案各试了 3 次，影子照样出现），只能在它自己
+    退出去之前把影子藏起来。
+    """
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def _cb(hwnd, _lparam):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, buf, 64)
+            if buf.value != "SysDragImage":
+                return True
+            if shell_pid_value:
+                pid = wt.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if int(pid.value) != shell_pid_value:
+                    return True
+            found.append(int(hwnd))
+        except Exception:  # noqa: BLE001 - 枚举里不许抛
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception:  # noqa: BLE001 - 收尾动作，失败也不该炸
+        return []
+    return found
+
+
+def hide_drag_images(shell_pid_value: int = 0) -> int:
+    """把残留的拖拽影子窗口藏起来，返回藏了几个。"""
+    hidden = 0
+    for hwnd in drag_image_windows(shell_pid_value):
+        try:
+            if user32.ShowWindow(wt.HWND(hwnd), 0):     # SW_HIDE
+                hidden += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return hidden
+
 
 def cancel_shell_drag() -> None:
-    """让 explorer 的桌面 ListView 彻底退出「拖拽中」状态。
+    """让 explorer 的桌面 ListView 退出「拖拽中」的状态。
 
     `dragwatch` 为了不让 explorer 把「快捷方式丢到快捷方式上」当成「用目标程序
     打开」，会把松手那一下**在全局钩子里吞掉**（钩子返回 1，任何窗口都收不到）。
@@ -910,13 +1012,18 @@ def find_desktop_copy(name: str) -> Path | None:
     return None
 
 
-def item_at_screen(x: int, y: int) -> tuple[int, str, Path | None]:
-    """屏幕坐标下命中的图标：索引、显示名、可收纳路径（普通文件也算，目录不算）。"""
+def item_at_screen(x: int, y: int,
+                   dirs: bool = False) -> tuple[int, str, Path | None]:
+    """屏幕坐标下命中的图标：索引、显示名、可收纳路径。
+
+    `dirs=True` 时文件夹也算（拖桌面上的文件夹到另一个图标上建盒用）；
+    默认不算——盒子内部「拖到桌面图标上预告建盒」走的是老行为。
+    """
     idx = hit_test(x, y)
     if idx < 0:
         return -1, "", None
     name = icon_name(idx)
     path = resolve_item(name) if name else None
-    if path is not None and not path.is_file():
+    if path is not None and not path.is_file() and not dirs:
         path = None
     return idx, name, path

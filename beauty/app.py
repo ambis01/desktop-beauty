@@ -366,7 +366,7 @@ class Controller(QObject):
         win.on_resize_drag = lambda on, w=win: self._cursor_drag(w, on)
         win.auto_align = bool(getattr(self.cfg, "auto_align", True))
         if card.type == "clock":
-            win.on_open_weather = lambda w: self.open_weather(w.card.city)
+            win.on_open_weather = lambda w: self.open_weather(w.card.city, w)
             try:
                 win.set_weather_data(self.weather.get(card.city or ""))
             except (RuntimeError, TypeError):
@@ -868,12 +868,27 @@ class Controller(QObject):
                 self.weather.refresh([card.city or ""])
         self.cfg.save()
 
-    def open_weather(self, city: str) -> None:
+    def open_weather(self, city: str, win=None) -> None:
         """点卡片右边的天气块：弹天气预报。"""
         from .weather_dialog import WeatherDialog
         parent = self.settings if getattr(self, "settings", None) is not None else None
+
+        def use_auto(name: str) -> None:
+            """「重新定位」成功：这张卡片从「钉死某个城市」改回自动定位。"""
+            if win is None or not getattr(win, "card", None):
+                return
+            try:
+                win.card.city = ""
+                win.set_weather_data(self.weather.get(""))
+                self._weather_updated()
+            except (RuntimeError, TypeError, AttributeError):
+                return
+            self.cfg.save()
+            _log(f"weather: card {win.card.id} switched to auto locate ({name})")
+
         WeatherDialog.show_for(city or "", self.weather,
-                               bool(getattr(self.cfg, "panel_dark", False)), parent)
+                               bool(getattr(self.cfg, "panel_dark", False)),
+                               parent, use_auto)
 
     def _weather_updated(self) -> None:
         for card in self.cfg.cards:
@@ -1001,6 +1016,7 @@ class Controller(QObject):
         win.on_z_changed = self.apply_z_order
         win.on_toast = lambda text: self.toast.show_text(text, 2200)
         win.on_merge = self.merge_boxes
+        win.on_merge_group = self.merge_group
         win.on_new_box = self._on_new_box
         win.on_new_box_from_selection = self._on_new_box_from_selection
         win.on_drag_preview = self._on_drag_preview
@@ -1534,25 +1550,61 @@ class Controller(QObject):
         key = getattr(win, "sel_key", None)
         if self.sel_items and key not in self.sel_items:
             self.clear_selection()
+        # 按到别的窗口上：别的盒子里「双击还没落地」的启动作废。以前每个盒子各自
+        # 计时 180ms，在 A 里双击一下、马上又去 B 里双击，两边都会到点启动
+        # —— 用户看到的就是「打开一个，另一个也跟着开了」。
+        for other in list(self.windows.values()) + list(self.card_widgets.values()):
+            if other is win:
+                continue
+            cb = getattr(other, "cancel_pending_launch", None)
+            if cb is not None:
+                try:
+                    cb()
+                except (RuntimeError, TypeError):
+                    continue
 
 
     def merge_boxes(self, src_win, dst_win) -> None:
         """两个盒子合并：src 的图标全进 dst，src 自己消失。"""
         if not getattr(self.cfg, "box_merge", True):
             return   # 设置里关了合并：什么都不做（拖上去也不会并）
-        src = getattr(src_win, "box", None)
-        dst = getattr(dst_win, "box", None)
-        if src is None or dst is None or src.id == dst.id:
-            return
-        moved = self.store.merge(src, dst)
-        # 一个都没搬过去（文件被占用等）：源盒子留在原地，别让它凭空消失
-        if moved <= 0:
+        if self._merge_one(src_win, dst_win) <= 0:
+            # 一个都没搬过去（文件被占用等）：源盒子留在原地，别让它凭空消失
             try:
                 if not src_win.is_expanded:
                     src_win.toggle(True)
             except (RuntimeError, TypeError):
                 pass
             return
+        self._after_merge(dst_win)
+
+    def merge_group(self, src_wins, dst_win) -> None:
+        """多选之后整组拖到另一个盒子上松手：这一整组都并进那个盒子。
+
+        用户的要求（2026-11-15）：选中多个收纳盒，拖其中一个时把它的拖动区压到
+        另一个盒子的拖动区上松手 —— 不是只并被拖的那个，**整组都并进去**。
+        """
+        if not getattr(self.cfg, "box_merge", True):
+            return
+        total = 0
+        for win in list(src_wins):
+            if win is dst_win:
+                continue
+            total += self._merge_one(win, dst_win)
+        if total <= 0:
+            return
+        self.clear_selection()      # 并掉的盒子已经没了，别留一堆悬空的多选
+        self._after_merge(dst_win)
+
+    def _merge_one(self, src_win, dst_win) -> int:
+        """把一个盒子的图标全搬进另一个盒子（只管搬，收尾交给调用方）。"""
+        src = getattr(src_win, "box", None)
+        dst = getattr(dst_win, "box", None)
+        if src is None or dst is None or src.id == dst.id:
+            return 0
+        moved = self.store.merge(src, dst)
+        if moved <= 0:
+            return 0
         try:
             src_win.dispose()
         except Exception:  # noqa: BLE001 - 监听器停不掉也不能挡着合并
@@ -1560,8 +1612,12 @@ class Controller(QObject):
         src_win.close()
         src_win.deleteLater()
         self.windows.pop(src.id, None)
+        self.sel_items.discard(f"box:{src.id}")
         self._forget_undo(src.id)
-        # 目标盒子重排：图标多了，展开尺寸要跟着长
+        return moved
+
+    def _after_merge(self, dst_win) -> None:
+        """并完的收尾：目标盒子重排（图标多了展开尺寸要跟着长）并抬到最上层。"""
         dst_win.refresh()
         if not dst_win.is_expanded:
             dst_win.toggle(True)

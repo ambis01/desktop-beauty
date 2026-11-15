@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime
 from pathlib import Path
@@ -27,6 +28,7 @@ CACHE_PATH = DATA_DIR / "weather.json"
 CACHE_TTL = 20 * 60          # 20 分钟内的缓存直接用，不再请求
 GEO_TTL = 12 * 3600          # 定位结果缓存 12 小时
 TIMEOUT = 8.0
+GEO_TIMEOUT = 8.0            # 定位是并行问多家，等这么久就够了（慢的不要了）
 
 # 城市 → (纬度, 经度)。够用就行，用户还能在设置里自己挑。
 CITIES: dict[str, tuple[float, float]] = {
@@ -193,42 +195,295 @@ class Weather:
 # ---------------------------------------------------------------- 定位
 _geo_cache: dict = {"stamp": 0.0, "city": "", "lat": None, "lon": None}
 
+# 系统里配了代理（Clash / v2ray 之类）时，urllib 默认会走它。按 IP 定位必须
+# **绕过代理直连**：走代理拿到的是代理出口的 IP —— 用户实际踩过这个坑，人在
+# 南昌，天气卡片定位到「香港」（实测走代理 ip-api 返回 22.3193/114.1693 香港，
+# 直连返回 28.684/115.853 南昌）。
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                     "AppleWebKit/537.36 (KHTML, like Gecko) "
+                     "Chrome/120.0 Safari/537.36"}
 
-def _get_json(url: str):
-    with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+_CITY_SUFFIX = ("特别行政区", "自治州", "自治区", "市辖区", "地区", "新区",
+                "市", "县", "区", "盟")
+
+
+def _log_geo(msg: str) -> None:
+    """定位过程写进 app.log：别人机器上定位歪了，让他把这行发过来就能查。"""
+    try:
+        from .dlog import dlog
+        dlog(msg)
+    except Exception:  # noqa: BLE001 - 日志写不进去不能影响定位
+        pass
+
+
+def _open(url: str, direct: bool, timeout: float = TIMEOUT) -> bytes:
+    req = urllib.request.Request(url, headers=_UA)
+    if direct:
+        return _DIRECT_OPENER.open(req, timeout=timeout).read()
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+
+def _get_json(url: str, direct: bool | None = None, encoding: str = "utf-8",
+              timeout: float = TIMEOUT):
+    """读一个 JSON 接口。
+
+    - `direct=None`：先按系统代理（翻得出去的时候快），失败再直连兜底
+    - `direct=True`：**只直连**，绝不走代理（定位用这个）
+    """
+    tries = (True,) if direct else (False, True)
+    for d in tries:
+        try:
+            return json.loads(_open(url, d, timeout).decode(encoding))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = (math.sin(dp / 2.0) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2)
+    return 2.0 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _nearest_city(lat: float, lon: float,
+                  limit: float = 60.0) -> tuple[str | None, float]:
+    """坐标最近的已知城市（默认 60km 内），返回 (城市, 距离)。"""
+    best, best_d = None, limit
+    for name, (clat, clon) in CITIES.items():
+        d = _km(lat, lon, clat, clon)
+        if d <= best_d:
+            best, best_d = name, d
+    return best, best_d
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _clean_city(name: str) -> str:
+    """「南昌市」→「南昌」，「香港特别行政区」→「香港」。"""
+    s = str(name or "").strip()
+    for suf in _CITY_SUFFIX:
+        if len(s) > len(suf) + 1 and s.endswith(suf):
+            return s[: -len(suf)]
+    return s
+
+
+def _fix_city(name: str, lat: float, lon: float, limit: float = 60.0) -> str:
+    """把 IP 库给的城市名收拾成能显示的中文名。
+
+    有的接口给英文（ipinfo / ip.sb 那种是 `Nanchang`），有的给区县
+    （`东湖区`）。凡是离某个已知城市很近（默认 25km）的，就显示那个城市 ——
+    反正天气是按坐标抓的，名字只是给人看的。
+    """
+    clean = _clean_city(name)
+    near, dist = _nearest_city(lat, lon, limit)
+    if near is not None:
+        if not clean or not _has_cjk(clean) or dist <= 25.0:
+            return near
+    return clean or (near or "自动定位")
+
+
+def _coords(raw: dict, lak: str, lok: str | None):
+    if lok is None:
+        loc = str(raw.get(lak) or "")
+        if "," not in loc:
+            return None, None
+        a, b = loc.split(",", 1)
+        try:
+            return float(a), float(b)
+        except (TypeError, ValueError):
+            return None, None
+    try:
+        return float(raw.get(lak)), float(raw.get(lok))
+    except (TypeError, ValueError):
+        return None, None
+
+
+# ---------------------------------------------------------------- 多源投票
+# 只问一家不够：同一个 IP，ip-api 说「南昌」、pconline 说「抚州」、ipwho.is
+# （走 IPv6 那条）说「北京」—— 实测就发生过。所以**每个源都问一遍，再按坐标
+# 聚类投票**：同一片地方的结果算一票，票多的赢；票一样时优先 IPv4 的那边
+# （IPv6 的库对中国移动的大段经常只给「北京」这种省级/注册地答案）。
+class _GeoHit:
+    __slots__ = ("city", "lat", "lon", "ip", "src")
+
+    def __init__(self, city, lat=None, lon=None, ip="", src=""):
+        self.city = str(city or "").strip()
+        self.lat = lat
+        self.lon = lon
+        self.ip = str(ip or "")
+        self.src = src
+
+    @property
+    def v6(self) -> bool:
+        return ":" in self.ip
+
+    def __repr__(self) -> str:      # 只给日志看
+        return (f"{self.src}={self.city or '?'}"
+                f"({self.lat},{self.lon}{' v6' if self.v6 else ''})")
+
+
+def _num(value) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _hit_ipapi(direct: bool) -> _GeoHit | None:
+    raw = _get_json("http://ip-api.com/json/?lang=zh-CN", direct=direct,
+                    timeout=GEO_TIMEOUT)
+    if not isinstance(raw, dict) or raw.get("status") != "success":
+        return None
+    return _GeoHit(raw.get("city") or raw.get("regionName"),
+                   _num(raw.get("lat")), _num(raw.get("lon")),
+                   raw.get("query"), "ip-api")
+
+
+def _hit_ipinfo(direct: bool) -> _GeoHit | None:
+    raw = _get_json("https://ipinfo.io/json", direct=direct, timeout=GEO_TIMEOUT)
+    if not isinstance(raw, dict):
+        return None
+    lat, lon = _coords(raw, "loc", None)
+    return _GeoHit(raw.get("city"), lat, lon, raw.get("ip"), "ipinfo")
+
+
+def _hit_ipsb(direct: bool) -> _GeoHit | None:
+    raw = _get_json("https://api.ip.sb/geoip", direct=direct, timeout=GEO_TIMEOUT)
+    if not isinstance(raw, dict):
+        return None
+    return _GeoHit(raw.get("city"), _num(raw.get("latitude")),
+                   _num(raw.get("longitude")), raw.get("ip"), "ip.sb")
+
+
+def _hit_ipwho(direct: bool) -> _GeoHit | None:
+    raw = _get_json("https://ipwho.is/", direct=direct, timeout=GEO_TIMEOUT)
+    if not isinstance(raw, dict) or raw.get("success") is False:
+        return None
+    return _GeoHit(raw.get("city"), _num(raw.get("latitude")),
+                   _num(raw.get("longitude")), raw.get("ip"), "ipwho")
+
+
+def _hit_pconline(direct: bool) -> _GeoHit | None:
+    """太平洋电脑网的 IP 库：只有省市名、没有坐标，而且是 GBK。"""
+    raw = _get_json("https://whois.pconline.com.cn/ipJson.jsp?json=true",
+                    direct=direct, encoding="gbk",
+                    timeout=GEO_TIMEOUT)
+    if not isinstance(raw, dict) or raw.get("err"):
+        return None
+    return _GeoHit(raw.get("city"), None, None, raw.get("ip"), "pconline")
+
+
+_HITTERS = (_hit_ipapi, _hit_ipinfo, _hit_ipsb, _hit_ipwho, _hit_pconline)
+
+
+def geocode(name: str, direct: bool = False) -> tuple[float, float] | None:
+    """城市名 → 坐标（Open-Meteo 的 geocoding，中文名认得挺准）。"""
+    if not name:
+        return None
+    query = urllib.parse.urlencode({"name": name, "count": "1", "language": "zh"})
+    raw = _get_json(f"https://geocoding-api.open-meteo.com/v1/search?{query}",
+                    direct=direct, timeout=GEO_TIMEOUT)
+    if not isinstance(raw, dict):
+        return None
+    results = raw.get("results") or []
+    if not results:
+        return None
+    lat, lon = _num(results[0].get("latitude")), _num(results[0].get("longitude"))
+    if lat is None or lon is None:
+        return None
+    return lat, lon
+
+
+def _pick_hit(hits: list[_GeoHit], direct: bool) -> tuple[str, float, float] | None:
+    """把各家结果按坐标聚类投票，挑出最可信的那一片。"""
+    for hit in hits:
+        if (hit.lat is None or hit.lon is None) and hit.city:
+            pos = geocode(hit.city, direct=direct)
+            if pos is not None:
+                hit.lat, hit.lon = pos
+    usable = [h for h in hits
+              if h.lat is not None and h.lon is not None
+              and -90.0 <= h.lat <= 90.0 and -180.0 <= h.lon <= 180.0]
+    if not usable:
+        return None
+    clusters: list[list[_GeoHit]] = []
+    for hit in usable:
+        for group in clusters:
+            if _km(hit.lat, hit.lon, group[0].lat, group[0].lon) <= 60.0:
+                group.append(hit)
+                break
+        else:
+            clusters.append([hit])
+
+    def rank(group):
+        votes = len(group)
+        v4 = sum(1 for h in group if not h.v6)
+        cjk = sum(1 for h in group if _has_cjk(_clean_city(h.city)))
+        return (-votes, -v4, -cjk)
+
+    clusters.sort(key=rank)
+    best = clusters[0]
+    lat = sum(h.lat for h in best) / len(best)
+    lon = sum(h.lon for h in best) / len(best)
+    named = [_clean_city(h.city) for h in best if _has_cjk(_clean_city(h.city))]
+    return _fix_city(named[0] if named else best[0].city, lat, lon), lat, lon
+
+
+def _locate_once(direct: bool) -> tuple[str, float, float] | None:
+    """问一圈定位源（并行问，最多等 GEO_TIMEOUT），再投票。"""
+    hits: list[_GeoHit] = []
+    pool = ThreadPoolExecutor(max_workers=len(_HITTERS))
+    try:
+        futures = [pool.submit(fn, direct) for fn in _HITTERS]
+        try:
+            for fut in as_completed(futures, timeout=GEO_TIMEOUT):
+                try:
+                    hit = fut.result()
+                except Exception:  # noqa: BLE001 - 单个源抽风不影响投票
+                    continue
+                if hit is not None and hit.city:
+                    hits.append(hit)
+        except TimeoutError:
+            pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    got = _pick_hit(hits, direct)
+    _log_geo(f"geo direct={direct}: {hits} -> {got}")
+    return got
 
 
 def locate(force: bool = False) -> tuple[str, float, float] | None:
-    """按公网 IP 定位，返回 (城市名, 纬度, 经度)；失败返回 None。"""
+    """按公网 IP 定位，返回 (城市名, 纬度, 经度)；失败返回 None。
+
+    **只走直连**。以前直连失败会退回去走系统代理，结果拿到的是代理出口的 IP
+    —— 用户实际踩过：人在南昌，天气卡片定位到「香港」。定位错了比暂时没定位
+    更糟（卡片会留着上一次的城市，用户也能点「重新定位」重试或手选城市），
+    所以这里不再用代理兜底。
+    """
     now = time.time()
     if not force and _geo_cache["lat"] is not None \
             and now - _geo_cache["stamp"] < GEO_TTL:
         return (_geo_cache["city"], _geo_cache["lat"], _geo_cache["lon"])
-    sources = (
-        ("http://ip-api.com/json/?lang=zh-CN", "city", "lat", "lon"),
-        ("https://ipwho.is/", "city", "latitude", "longitude"),
-    )
-    for url, ck, lak, lok in sources:
-        try:
-            raw = _get_json(url)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        if raw.get("status") in ("fail", False):
-            continue
-        city = str(raw.get(ck) or "").strip()
-        lat, lon = raw.get(lak), raw.get(lok)
-        if not city or lat is None or lon is None:
-            continue
-        try:
-            lat, lon = float(lat), float(lon)
-        except (TypeError, ValueError):
-            continue
-        _geo_cache.update(stamp=now, city=city, lat=lat, lon=lon)
-        return city, lat, lon
-    return None
+    got = _locate_once(True)
+    if got is None:
+        # 一家都没回来（网络抽风 / 被限流）：歇一下再问一轮，还不行就保留上一次
+        # 的定位结果，绝不退回走代理（那会拿到代理出口的城市）
+        time.sleep(0.4)
+        got = _locate_once(True)
+    if got is None:
+        _log_geo("geo: direct sources all failed, keep previous location")
+        return None
+    _geo_cache.update(stamp=now, city=got[0], lat=got[1], lon=got[2])
+    return got
 
 
 def resolve(key: str) -> tuple[str, float, float] | None:
@@ -366,6 +621,7 @@ class WeatherService(QObject):
     """后台线程抓天气，数据放在 self.data[城市key]；有新数据发 updated。"""
 
     updated = Signal()
+    relocated = Signal(bool, str)      # (成功, 城市名)：手动「重新定位」的结果
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -373,6 +629,37 @@ class WeatherService(QObject):
         self._lock = threading.Lock()
         self._busy: set[str] = set()
         self._last: dict[str, float] = {}
+        self._locating = False
+
+    def locate_now(self) -> None:
+        """手动「重新定位」：绕过代理重新按 IP 定位，再强制刷新自动定位的天气。"""
+        if self._locating:
+            return
+        self._locating = True
+        threading.Thread(target=self._locate_worker, daemon=True).start()
+
+    def _locate_worker(self) -> None:
+        got = None
+        try:
+            got = locate(force=True)
+        except Exception:  # noqa: BLE001 - 定位失败就走失败分支
+            got = None
+        finally:
+            self._locating = False
+        if got is None:
+            self.relocated.emit(False, "")
+            return
+        name, _lat, _lon = got
+        with self._lock:
+            self._last.pop("", None)
+            old = self.data.get("")
+            if old is not None and old.city != name:
+                # 旧的那份是错的城市（比如定位到香港了）：先扔掉，界面才会显示
+                # 「正在获取…」而不是继续放着旧城市
+                self.data.pop("", None)
+        self.updated.emit()
+        self.refresh([""], force=True)
+        self.relocated.emit(True, name)
 
     def get(self, key: str) -> Weather | None:
         return self.data.get(key or "")

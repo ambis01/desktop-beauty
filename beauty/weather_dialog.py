@@ -71,11 +71,15 @@ def _temp(value) -> str:
 
 
 class WeatherDialog(_FrostDialog):
-    def __init__(self, key: str, service, dark: bool = False, parent=None):
+    def __init__(self, key: str, service, dark: bool = False, parent=None,
+                 on_auto=None):
         flags = Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint
         super().__init__(flags, 10.0, dark, parent)
         self.key = key or ""
         self.service = service
+        # 「重新定位」成功、而这张卡片原来钉的是某个城市：回调让 Controller 把
+        # 那张卡片改回「自动定位」，不然定位完界面还是显示原来那个城市
+        self.on_auto = on_auto
         self.setFixedSize(u(468), u(640))
         self.setStyleSheet(_QSS_DARK if self._dark else _QSS)
 
@@ -92,6 +96,10 @@ class WeatherDialog(_FrostDialog):
         self.lbl_updated.setObjectName("dim")
         header.addWidget(self.lbl_updated)
         header.addStretch(1)
+        self._btn_locate = QPushButton("重新定位")
+        self._btn_locate.setObjectName("ghost")
+        self._btn_locate.clicked.connect(self._locate)
+        header.addWidget(self._btn_locate)
         self._btn_refresh = QPushButton("刷新")
         self._btn_refresh.setObjectName("ghost")
         self._btn_refresh.clicked.connect(self._refresh)
@@ -194,9 +202,48 @@ class WeatherDialog(_FrostDialog):
         self._timer.setInterval(60 * 1000)
         self._timer.timeout.connect(self._fill)
         self._timer.start()
+        if service is not None:
+            # 在 __init__ 里就接上：不管是谁创建的这个窗，「重新定位」的结果和
+            # 新数据都能回到界面上（以前只有 show_for 那条路会接）
+            try:
+                service.updated.connect(self._fill)
+                service.relocated.connect(self._on_relocated)
+            except (AttributeError, TypeError):
+                pass
         self._fill()
 
     # ---- 数据 ----
+    def _locate(self) -> None:
+        """重新定位：绕过系统代理按公网 IP 重新认一次位置，然后强制刷新天气。"""
+        if self.service is None or not hasattr(self.service, "locate_now"):
+            return
+        self._btn_locate.setText("定位中…")
+        self._btn_locate.setEnabled(False)
+        self.lbl_updated.setText("正在定位…")
+        self._flash.stop()
+        self.service.locate_now()
+
+    def _on_relocated(self, ok: bool, name: str) -> None:
+        self._btn_locate.setText("重新定位")
+        self._btn_locate.setEnabled(True)
+        if not ok:
+            # 失败的话这句留着（别用 flash 到点又清空），下次定位/刷新会覆盖它
+            self._flash.stop()
+            self.lbl_updated.setText("定位失败，检查一下网络")
+            return
+        if self.key:
+            # 原来钉死某个城市的：定位成功就改回自动定位
+            self.key = ""
+            cb = self.on_auto
+            if cb is not None:
+                try:
+                    cb(name)
+                except (RuntimeError, TypeError):
+                    pass
+        self.lbl_updated.setText(f"已定位到 {name}")
+        self._flash.start(8000)      # 数据回来那一下别把「已定位到 xx」冲掉
+        self._fill()
+
     def _refresh(self) -> None:
         if self.service is None:
             return
@@ -341,8 +388,8 @@ class WeatherDialog(_FrostDialog):
     # ---- 打开 ----
     @classmethod
     def show_for(cls, key: str, service, dark: bool = False,
-                 parent=None) -> None:
-        dlg = cls(key, service, dark, parent)
+                 parent=None, on_auto=None) -> None:
+        dlg = cls(key, service, dark, parent, on_auto)
         dlg.center_over(parent)
         dlg.show()
         dlg.raise_()
@@ -350,7 +397,6 @@ class WeatherDialog(_FrostDialog):
         if service is not None:
             try:
                 service.refresh([key or ""])
-                service.updated.connect(dlg._fill)
                 dlg.closed.connect(lambda: _disconnect(service, dlg))
             except (AttributeError, TypeError):
                 pass
@@ -368,6 +414,10 @@ def _disconnect(service, dlg) -> None:
     try:
         service.updated.disconnect(dlg._fill)
     except (RuntimeError, TypeError):
+        pass
+    try:
+        service.relocated.disconnect(dlg._on_relocated)
+    except (RuntimeError, TypeError, AttributeError):
         pass
 
 

@@ -513,6 +513,7 @@ class BoxWidget(GlassWindow):
         self.on_z_changed = None
         self.on_toast = None
         self.on_merge = None
+        self.on_merge_group = None    # 多选整组压到别的盒子上：整组并进去
         self.on_grow_request = None   # 盒子要长高：先问 Controller 有没有地方
         self.on_shrunk = None         # 收到横杠：让下面的东西吸上来
         self.on_grew = None           # 自动变大之后：把被压住的盒子和桌面图标挪开
@@ -541,7 +542,7 @@ class BoxWidget(GlassWindow):
         # 双击打开要延迟一点点再执行：拖图标时第二下按下会被 Qt 判成双击，
         # 不延迟就会在拖拽途中把软件打开
         self._launch_timer: QTimer | None = None
-        self._pending_launch: int | None = None
+        self._pending_launch: Path | None = None
 
         self._watch = QFileSystemWatcher(self)
         self._watch.directoryChanged.connect(self._on_dir_changed)
@@ -1291,7 +1292,7 @@ class BoxWidget(GlassWindow):
         if chosen is None:
             return
         if chosen is act_open:
-            self._launch(index)
+            self._launch(path)
         elif chosen is act_reveal:
             try:
                 subprocess.Popen(["explorer", "/select,", str(path)])
@@ -1366,9 +1367,23 @@ class BoxWidget(GlassWindow):
         if cb is not None:
             cb(text)
 
-    def _launch(self, index: int) -> None:
-        if 0 <= index < len(self._items):
-            QDesktopServices_open(self._items[index])
+    def _launch(self, which) -> None:
+        """启动一个图标。
+
+        `which` 可以是下标，也可以直接是 Path。**菜单开着 / 双击延迟那 180ms 里
+        列表可能已经变了**（拖进新文件、合并、改名、文件监听刷新），这时候按下标
+        启动会打开**另一个**文件（用户报的「打开一个，另一个也被打开了」，实测
+        5 个用例里有 2 个开错）。所以按路径启动；路径已经不在盒子里就什么都不做。
+        """
+        if isinstance(which, int):
+            if not (0 <= which < len(self._items)):
+                return
+            path = self._items[which]
+        else:
+            path = Path(which)
+            if path not in self._items:
+                return
+        QDesktopServices_open(path)
 
     # ---------------------------------------------------------------- 几何
     def _screen(self) -> QRect:
@@ -1439,6 +1454,8 @@ class BoxWidget(GlassWindow):
             # 收起/展开时先把改名结束掉，别留一个输入框挂在窗口上
             self._finish_inline_rename(True)
         self._expanded = target
+        # 收 / 展开的时候，上一次双击还没落地的启动作废
+        self.cancel_pending_launch()
         self._rect_collapsed = QRect(self.box.x - self._win_margin(),
                                      self.box.y - self._win_margin(),
                                      self._win_w(), self._win_h())
@@ -1851,6 +1868,7 @@ class BoxWidget(GlassWindow):
         """拖着盒子走时：自己的拖动区压到别的盒子的拖动区上，那个盒子就展开。
 
         松手即合并（把图标全并过去），移开就把它收回原来的状态。
+        多选整组一起搬的时候同样适用：松手是**整组**并进目标盒子。
         """
         if not self._moved:
             return
@@ -1864,6 +1882,10 @@ class BoxWidget(GlassWindow):
                 others = []
             for w in others:
                 if w is self or not isinstance(w, BoxWidget) or not w.isVisible():
+                    continue
+                # 多选一起搬的时候，组里那些盒子跟我同步移动，它们的拖动区也是
+                # 自己人：不能拿它们当合并目标（不然并到自己这一组身上）
+                if any(w is g for g in self._drag_group):
                     continue
                 try:
                     if mine.intersects(w._grip_global()):
@@ -2506,6 +2528,9 @@ class BoxWidget(GlassWindow):
 
     def mousePressEvent(self, event) -> None:
         pos = self._to_content(event.position().toPoint())
+        # 新的一次按下：上一次双击还没落地的启动作废（Qt 双击的「第二下」走的是
+        # mouseDoubleClickEvent，不会进这里，所以正常双击不受影响）
+        self.cancel_pending_launch()
         _log("press raw pos=%s button=%s anim=%s", pos, event.button(),
              self._anim_timer.isActive())
         if event.button() == Qt.RightButton:
@@ -2772,6 +2797,21 @@ class BoxWidget(GlassWindow):
                 except (RuntimeError, TypeError):
                     pass
                 if still:
+                    # 多选整组拖过来：并进去的是**一整组**，不只是被拖的这个
+                    group = [w for w in self._drag_group
+                             if isinstance(w, BoxWidget)]
+                    whole = bool(group) and len(group) == len(self._drag_group)
+                    if whole:
+                        cb = getattr(self, "on_merge_group", None)
+                        if cb is not None:
+                            _DRAGGING = False
+                            _log("merge group (%d boxes) into %s",
+                                 len(group) + 1, target.box.id)
+                            self._drag_group = []
+                            self._group_origin = None
+                            self._group_starts = []
+                            cb([self] + group, target)
+                            return
                     cb = getattr(self, "on_merge", None)
                     if cb is not None:
                         _DRAGGING = False
@@ -2943,26 +2983,52 @@ class BoxWidget(GlassWindow):
         if idx is None:
             return
         event.accept()
+        # 「第二下」通常走的是这里、不进 `mousePressEvent`（Qt 双击的第二次按下
+        # 就是 MouseButtonDblClick）。所以这里也要通知 Controller：按到的是我，
+        # 别的盒子里还没落地的双击启动作废。忘了这一句就会出现「在 A 里双击、
+        # 250ms 内又点到 B 里，两个盒子都到点启动，两个文件一起打开」。
+        cb = getattr(self, "on_widget_press", None)
+        if cb is not None:
+            try:
+                cb(self)
+            except (RuntimeError, TypeError):
+                pass
+        # 正在展开/收起动画里：这会儿窗口几何和展开布局对不上，`_item_at` 算出来的
+        # 下标可能是隔壁那个图标（实测确实会开错），干脆这次不启动。
+        if self._anim_timer.isActive():
+            _log("double click during animation -> ignore")
+            return
         # 不立刻启动：先等 180ms。用户拖图标时第二下按下会被 Qt 判成双击，
         # 立刻启动就会在拖拽途中把软件打开；延迟之后只要中途动了就取消。
-        self._pending_launch = idx
+        # ⚠️ 存**路径**不存下标：这 180ms 里列表完全可能变（拖进新文件、合并、
+        # 改名、文件监听刷新），按下标去启动就会打开另一个文件。
+        self._pending_launch = self._items[idx]
         if self._launch_timer is None:
             self._launch_timer = QTimer(self)
             self._launch_timer.setSingleShot(True)
             self._launch_timer.timeout.connect(self._maybe_launch)
         self._launch_timer.start(180)
 
-    def _maybe_launch(self) -> None:
-        idx = self._pending_launch
+    def cancel_pending_launch(self) -> None:
+        """作废还没落地的「双击启动」（别的盒子被按下 / 盒子要收起时用）。"""
         self._pending_launch = None
-        if idx is None or not (0 <= idx < len(self._items)):
+        if self._launch_timer is not None and self._launch_timer.isActive():
+            self._launch_timer.stop()
+
+    def _maybe_launch(self) -> None:
+        path = self._pending_launch
+        self._pending_launch = None
+        if path is None:
+            return
+        if path not in self._items:
+            _log("pending launch: %s 已经不在盒子里了", path)
             return
         # 中途动过（拖动/拖出/换位）或者鼠标还按着 → 这是拖拽，不是双击
         if self._moved or self._internal_drag is not None or self._item_drag:
             return
         if self._press_global is not None:
             return
-        self._launch(idx)
+        self._launch(path)
 
     def _start_item_drag(self, indexes) -> None:
         """把选中的一个或多个图标拖出去。indexes 可以是 int 或 int 列表。"""

@@ -31,6 +31,7 @@ import ctypes
 import hashlib
 import json
 import queue
+import re
 import threading
 import time
 import urllib.parse
@@ -73,6 +74,24 @@ VK_MEDIA_PREV = 0xB1
 VK_MEDIA_PLAY_PAUSE = 0xB3
 KEYEVENTF_KEYUP = 0x0002
 
+# WM_APPCOMMAND：把「上一首/播放/下一首」直接递给某个播放器的窗口。
+# 比合成键盘媒体键准——只打这一个播放器，别的程序抢不到；播放器自己挂了
+# 键盘钩子、把合成的按键过滤掉的时候，也还认这条。
+WM_APPCOMMAND = 0x0319
+APPCOMMAND_MEDIA_NEXTTRACK = 11
+APPCOMMAND_MEDIA_PREVIOUSTRACK = 12
+APPCOMMAND_MEDIA_PLAY_PAUSE = 14
+APPCOMMAND_MEDIA_PLAY = 46
+APPCOMMAND_MEDIA_PAUSE = 47
+
+# 这些窗口不是「播放器主窗口」，标题也长得像歌名，得排掉
+JUNK_WINDOW_CLASSES = {
+    "IME", "MSCTFIME UI", "GDI+ Hook Window Class", "Base_PowerMessageWindow",
+    "Chrome_SystemMessageWindow", "DesktopLyrics",
+}
+JUNK_TITLE_MARKS = ("smtc", "default ime", "msctfime", "gdi+ window")
+_GUID_RE = re.compile(r"\{[0-9a-f]{8}-[0-9a-f]{4}", re.I)
+
 _user32 = ctypes.windll.user32
 _user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
 try:
@@ -114,28 +133,78 @@ def _send_media_key(vk: int) -> None:
         dlog(f"music: 发媒体键失败 {exc!r}")
 
 
-def _window_titles(pids: set[int]) -> list[str]:
-    """指定进程的所有顶层窗口标题。"""
-    out: list[str] = []
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+_PROC_NAMES: dict[int, str] = {}
+
+
+def _proc_name(pid: int) -> str:
+    """pid → 进程名（小写）。拿不到就空，别让一次权限失败打断枚举。"""
+    got = _PROC_NAMES.get(pid)
+    if got is not None:
+        return got
+    name = ""
+    handle = _kernel32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+    if handle:
+        try:
+            buf = ctypes.create_unicode_buffer(520)
+            size = wintypes.DWORD(len(buf))
+            if _kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                name = buf.value.rsplit("\\", 1)[-1].lower()
+        finally:
+            _kernel32.CloseHandle(handle)
+    if name:
+        _PROC_NAMES[pid] = name
+    return name
+
+
+def _window_rows(pid: int = 0) -> list[tuple[int, int, str, str, str, bool]]:
+    """顶层窗口清单：(hwnd, pid, 进程名, 标题, 窗口类名, 是否可见)。给 pid 就只列那个进程。"""
+    rows: list[tuple[int, int, str, str, str, bool]] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def _cb(hwnd, _lparam):  # noqa: ANN001
-        pid = wintypes.DWORD()
-        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value in pids:
-            n = _user32.GetWindowTextLengthW(hwnd)
-            if n:
-                buf = ctypes.create_unicode_buffer(n + 2)
-                _user32.GetWindowTextW(hwnd, buf, n + 2)
-                if buf.value:
-                    out.append(buf.value)
+        owner = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if pid and owner.value != pid:
+            return True
+        proc = _proc_name(owner.value)
+        if not proc:
+            return True
+        n = _user32.GetWindowTextLengthW(hwnd)
+        title = ""
+        if n:
+            buf = ctypes.create_unicode_buffer(n + 2)
+            _user32.GetWindowTextW(hwnd, buf, n + 2)
+            title = buf.value
+        cls = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(hwnd, cls, 256)
+        rows.append((hwnd, int(owner.value), proc, title, cls.value,
+                     bool(_user32.IsWindowVisible(hwnd))))
         return True
 
     try:
         _user32.EnumWindows(_cb, 0)
     except OSError:
-        return out
-    return out
+        return rows
+    return rows
+
+
+def _looks_junk(title: str, cls: str) -> bool:
+    """标题像「MediaPlayer SMTC window - {GUID}」这种系统窗口，不是歌。"""
+    low = title.lower()
+    if any(mark in low for mark in JUNK_TITLE_MARKS):
+        return True
+    if cls in JUNK_WINDOW_CLASSES:
+        return True
+    if title.strip() == cls.strip():       # 标题跟窗口类名一样：系统的，不是歌
+        return True
+    return bool(_GUID_RE.search(title))
 
 
 def _split_title(raw: str) -> tuple[str, str]:
@@ -147,6 +216,55 @@ def _split_title(raw: str) -> tuple[str, str]:
             if head and tail:
                 return head, tail
     return raw.strip(), ""
+
+
+def _player_windows() -> list[tuple[int, str, str]]:
+    """已知播放器里「标题像 歌名 - 歌手」的窗口：(pid, 进程名, 标题)。
+
+    可见的排前面。这里**不加「必须正在出声」的条件**：播放器暂停之后音频会话
+    会变成 inactive、有些（网易云就这么干）连系统媒体会话都撤掉，可窗口标题上
+    还挂着这首没放完的歌——只按声音找，就会得到「没有播放器」。
+    """
+    out: list[tuple[int, str, str, bool]] = []
+    seen: set[tuple[int, str]] = set()
+    for _hwnd, owner, proc, title, cls, visible in _window_rows():
+        if proc not in PLAYER_PROCS or not title:
+            continue
+        head, artist = _split_title(title)
+        if not head or not artist:
+            continue
+        if _looks_junk(title, cls):
+            continue
+        mark = (owner, title.strip())
+        if mark in seen:          # 主窗口 + 隐藏的「icon」窗口标题一样，只算一个
+            continue
+        seen.add(mark)
+        out.append((owner, proc, title, visible))
+    out.sort(key=lambda row: not row[3])
+    return [(owner, proc, title) for owner, proc, title, _v in out]
+
+
+def _send_appcommand(pid: int, code: int) -> bool:
+    """把一条 WM_APPCOMMAND 递给这个播放器的窗口。只发一个窗口：两个窗口一起收
+    会当成按了两下。优先发「标题像歌名」的那个（主窗口），没有就发第一个可见的。"""
+    rows = [row for row in _window_rows(pid) if row[5]]
+    if not rows:
+        return False
+    target = 0
+    for hwnd, _owner, _proc, title, cls, _visible in rows:
+        head, artist = _split_title(title or "")
+        if head and artist and not _looks_junk(title, cls):
+            target = hwnd
+            break
+    if not target:
+        target = rows[0][0]
+    try:
+        _user32.PostMessageW(target, WM_APPCOMMAND, target,
+                             wintypes.LPARAM((code << 16) & 0x7FFFFFFF))
+    except OSError as exc:
+        dlog(f"music: 发 APPCOMMAND 失败 {exc!r}")
+        return False
+    return True
 
 
 def _player_session() -> tuple[int, str, bool] | None:
@@ -215,6 +333,13 @@ class MusicChannel(QObject):
     @property
     def cover_bytes(self) -> bytes | None:
         return self._svc.covers.get(self.key) if self.key else None
+
+    @property
+    def fallback_app(self) -> str:
+        """兜底路（这个播放器没注册系统会话）现在跟的是哪个播放器；不在兜底路就空。"""
+        if self._snap.get("src") != "title":
+            return ""
+        return str(self._snap.get("app") or "")
 
     def position_now(self) -> float:
         """估算此刻的播放进度：上次轮询的位置 + 已经过去的时间。"""
@@ -324,8 +449,11 @@ class MusicService(QObject):
         self._web_key: tuple[str, str] | None = None
         self._web_tries = 0
         self._web_done = True
+        self._web_searching = False
         self._web_cache: dict[tuple[str, str], bytes | None] = {}
         self._empty_streak = 0
+        self._hold_pid = 0                # 兜底路上一轮跟的播放器（没人在放时别来回跳）
+        self._fallback_sig: tuple | None = None
         self._cmds: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         try:
@@ -469,6 +597,9 @@ class MusicService(QObject):
                         await self._run_smtc_command(cur, cmd, arg)
                     elif self._has_fallback(ch):
                         self._run_fallback_command(ch, cmd, arg)
+                    else:
+                        dlog(f"music: 命令 {cmd} 没送出去（卡片 {card_id} "
+                             f"key={key!r} 也没有兜底）")
             except Exception as exc:  # noqa: BLE001
                 dlog(f"music: 命令 {cmd} 失败 {exc!r}")
             # 连着发好几条时给播放器喘口气，太快它会丢
@@ -491,7 +622,9 @@ class MusicService(QObject):
                     await cur.try_pause_async()
             elif self._has_fallback(ch):
                 if bool(ch.snap.get("playing")) != want:
-                    _send_media_key(VK_MEDIA_PLAY_PAUSE)
+                    self._fallback_send(ch, APPCOMMAND_MEDIA_PLAY if want
+                                        else APPCOMMAND_MEDIA_PAUSE,
+                                        VK_MEDIA_PLAY_PAUSE)
         for ch in chans:
             ch._flip_to(want)
 
@@ -502,7 +635,13 @@ class MusicService(QObject):
     @staticmethod
     async def _run_smtc_command(cur, cmd: str, arg) -> None:
         if cmd == "toggle":
-            await cur.try_toggle_play_pause_async()
+            # 别用 try_toggle_play_pause_async：有的播放器暂停后不理 toggle，
+            # 按现在的真实状态明说要放还是要停，才按得动。
+            info = cur.get_playback_info()
+            if _int_or(getattr(info, "playback_status", None), 0) == 4:
+                await cur.try_pause_async()
+            else:
+                await cur.try_play_async()
         elif cmd == "play":
             await cur.try_play_async()
         elif cmd == "pause":
@@ -514,18 +653,28 @@ class MusicService(QObject):
         elif cmd == "mode":
             await MusicService._apply_mode(cur, int(arg))
 
+    def _fallback_send(self, ch: MusicChannel, code: int, vk: int) -> None:
+        """没有系统会话时的控制：先按窗口把 APPCOMMAND 递给这个播放器，
+        递不到（窗口关了、在托盘里）再退一步发系统媒体键。"""
+        pid = int(ch.snap.get("_pid") or 0)
+        if pid and _send_appcommand(pid, code):
+            return
+        _send_media_key(vk)
+
     def _run_fallback_command(self, ch: MusicChannel, cmd: str, arg) -> None:
-        """没有系统会话时：用媒体键。"""
+        """没有系统会话时：APPCOMMAND / 媒体键。"""
         if cmd == "next":
-            _send_media_key(VK_MEDIA_NEXT)
+            self._fallback_send(ch, APPCOMMAND_MEDIA_NEXTTRACK, VK_MEDIA_NEXT)
         elif cmd == "prev":
-            _send_media_key(VK_MEDIA_PREV)
+            self._fallback_send(ch, APPCOMMAND_MEDIA_PREVIOUSTRACK, VK_MEDIA_PREV)
         elif cmd == "toggle":
-            _send_media_key(VK_MEDIA_PLAY_PAUSE)
+            self._fallback_send(ch, APPCOMMAND_MEDIA_PLAY_PAUSE, VK_MEDIA_PLAY_PAUSE)
         elif cmd in ("play", "pause"):
             want = cmd == "play"
-            if bool(ch.snap.get("playing")) != want:
-                _send_media_key(VK_MEDIA_PLAY_PAUSE)
+            if bool(ch.snap.get("playing")) == want:
+                return
+            self._fallback_send(ch, APPCOMMAND_MEDIA_PLAY if want
+                                else APPCOMMAND_MEDIA_PAUSE, VK_MEDIA_PLAY_PAUSE)
         elif cmd == "mode":
             dlog("music: 这个播放器没有系统会话，改不了循环/随机")
 
@@ -579,7 +728,7 @@ class MusicService(QObject):
             key = claim.get(ch.card_id, "")
             if not items and ch.prefer != NO_FOLLOW and self._has_fallback(ch):
                 # 一个系统会话都没有：第一张卡片退回「读窗口标题」，其余空着
-                fb = await self._read_fallback()
+                fb = self._read_fallback()
                 if fb is not None:
                     key = "title"
                     self._snaps["title"] = fb
@@ -678,45 +827,61 @@ class MusicService(QObject):
             self.fallback_playing = None      # 系统会话回来了：兜底的那份状态作废
         return snap, props
 
-    async def _read_fallback(self) -> dict[str, Any] | None:
+    def _read_fallback(self) -> dict[str, Any] | None:
         """没有系统会话时的兜底：窗口标题 + 网上搜封面。"""
         snap = self._read_window_title()
         if snap is None:
             return None
-        await self._maybe_web_cover(snap)
+        self._maybe_web_cover(snap)          # 网上找封面另开线程，不挡读状态/发命令
         self._note_capabilities("title", snap)
-        if self.fallback_playing is None:
-            self.fallback_playing = True
         return snap
 
     def _read_window_title(self) -> dict[str, Any] | None:
         """兜底：从播放器的窗口标题读「歌名 - 歌手」。
 
-        播放/暂停状态问不出来（网易云暂停了音频会话还是 active），所以自己记：
-        只记卡片上点过的（不监听键盘，见文件头说明）。兜底路拿不到进度和循环模式。
+        播放/暂停状态问不出来，所以自己记：只记卡片上点过的（不监听键盘，见文件头
+        说明）。兜底路拿不到进度和循环模式。
+
+        找窗口的条件只要求「是已知播放器 + 标题长得像 歌名 - 歌手」：不要求它此刻
+        正在出声。暂停之后网易云会把系统媒体会话撤掉、音频会话变 inactive，只按声音
+        找就会得到「没有播放器」；窗口标题上那首歌还在。
         """
-        info = _player_session()
-        if info is None:
+        info = _player_session()             # 只用来判断谁在放、顺便排个优先级
+        wins = _player_windows()
+        if not wins:
+            if self._fallback_sig != ():
+                self._fallback_sig = ()
+                dlog("music: 没有系统会话，也没有一个播放器窗口可读")
             return None
-        pid, proc, _active = info
-        titles = _window_titles({pid})
-        if not titles:
-            return None
-        raw = ""
-        for t in titles:
-            title, artist = _split_title(t)
-            if artist:
-                raw = t
+        pick = None
+        playing_pid = info[0] if info is not None and info[2] else 0
+        order = [playing_pid, int(getattr(self, "_hold_pid", 0) or 0),
+                 info[0] if info is not None else 0]
+        for want_pid in order:
+            if not want_pid:
+                continue
+            for row in wins:
+                if row[0] == want_pid:
+                    pick = row
+                    break
+            if pick is not None:
                 break
-        if not raw:
-            # 标题里没有「 - 」：可能在放但读不到歌名（那就当没消息，别乱显示）
-            return None
+        if pick is None:
+            pick = wins[0]
+        pid, proc, raw = pick
         title, artist = _split_title(raw)
+        if self._fallback_sig != (proc, raw):
+            self._fallback_sig = (proc, raw)
+            dlog(f"music: 兜底读窗口 {proc} {raw[:40]!r} "
+                 f"（候选 {len(wins)} 个）")
         # 换歌了：一般就是在放（除非它本来就停着，那也很快会被播放器自己的状态纠正）
         prev = self._channels[0].snap if self._channels else {}
         if (title, artist) != (prev.get("title"), prev.get("artist")):
             self.fallback_playing = True
-        playing = True if self.fallback_playing is None else bool(self.fallback_playing)
+        if self.fallback_playing is None:
+            self.fallback_playing = bool(info[2]) if info is not None else True
+        playing = bool(self.fallback_playing)
+        self._hold_pid = pid
         return {
             "has": True,
             "playing": playing,
@@ -822,18 +987,22 @@ class MusicService(QObject):
             dlog(f"music: 封面读失败 {exc!r}")
             return None
 
-    WEB_TRIES = 3
+    WEB_TRIES = 2
+    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
-    async def _maybe_web_cover(self, snap: dict) -> None:
-        """兜底路没有系统封面：拿「歌名 歌手」去网易云公开接口搜一张。
+    def _maybe_web_cover(self, snap: dict) -> None:
+        """兜底路没有系统封面：拿「歌名 歌手」去网上搜一张。
 
-        结果写进 covers["title"]：兜底路只有第一张卡片在用。
+        搜索在单独的线程里跑：以前是 `await asyncio.to_thread(...)`，网一慢就把
+        整个轮询线程按住几秒——那几秒里卡片上的按钮全哑。结果写进 covers["title"]，
+        兜底路只有第一张卡片在用。
         """
         key = (snap["title"], snap["artist"])
         if key != self._web_key:
             self._web_key = key
             self._web_tries = 0
             self._web_done = False
+            self.covers["title"] = None        # 换歌了：先撤掉上一首的图
         if self._web_done:
             return
         if key in self._web_cache:
@@ -841,57 +1010,98 @@ class MusicService(QObject):
             self.covers["title"] = self._web_cache[key]
             return
         if self._web_tries >= self.WEB_TRIES:
-            # 搜不到就是搜不到：先显示音符占位，换歌再说
             self._web_done = True
-            self.covers["title"] = None
+            return
+        if self._web_searching:
             return
         self._web_tries += 1
+        self._web_searching = True
+        threading.Thread(target=self._web_worker, args=(key,), name="music-cover",
+                         daemon=True).start()
+
+    def _web_worker(self, key: tuple[str, str]) -> None:
         try:
-            data = await asyncio.to_thread(self._http_cover, key[0], key[1])
+            data = self._http_cover(key[0], key[1])
         except Exception as exc:  # noqa: BLE001
             dlog(f"music: 网络封面失败 {exc!r}")
             data = None
+        finally:
+            self._web_searching = False
         if key != self._web_key:
             return
         if data is None:
-            return                    # 这一轮没搜到：下一轮再试
-        self._web_done = True
+            return                    # 下一轮再试（最多 WEB_TRIES 次）
         self._web_cache[key] = data
         if len(self._web_cache) > 40:
             self._web_cache.pop(next(iter(self._web_cache)))
         self.covers["title"] = data
+        self._web_done = True
 
-    @staticmethod
-    def _http_cover(title: str, artist: str) -> bytes | None:
-        """网易云搜索 → 歌曲详情 → 封面图。失败就返回 None（卡片显示音符占位）。"""
+    @classmethod
+    def _http_json(cls, url: str, headers: dict | None = None) -> Any:
+        req = urllib.request.Request(url, headers=headers or {"User-Agent": cls.UA})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read()
+        try:
+            return json.loads(raw.decode("utf-8", "ignore"))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _netease_pic(cls, query: str) -> str:
+        """网易云搜索（返回里直接带专辑封面图）。
+
+        别用 /api/search/get/web：那条现在返回的是一串加密过的 result，取不出来；
+        /api/search/get 还是明文，album.picUrl 直接用。
+        """
+        headers = {"Referer": "https://music.163.com/", "User-Agent": cls.UA}
+        try:
+            data = cls._http_json(
+                "https://music.163.com/api/search/get?type=1&limit=3&s="
+                + urllib.parse.quote(query), headers)
+        except Exception as exc:  # noqa: BLE001
+            dlog(f"music: 网易云搜索失败 {exc!r}")
+            return ""
+        result = data.get("result") if isinstance(data, dict) else None
+        songs = result.get("songs") if isinstance(result, dict) else None
+        for song in songs or []:
+            if not isinstance(song, dict):
+                continue
+            pic = str(((song.get("album") or {}).get("picUrl")) or "").strip()
+            if pic:
+                return pic
+        return ""
+
+    @classmethod
+    def _itunes_pic(cls, title: str, artist: str) -> str:
+        """网易云搜不到（日文歌、小众）就走 iTunes：它有封面、不用登录。"""
+        term = urllib.parse.quote(f"{artist} {title}".strip())
+        for country in ("", "CN"):
+            url = ("https://itunes.apple.com/search?entity=song&limit=5&term=" + term
+                   + (f"&country={country}" if country else ""))
+            try:
+                data = cls._http_json(url)
+            except Exception:  # noqa: BLE001
+                continue
+            for row in (data or {}).get("results") or []:
+                art = str((row or {}).get("artworkUrl100") or "")
+                if art:
+                    return art.replace("100x100", "500x500")
+        return ""
+
+    @classmethod
+    def _http_cover(cls, title: str, artist: str) -> bytes | None:
+        """网易云 → iTunes → 封面图字节。失败就返回 None（卡片显示音符占位）。"""
         if not title:
             return None
-        headers = {"Referer": "https://music.163.com/",
-                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-        def get_json(url: str) -> dict:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                return json.loads(resp.read().decode("utf-8", "ignore"))
-
         q = f"{title} {artist}".strip()
-        url = ("https://music.163.com/api/search/get/web?csrf_token=&s="
-               + urllib.parse.quote(q) + "&type=1&offset=0&total=true&limit=3")
-        data = get_json(url)
-        songs = (data.get("result") or {}).get("songs") or []
-        if not songs:
-            return None
-        sid = songs[0].get("id")
-        if sid is None:
-            return None
-        detail = get_json(f"https://music.163.com/api/song/detail/?id={sid}&ids=[{sid}]")
-        songs2 = detail.get("songs") or []
-        if not songs2:
-            return None
-        pic = (songs2[0].get("album") or {}).get("picUrl")
+        pic = cls._netease_pic(q) or cls._itunes_pic(title, artist)
         if not pic:
             return None
-        pic = pic.split("?")[0] + "?param=500y500"
-        req = urllib.request.Request(pic, headers={"User-Agent": "Mozilla/5.0"})
+        headers = {"User-Agent": cls.UA}
+        if "126.net" in pic:
+            headers["Referer"] = "https://music.163.com/"
+        req = urllib.request.Request(pic, headers=headers)
         with urllib.request.urlopen(req, timeout=8) as resp:
-            return resp.read()
+            data = resp.read()
+        return data or None

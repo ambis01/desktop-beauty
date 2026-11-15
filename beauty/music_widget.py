@@ -395,8 +395,15 @@ class MusicWidget(CardWindow):
             act.setChecked(bool(pref) and pref == p.get("key"))
             acts[act] = p.get("key") or ""
         if not players:
-            none_act = menu.addAction("　（现在没有播放器）")
-            none_act.setEnabled(False)
+            # 没有系统会话、卡片却在跟某个播放器（读窗口标题那条路）：把它的名字
+            # 亮出来。写「现在没有播放器」是撒谎——卡片上正放着歌呢。
+            fb = getattr(svc, "fallback_app", "")
+            if fb:
+                act = menu.addAction("　" + fb)
+                act.setEnabled(False)
+            else:
+                none_act = menu.addAction("　（现在没有播放器）")
+                none_act.setEnabled(False)
 
         def handle(chosen):
             if chosen is None:

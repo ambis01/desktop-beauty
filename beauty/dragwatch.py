@@ -43,6 +43,10 @@ WM_LBUTTONUP = 0x0202
 WM_MBUTTONDOWN = 0x0207
 VK_LBUTTON = 0x01
 VK_ESCAPE = 0x1B
+# 我们自己注入的鼠标事件（`_end_stuck_drag` 补的那一下抬起）不许再进本钩子的
+# 逻辑，否则「吞 up」和「补 up」能互相打架。
+LLMHF_INJECTED = 0x01
+MOUSEEVENTF_LEFTUP = 0x0004
 # 悬停到 0.18s 就发 Esc 把 explorer 的拖拽抢过来：explorer 的拖拽一死，
 # 松手就不可能再变成「用 xx 打开」——这是把那个功能彻底取消掉的关键。
 DWELL_HINT = 0.15
@@ -61,6 +65,7 @@ user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 user32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t]
+user32.mouse_event.argtypes = [wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t]
 user32.WindowFromPoint.restype = wt.HWND
 user32.WindowFromPoint.argtypes = [wt.POINT]
 user32.GetClassNameW.argtypes = [wt.HWND, ctypes.c_wchar_p, ctypes.c_int]
@@ -71,9 +76,13 @@ KEYEVENTF_KEYUP = 0x0002
 # 光标压在桌面本体上才算「停在图标上」：压在我们自己的收纳盒上时要放行，
 # 否则「把图标拖进收纳盒」会被这里抢断。
 DESKTOP_CLASSES = {"SysListView32", "SHELLDLL_DefView", "Progman", "WorkerW"}
+# explorer 的**文件夹窗口**不是桌面：文件落在那儿是「移动到那个文件夹」，
+# 不能被当成「落在桌面图标上」而把松手吞掉。
+EXPLORER_FOLDER_CLASSES = {"CabinetWClass", "ExploreWClass", "ApplicationFrameWindow"}
 
 
 def _over_desktop(x: int, y: int) -> bool:
+    """严格版：光标下面就是桌面本体（按下时用这个）。"""
     try:
         hwnd = user32.WindowFromPoint(wt.POINT(x, y))
         if not hwnd:
@@ -81,6 +90,35 @@ def _over_desktop(x: int, y: int) -> bool:
         buf = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(hwnd, buf, 64)
         return buf.value in DESKTOP_CLASSES
+    except Exception:  # noqa: BLE001 - 判断不出来就按桌面算，别把功能卡死
+        return True
+
+
+def _over_shell(x: int, y: int, shell_pid: int = 0) -> bool:
+    """宽松版：桌面本体，**或者 explorer 自己的窗口**（松手时用这个）。
+
+    别的机器上报过「拖到图标上松手太快，文件还是被打开了」：explorer 拖拽时
+    光标底下常常不是 SysListView32，而是它自己的**拖拽影子窗口**（类名随系统
+    版本变）。以前这里一律当成「不在桌面上」，于是松手那一下没被吞掉，
+    explorer 收到 drop 就执行了「用目标程序打开」。现在只要窗口属于 explorer
+    进程（且不是资源管理器文件夹窗口）就按桌面算。
+    """
+    try:
+        hwnd = user32.WindowFromPoint(wt.POINT(x, y))
+        if not hwnd:
+            return True
+        buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, buf, 64)
+        cls = buf.value
+        if cls in DESKTOP_CLASSES:
+            return True
+        if cls in EXPLORER_FOLDER_CLASSES:
+            return False
+        if not shell_pid:
+            return False
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value) == shell_pid
     except Exception:  # noqa: BLE001 - 判断不出来就按桌面算，别把功能卡死
         return True
 
@@ -153,9 +191,20 @@ class DragWatcher(QObject):
         self._idle_names: dict[int, str] = {}
         self._cache_at = 0.0
         self._cache_ok = False
+        # 桌面 ListView 属于哪个进程（explorer）：空闲期抄缓存时一起取，钩子里
+        # 只做比较，不去 FindWindow
+        self._shell_pid = 0
         # 滚轮键：钩子里只记坐标，真正的活儿交给 _tick（钩子里调 Qt 信号
         # 会把整段逻辑塞进系统回调，那边卡一下全系统的鼠标都跟着卡）
         self._wheel_pt: tuple[int, int] | None = None
+        # 吞掉 up 之后 explorer 的拖拽循环有时还活着，会不停把拖拽影子画在光标
+        # 下面（用户报的「图标残影跟着鼠标跑」）。这段窗口期内定时把影子藏掉，
+        # 有新的按下就立刻停手（免得把用户自己那次拖拽的影子也藏了）。
+        self._ghost_until = 0.0
+        self._ghost_stop = False
+        self._ghost_timer = QTimer(self)
+        self._ghost_timer.setInterval(40)
+        self._ghost_timer.timeout.connect(self._sweep_drag_images)
         # 框选收纳盒：起点（按下点，物理像素）+ 上一次发出去的矩形
         self._band: tuple[int, int] | None = None
         self._band_rect: QRect | None = None
@@ -175,10 +224,15 @@ class DragWatcher(QObject):
         if code >= 0:
             try:
                 data = _MSLLHOOKSTRUCT.from_address(lparam)
+                if data.flags & LLMHF_INJECTED:
+                    # 我们自己补的那一下抬起：交给系统，不进下面的逻辑
+                    return user32.CallNextHookEx(self._hook, code, wparam, lparam)
                 self._x, self._y = data.pt.x, data.pt.y
                 if wparam == WM_MBUTTONDOWN and _over_desktop(self._x, self._y):
                     self._wheel_pt = (self._x, self._y)
                 if wparam == WM_LBUTTONDOWN:
+                    # 新的按下：之前那次残留影子的清扫到此为止
+                    self._ghost_stop = True
                     self._down = (self._x, self._y, time.monotonic())
                     self._down_desktop = _over_desktop(self._x, self._y)
                     self._band = None
@@ -205,16 +259,18 @@ class DragWatcher(QObject):
                 elif wparam == WM_LBUTTONUP:
                     self._up_pt = (self._x, self._y)
                     self._up_pending = True
-                    if (self._dragging and self._source is not None
-                            and self._target_at(self._x, self._y) is not None):
+                    if self._swallow_this_up():
                         # 拖到另一个图标上松手（不管松得多快）：这一下**不能让
                         # explorer 收到** —— 它会把「快捷方式丢在快捷方式上」执行
                         # 成「用目标程序打开」（用户反复报的 bug）。吞掉 up，
                         # _tick 里补一次「抢拖拽 + 提交」。
                         _log("swallow up at %s,%s", self._x, self._y)
+                        # 不管 Esc 是之前悬停时就发了还是这次才补：up 都被我们
+                        # 吃掉了，桌面 ListView 永远等不到它 —— 收尾必须由我们做
+                        # （`_finish` 里 `_ate_up` 那条路），否则留残影。
+                        self._ate_up = True
                         if not self._esc_sent:
                             self._swallow_up = True
-                            self._ate_up = True
                         return 1
             except Exception:  # noqa: BLE001 - 钩子里不能抛
                 pass
@@ -273,7 +329,8 @@ class DragWatcher(QObject):
             path = self._path_for(name) if name else None
             if not name:
                 # 缓存是冷的（程序刚起来 / 桌面刚变过）→ 再直接问一次
-                idx, name, path = di.item_at_screen(sx, sy)
+                # （文件夹也算：桌面上的文件夹拖到别的图标上同样要能建盒）
+                idx, name, path = di.item_at_screen(sx, sy, dirs=True)
                 path = str(path) if path else None
             _log("source hit idx=%s name=%r path=%s", idx, name, path)
             if not path and name:
@@ -304,7 +361,8 @@ class DragWatcher(QObject):
 
         idx = self._hit(self._x, self._y)
         info = self._info(idx) if idx >= 0 else None
-        if info is None or not info[1] or not _over_desktop(self._x, self._y):
+        if info is None or not info[1] or not _over_shell(self._x, self._y,
+                                                          self._shell_pid):
             # 光标离开了目标图标：先保留 0.4s，避免松手瞬间手抖导致不触发
             if self._target is not None:
                 self._target = None
@@ -361,13 +419,46 @@ class DragWatcher(QObject):
                 return idx
         return -1
 
+    def _press_cell(self) -> int:
+        """按下点压在哪个图标格子上（纯几何，-1 = 不是图标＝可能是拉框选）。"""
+        if not self._down:
+            return -1
+        return self._hit_in(self._down[0], self._down[1], self._idle_rects)
+
+    def _swallow_this_up(self) -> bool:
+        """松手这一下要不要吞掉（= 一次「拖到另一个图标上」的合并手势）。
+
+        ⚠️ 钩子里**绝不能碰文件系统**。以前这里调 `_target_at()` → `_path_for()`
+        → 读一遍桌面目录来确认「目标能不能收纳」；别的机器上桌面挂在 OneDrive、
+        文件很多的时候，这一个钩子回调可能卡上百毫秒，Windows 判钩子超时后
+        **直接跳过它**，于是松手照旧落到 explorer 手里 → 「用目标程序打开」
+        （用户报的「别人电脑上松手太快还是会打开文件」）。现在只看空闲期抄好的
+        矩形表 + 窗口类名/进程，路径解析留给轮询里的 `_finish`。
+        """
+        if not self._dragging or self._band is not None:
+            return False      # 在桌面上拉框选收纳盒：那一下 up 必须照常送到
+        src = self._source[0] if self._source else self._press_cell()
+        if src < 0:
+            return False      # 按下的不是图标（空白处 / 别的窗口）
+        hit = self._hit_in(self._x, self._y, self._idle_rects)
+        if hit < 0 or hit == src:
+            return False      # 松在空白处 / 还压着自己
+        # 回收站那一下 up **必须**交给 explorer：拖到回收站 = 删除文件。
+        # 这是唯一一个「落在图标上但不是合并」的情况，用显示名+CLSID 表判断，
+        # 不碰文件系统。
+        clsid = ns_items.clsid_for(self._idle_names.get(hit, ""))
+        if clsid and ns_items.is_excluded(clsid):
+            return False
+        return _over_shell(self._x, self._y, self._shell_pid)
+
     def _target_at(self, x: int, y: int):
         """松手点是不是压在另一个桌面图标上 → 返回 (idx, 名字, 路径)。
 
-        只用空闲期抄好的缓存，钩子里不能做重调用。
+        只用空闲期抄好的缓存，钩子里不能做重调用。**只在轮询里调**（`_finish`），
+        别放进钩子回调：`_path_for` 要读桌面目录，慢机器上会让钩子超时。
         """
         try:
-            if not _over_desktop(x, y):
+            if not _over_shell(x, y, self._shell_pid):
                 try:
                     hwnd = user32.WindowFromPoint(wt.POINT(x, y))
                     buf = ctypes.create_unicode_buffer(64)
@@ -405,6 +496,10 @@ class DragWatcher(QObject):
         self._idle_rects = rects
         self._idle_names = {it.index: it.name for it in icons}
         self._cache_ok = True
+        try:
+            self._shell_pid = di.shell_pid()
+        except Exception:  # noqa: BLE001 - 拿不到就当不知道（松手判断会退回严格版）
+            self._shell_pid = 0
 
     def _path_for(self, name: str) -> str | None:
         """显示名 → 可收纳的路径：普通文件（含快捷方式）的真实路径，或系统图标的 `ns::{CLSID}`。"""
@@ -522,12 +617,6 @@ class DragWatcher(QObject):
             # 否则它一直以为鼠标还按着，后面每次拖拽都会错乱。
             self._swallow_up = False
             self._cancel_once()
-            if self._ate_up:
-                # 只发 Esc 不够：explorer 等不到那一下 up，桌面 ListView 会留在
-                # 「按着」状态，偶发留下跟着鼠标跑的残影。稍等它处理完 Esc，
-                # 再补 WM_CANCELMODE + 一个 WM_LBUTTONUP（见 desktop_icons）。
-                self._ate_up = False
-                QTimer.singleShot(60, di.cancel_shell_drag)
             self._take_over()
             if self._target is None:
                 # 松得太快，轮询还没来得及把「目标」记下来：按松手点现算一次
@@ -536,6 +625,14 @@ class DragWatcher(QObject):
                     self._target = tgt
                     self._target_rect = self._idle_rects.get(tgt[0])
                     self._up_pt = (self._x, self._y)
+        if self._ate_up:
+            # 那一下 up 被钩子吞掉了（Esc 是这次补的还是之前悬停时就发的都一样）：
+            # explorer 的桌面 ListView 永远等不到它，会停在「按着」的状态里 ——
+            # 用户报的「偶发一个图标残影跟着鼠标跑」。排一次收尾（放在补 Esc 之后）。
+            self._ate_up = False
+            self._clean_shell_drag()
+            self._start_ghost_sweep()
+            QTimer.singleShot(120, self._end_stuck_drag)
         if not self._committed and self._esc_sent and self._target is not None \
                 and self._up_on_target():
             _log("released on target -> merge")
@@ -556,6 +653,75 @@ class DragWatcher(QObject):
         self._hard_reset()
         self.clear.emit()
         self.cancelled.emit()
+
+    def _end_stuck_drag(self) -> None:
+        """补一个**真的**鼠标抬起，终结还活着的 explorer 拖拽循环（残影的根）。
+
+        实测（2026-11-15）：吞掉 up 之后这个循环有时候还活着，而且**不认 Esc**
+        —— 它会一直把拖拽影子窗口画在光标下面，直到收到一个真正的鼠标抬起。
+        补 Esc / 给捕获窗口发 message / 抢掉鼠标捕获都试过，影子照样出现
+        （每种 3 次）；只有这一下真抬起能让它停下来（补完之后再挪 1.5s 鼠标，
+        影子 0 次、无弹框、文件也没被丢回桌面）。
+
+        安全性：此刻源文件已经搬进盒子，就算这一下让循环执行了一次落空的 drop，
+        也没有东西可打开；另外只有「上一次 up 是被我们吞掉的」才会补，而且
+        用户已经按下新的一次时不会补。
+        """
+        if self._down is not None:
+            return          # 用户已经按下了新的一次，别去搅和
+        if user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
+            return          # 鼠标还按着（例如又开始拖了）
+        try:
+            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            _log("injected mouse-up to end the stuck shell drag")
+        except OSError:
+            pass
+
+    def _start_ghost_sweep(self) -> None:
+        """兜底：`_end_stuck_drag` 那一下补抬起之前/万一没补成，先把影子藏住。
+
+        实测：吞掉 up 之后拖拽循环有时还活着，它每挪一下鼠标就新建/重画一个
+        `SysDragImage` 窗口，正好在光标下面 —— 就是用户看到的「残影跟着鼠标跑」。
+        真正的解法是 `_end_stuck_drag`（补一下真抬起）；这里只是在那 120ms 空档
+        和「补抬起失败」的情况下不让用户看见影子。
+        """
+        self._ghost_stop = False
+        self._ghost_until = time.monotonic() + 1.2
+        if not self._ghost_timer.isActive():
+            self._ghost_timer.start()
+
+    def _sweep_drag_images(self) -> None:
+        if self._ghost_stop or time.monotonic() >= self._ghost_until:
+            self._ghost_timer.stop()
+            return
+        try:
+            hidden = di.hide_drag_images(self._shell_pid)
+        except Exception:  # noqa: BLE001 - 收尾动作失败不影响别的
+            return
+        if hidden:
+            _log("hid %d lingering drag image window(s)", hidden)
+
+    def _clean_shell_drag(self, wait: int = 8) -> None:
+        """吞掉 up 之后，把 explorer 那个「还按着」的桌面状态收干净。
+
+        用户报的「偶发一个图标残影跟着鼠标跑」：拖拽循环被 Esc 掐掉，可它永远
+        等不到那一下 up，桌面 ListView 就停在按下的状态里。之前只在 60ms 后补
+        一次 WM_CANCELMODE + WM_LBUTTONUP（`di.cancel_shell_drag`），explorer 还没
+        退干净的时候那一下会被它自己的拖拽循环吃掉。
+
+        现在：先反复问 `di.drag_still_active()`（explorer 还攥着鼠标捕获 = 拖拽
+        还没退），退干净了再补；最多等 8×45ms，等不到就直接补。补完 280ms 再补
+        一次兜底（慢机器上第一下有可能落在 Esc 之前）。
+        """
+        try:
+            if wait > 0 and di.drag_still_active():
+                QTimer.singleShot(45, lambda: self._clean_shell_drag(wait - 1))
+                return
+            di.cancel_shell_drag()
+        except Exception:  # noqa: BLE001 - 收尾动作失败也不能影响别的
+            return
+        if wait > 0:
+            QTimer.singleShot(280, lambda: self._clean_shell_drag(0))
 
     def _abort(self) -> None:
         self._hard_reset()
