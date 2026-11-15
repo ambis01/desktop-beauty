@@ -892,7 +892,7 @@ def find_desktop_copy(name: str) -> Path | None:
     for root in dirs:
         exact = root / name
         try:
-            if exact.is_file():
+            if exact.is_file() or exact.is_dir():   # 文件夹也要认（盒子里能收文件夹）
                 return exact
         except OSError:
             continue

@@ -438,6 +438,7 @@ def _land_restored(paths: list[Path], drop: QPoint, tries: int = 0) -> None:
 class BoxWidget(GlassWindow):
     changed = Signal()
     removed = Signal(str)     # 盒子把自己删掉了（图标被拖空）
+    warn = Signal(str)        # 有东西被拒收（别的卷上的文件夹 / 系统目录…）
 
     def __init__(self, store, box):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool, radius=20,
@@ -3201,6 +3202,9 @@ class BoxWidget(GlassWindow):
             if added:
                 self.refresh()
                 self.changed.emit()
+            elif paths:
+                # 静默吞掉最难查（「拖进来没反应」），说一句
+                self.warn.emit("这个文件夹搬不进来：别的盘、系统目录、或程序自己的数据目录")
         finally:
             self._busy_drop = False
 

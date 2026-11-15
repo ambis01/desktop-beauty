@@ -39,30 +39,74 @@ def _log(msg: str, *args) -> None:
         pass
 
 
-def _acceptable(src: Path) -> bool:
-    """能收进盒子的东西：任意普通文件，目录一律拒绝，程序自己的数据也不许碰。
+def _protected_dirs() -> set[Path]:
+    """绝对不能整个搬进盒子的目录：桌面本身、用户目录。"""
+    out: set[Path] = set()
+    try:
+        for d in di.desktop_dirs():
+            out.add(d.resolve())
+        out.add(Path.home().resolve())
+    except OSError:
+        pass
+    return out
 
-    以前这里只放行 `.lnk` / `.url`，桌面上的文档、图片、压缩包拖进来会被静默
-    吞掉（用户报的「只适配了图标，桌面上的文件不适配」）。现在文件都收：拖动是
-    `shutil.move`，同一个卷上就是一次 rename，跟文件大小无关；换卷才会真的拷贝。
+
+def _same_volume(a: Path, b: Path) -> bool:
+    """是不是同一个卷。
+
+    同卷 `shutil.move` 就是一次 rename（文件夹多大都是瞬间）；跨卷是整棵树的
+    拷贝，而且是在主线程里搬 —— 拖一个几十 G 的目录进来能把界面卡死，所以不收。
+    """
+    try:
+        return os.stat(str(a)).st_dev == os.stat(str(b)).st_dev
+    except OSError:
+        try:
+            return a.anchor.lower() == b.anchor.lower()
+        except Exception:  # noqa: BLE001
+            return False
+
+
+def _acceptable(src: Path) -> bool:
+    """能收进盒子的东西：任意普通文件，或者**一个文件夹**。
+
+    以前这里只放行 `.lnk` / `.url`（后来又放开到所有文件）。现在文件夹也收，
+    但有几条硬保护 —— 文件夹挪走之后不好收拾，而且跨卷拷贝会卡死界面：
+
+    - 盘符根、桌面本身、用户目录：不收
+    - 别的卷上的文件夹：不收（同卷是 rename，跨卷是整棵树拷贝）
+    - `DATA_DIR` 内部（盒子目录除外）、以及 `DATA_DIR` 的**祖先**：不收
+      （后者等于把装有数据的目录搬进它自己）
     """
     try:
         if not src.is_absolute() or not src.name:
             return False
-        if not src.is_file():
+        is_dir = src.is_dir()
+        if not is_dir and not src.is_file():
             return False
         # 桌面的系统文件：收进去 explorer 会重新生成一份，没意义还可能惹事
         if src.name.lower() in ("desktop.ini", "thumbs.db"):
             return False
-        # 盒子之间互相搬图标是正常操作，所以盒子目录里的文件要放行；
-        # 但 DATA_DIR 底下别的（配置 / 日志 / 图标缓存）绝对不许进来。
         resolved = src.resolve()
-        if DATA_DIR.resolve() in resolved.parents:
+        data = DATA_DIR.resolve()
+        # 盒子之间互相搬东西是正常操作，所以盒子目录里的要放行；
+        # 但 DATA_DIR 底下别的（配置 / 日志 / 图标缓存）绝对不许进来。
+        if resolved == data:
+            return False
+        if data in resolved.parents:
             if BOX_ROOT.resolve() not in resolved.parents:
                 return False
+        elif resolved in data.parents:
+            return False
+        if is_dir:
+            if resolved.parent == resolved:
+                return False      # 盘符根
+            if resolved in _protected_dirs():
+                return False
+            if not _same_volume(resolved, data):
+                return False
+        return True
     except OSError:
         return False
-    return True
 
 
 def acceptable(path) -> bool:
@@ -132,7 +176,7 @@ class BoxStore:
         for box in self.boxes:
             folder = self.box_dir(box)
             try:
-                names = {p.name for p in folder.iterdir() if p.is_file()}
+                names = {p.name for p in folder.iterdir() if p.is_file() or p.is_dir()}
             except OSError:
                 continue
             keep = [n for n in box.order if n in names]
@@ -212,7 +256,7 @@ class BoxStore:
     def items(self, box: BoxData) -> list[Path]:
         folder = self.box_dir(box)
         try:
-            files = [p for p in folder.iterdir() if p.is_file()]
+            files = [p for p in folder.iterdir() if p.is_file() or p.is_dir()]
         except OSError:
             return []
         rank = {name: i for i, name in enumerate(box.order)}
@@ -371,7 +415,7 @@ class BoxStore:
 
     def remove_to(self, box: BoxData, path: Path, dest_dir: Path | None = None) -> Path | None:
         """把盒子里的文件移出去（优先放回原目录，写不进去就退到个人桌面）。"""
-        if not path.is_file():
+        if not (path.is_file() or path.is_dir()):
             return None
         candidates: list[Path] = []
         if dest_dir is not None:

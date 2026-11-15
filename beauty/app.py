@@ -996,6 +996,7 @@ class Controller(QObject):
         win = BoxWidget(self.store, box)
         win.changed.connect(self.store.save)
         win.removed.connect(self._on_box_removed)
+        win.warn.connect(lambda text: self.toast.show_text(text, 3200))
         win.on_z_changed = self.apply_z_order
         win.on_toast = lambda text: self.toast.show_text(text, 2200)
         win.on_merge = self.merge_boxes
