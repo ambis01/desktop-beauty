@@ -1399,7 +1399,14 @@ class Controller(QObject):
                     if abs(self._axis_pos(other, is_box, axis) - new) > gap:
                         continue              # 你已经挪过它：这一环不抢
                     rect = self._flat_rect(other)
-                    others = self._rects_except([other], virt)
+                    # 正在收回去的盒子自己也算障碍，但要用**收完以后**那块：
+                    # 这一瞬间 `_flat_rect` 还是展开时的尺寸，拿它当障碍会把
+                    # 下面该回来的东西挡在半路（用户报的「收起后游戏启动还低一截」）
+                    others = self._rects_except([other, win], virt)
+                    try:
+                        others = others + [win.collapsed_rect()]
+                    except (RuntimeError, TypeError, AttributeError):
+                        pass
                     if self._free_at(rect, others, gap, axis, old):
                         stop = old             # 原位空着：直接回去（可以越过让开的那几个）
                     else:
@@ -1431,6 +1438,10 @@ class Controller(QObject):
         离得远的无关东西一律不动。
         """
         if self._restore_grow(win):
+            return
+        if getattr(win, "_grew_up", False):
+            # 这次是「往上长」展开的：下面谁都没被推开，收回去凭什么把下面吸上来
+            # （用户报的「游戏启动常驻着，展开别的盒子再收起，它反而被吸上去叠住」）
             return
         if freed <= 0:
             return
@@ -1804,6 +1815,7 @@ class Controller(QObject):
         want, side, up, plan = got
         try:
             win._expand_side = side
+            win._grew_up = bool(up)
             win.set_up(int(win.box.y) - int(want.top()))
         except (RuntimeError, TypeError, AttributeError):
             return False
@@ -1834,6 +1846,7 @@ class Controller(QObject):
         want, side, up, plan = got
         try:
             win._expand_side = side
+            win._grew_up = bool(up)
             win.set_up(int(win.box.y) - int(want.top()))
         except (RuntimeError, TypeError, AttributeError):
             return False
