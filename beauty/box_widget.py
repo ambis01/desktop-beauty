@@ -583,6 +583,9 @@ class BoxWidget(GlassWindow):
         # 收起形态：False = 带缩略图标的方块，True = 只剩那条可拖拽的横杠
         self._bar = False
         self._bar_t = 0.0        # 实际进度：0 = 缩略，1 = 只剩横杠
+        # 挤开时为了腾地方被临时收成横杠：这是这一刻的样子，**不落盘**，
+        # 收起展开的盒子时按家重排、它自己就长回来了
+        self._tmp_bar = False
         if bool(getattr(box, "bar", False)):
             # 上次退出时就是一条横杠：直接就按横杠起来
             self._bar = True
@@ -816,11 +819,21 @@ class BoxWidget(GlassWindow):
         """确保整个盒子在可视区内（任务栏上方），否则收起来的盒子会“消失”。
 
         边距是 0：用户要盒子贴着屏幕边缘，之前留 8px 看着就是「永远差一小块」。
+
+        ⚠️ 「家」和「现在显示在哪儿」分开夹：以前拿当前显示位置写回 `store.move`
+        （那时 move 会落盘），盒子被挤开之后随便触发一次尺寸变化，那个「被推开的
+        位置」就被记成了新家。
         """
         avail = self._screen()
-        x = min(max(self.box.x, avail.left()), avail.right() + 1 - self._side_w)
-        y = min(max(self.box.y, avail.top()), avail.bottom() + 1 - self._collapsed_h())
-        if (x, y) != (self.box.x, self.box.y):
+        hx = min(max(int(self.box.home_x), avail.left()),
+                 avail.right() + 1 - self._side_w)
+        hy = min(max(int(self.box.home_y), avail.top()),
+                 avail.bottom() + 1 - self._collapsed_h())
+        if (hx, hy) != (int(self.box.home_x), int(self.box.home_y)):
+            self.store.place(self.box, hx, hy)
+        x = min(max(int(self.box.x), avail.left()), avail.right() + 1 - self._side_w)
+        y = min(max(int(self.box.y), avail.top()), avail.bottom() + 1 - self._collapsed_h())
+        if (x, y) != (int(self.box.x), int(self.box.y)):
             self.box.x, self.box.y = x, y
             self.store.move(self.box, x, y)
         if not self._expanded:
@@ -1589,9 +1602,16 @@ class BoxWidget(GlassWindow):
             self._set_expanded_blur(False)   # 收起后立刻关掉模糊
         self._notify_z()
 
-    def _save_bar(self) -> None:
-        """把「是不是一条横杠」记进 boxes.json，重启后还是那个样子。"""
+    def _save_bar(self, persist: bool = True) -> None:
+        """把「是不是一条横杠」记进 boxes.json，重启后还是那个样子。
+
+        `persist=False` 是**挤开时临时收成横杠**（为了让出地方），那种只是这一刻
+        的样子，不能记进配置——以前也记进去了，于是展开一次邻居就永久变横杠，
+        收起之后它还是横杠（用户报的「我的盒子怎么自己变成一条杠了」）。
+        """
         want = bool(self._bar)
+        if not persist:
+            return
         if bool(getattr(self.box, "bar", False)) == want:
             return
         self.box.bar = want
@@ -1600,14 +1620,14 @@ class BoxWidget(GlassWindow):
         except OSError:
             pass
 
-    def _set_bar(self, on: bool) -> None:
+    def _set_bar(self, on: bool, persist: bool = True) -> None:
         """-1（只剩横杠）↔ 0（正常，带缩略图标）：只动高度，盒子位置不变。
 
         on=True 收到横杠（-1），on=False 长回正常（0）。展开状态（1）不走这里，
         调用方先 toggle(False) —— 那条路是 1 → -1 一步收到底。
         """
         on = bool(on)
-        if not on and not self._expanded:
+        if not on and not self._expanded and persist:
             cb = getattr(self, "on_grow_request", None)
             if cb is not None:
                 try:
@@ -1626,7 +1646,7 @@ class BoxWidget(GlassWindow):
             self._apply_collapsed_geometry()
             self.update()
             return
-        self._save_bar()
+        self._save_bar(persist)
         self._anim_timer.stop()
         if on:
             cb = getattr(self, "on_shrunk", None)
@@ -3012,7 +3032,7 @@ class BoxWidget(GlassWindow):
             self._clamp_to_screen()
             _log("after clamp pos=%s box=%s", self.pos(), (self.box.x, self.box.y))
             self._avoid_overlap()
-            self.store.move(self.box, self.box.x, self.box.y)
+            self.store.place(self.box, self.box.x, self.box.y)
             self.changed.emit()
             # 盒子拖到哪儿，压在下面的桌面图标就挪开——放到事件之后再做，
             # 免得松手瞬间卡一下
@@ -3104,7 +3124,7 @@ class BoxWidget(GlassWindow):
             self.setGeometry(self._rect_expanded)
         else:
             self._apply_collapsed_geometry()
-        self.store.move(self.box, self.box.x, self.box.y)
+        self.store.place(self.box, self.box.x, self.box.y)
         self.changed.emit()
         QTimer.singleShot(0, self._push_desktop_icons)
 

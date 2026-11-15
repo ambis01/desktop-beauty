@@ -211,6 +211,19 @@ class BoxData:
     size: str = "auto"
     # 建盒时间（epoch 秒），面板里「按创建时间排序」用；老数据没有就退回目录时间
     created: float = 0.0
+    # x/y 是**现在显示在哪儿**（挤开、让开、吸回都会改它，但不落盘）；
+    # home_x/home_y 是**用户亲手把它放在哪儿**，只有拖动 / 建盒才改，落盘的是它。
+    # 分开存是因为：以前挤开的位置也写进了 boxes.json，只要有一步没吸回来，
+    # 那个「被推开的位置」就变成它的新家，再也不会回到原来的地方（用户报的
+    # 「展开再收起，盒子回不到原位、还越推越远」）。
+    home_x: int = -1
+    home_y: int = -1
+
+    def __post_init__(self) -> None:
+        if self.home_x < 0:
+            self.home_x = int(self.x)
+        if self.home_y < 0:
+            self.home_y = int(self.y)
 
 
 def _name_key(name: str) -> tuple:
@@ -308,6 +321,8 @@ class BoxStore:
                     bar=bool(item.get("bar", False)),
                     size=str(item.get("size", "auto") or "auto"),
                     created=float(item.get("created", 0.0) or 0.0),
+                    home_x=int(item.get("home_x", -1)),
+                    home_y=int(item.get("home_y", -1)),
                 ))
             except (KeyError, TypeError, ValueError):
                 continue
@@ -322,10 +337,22 @@ class BoxStore:
                 box.created = 0.0
 
     def save(self) -> None:
+        """落盘的是**家**的位置，不是现在被推到哪儿了。
+
+        挤开/吸回只改 `box.x/box.y`（内存里的显示位置），重启之后一律按家摆回去：
+        哪一步没吸回来都不会把错位记住。
+        """
         ensure_dirs()
+        rows = []
+        for box in self.boxes:
+            row = asdict(box)
+            row["x"], row["y"] = int(box.home_x), int(box.home_y)
+            row.pop("home_x", None)
+            row.pop("home_y", None)
+            rows.append(row)
         tmp = INDEX_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(
-            {"boxes": [asdict(b) for b in self.boxes]}, ensure_ascii=False, indent=2,
+            {"boxes": rows}, ensure_ascii=False, indent=2,
         ), "utf-8")
         tmp.replace(INDEX_PATH)
 
@@ -632,5 +659,15 @@ class BoxStore:
         self.save()
 
     def move(self, box: BoxData, x: int, y: int) -> None:
+        """改**现在显示在哪儿**（挤开、让开、吸回）。不落盘：家不动。
+
+        要记住位置用 `place()`（拖动、建盒、整组搬完）；挤开是临时的，
+        落盘就等于把「被推开的位置」变成了新家。
+        """
+        box.x, box.y = int(x), int(y)
+
+    def place(self, box: BoxData, x: int, y: int) -> None:
+        """用户亲手把它放在这儿：这才是它的家，落盘。"""
+        box.home_x, box.home_y = int(x), int(y)
         box.x, box.y = int(x), int(y)
         self.save()

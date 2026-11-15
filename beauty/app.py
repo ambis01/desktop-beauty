@@ -118,8 +118,11 @@ class Controller(QObject):
             pass
         self.store = BoxStore()
         self.windows: dict[str, BoxWidget] = {}
-        # 盒子临时长开时把谁让到哪儿了：缩回去要放回原位（见 _restore_grow）
-        self._grow_saved: dict[str, list[list]] = {}
+        # 布局：每次从「家」重算（见 _relayout）。`_in_layout` 防回调套回调，
+        # `_layout_pass` 表示现在只在算逻辑坐标，窗口等算完统一滑过去。
+        self._in_layout = False
+        self._layout_pass = False
+        self._relayout_more = False
         self.card_widgets: dict[str, ClockWidget] = {}
         self.settings = None
         # 撤销栈：按建盒顺序记盒子 id，面板「撤销上次建盒」一次弹一个
@@ -154,6 +157,12 @@ class Controller(QObject):
 
         for box in list(self.store.boxes):
             self._spawn(box)
+        # 旧版本把「挤开的位置」也写进了配置，可能有几块的家是叠在一起的：
+        # 启动时先把它们分开一次（没重叠就一个像素都不动）
+        try:
+            self._untangle_homes()
+        except Exception:  # noqa: BLE001 - 摆位置出错不能拦着启动
+            pass
 
         # 和卡片同一套玻璃浓度（默认 212），换主题时一起跟着变
         self.toast = Toast(alpha=int(getattr(self.cfg, "glass_alpha", 212) or 212))
@@ -1033,8 +1042,8 @@ class Controller(QObject):
         win.on_new_box_from_selection = self._on_new_box_from_selection
         win.on_drag_preview = self._on_drag_preview
         win.on_grow_request = self._grow_request
-        win.on_shrunk = self._snap_below
-        win.on_collapsed = self._restore_grow
+        win.on_shrunk = self._on_shrunk
+        win.on_collapsed = lambda _w: self._relayout()
         # 展开（1）：正下方挤开、侧面左右推开；勾常驻展开之前先问让不让得开
         win.on_expanded = self._expand_room
         win.on_pin_room = self._pin_check
@@ -1222,18 +1231,32 @@ class Controller(QObject):
         return w.card.y if axis == "y" else w.card.x
 
     def _axis_move(self, w, is_box: bool, axis: str, value: int) -> None:
-        """沿一个轴挪过去（**玻璃坐标**），带滑动动画。"""
+        """沿一个轴挪过去（**玻璃坐标**），带滑动动画。
+
+        `_layout_pass` 期间只改逻辑坐标（`box.x/box.y`、`card.x/card.y`），
+        窗口一个像素都不动——布局是一次算完再统一滑过去的（见 `_relayout`）。
+        """
+        if self._layout_pass:
+            if is_box:
+                if axis == "y":
+                    w.box.y = int(value) + int(getattr(w, "_up", 0) or 0)
+                else:
+                    w.box.x = int(value)
+            else:
+                if axis == "y":
+                    w.card.y = int(value)
+                else:
+                    w.card.x = int(value)
+            return
         if is_box:
             if axis == "y":
                 # value 是玻璃 y；box.y 得把往上长的偏移加回来
                 w.box.y = int(value) + int(getattr(w, "_up", 0) or 0)
-                w.store.move(w.box, w.box.x, w.box.y)
-                w.changed.emit()
+                w.store.move(w.box, w.box.x, w.box.y)   # 只是显示位置，家不动
                 w.slide_to(int(value))
             else:
                 w.box.x = value
                 w.store.move(w.box, w.box.x, w.box.y)
-                w.changed.emit()
                 w.slide_x_to(value)
         else:
             inset = int(getattr(w, "inset", 0) or 0)
@@ -1321,187 +1344,276 @@ class Controller(QObject):
                         rect if ny is None else rect.translated(0, ny - rect.top())))
         return out
 
-    def _remember_grow(self, win, saved, height: int) -> None:
-        """记下「盒子长开时把谁让到哪儿了」：缩回去时按这个放回原位。
+    # ------------------------------------------- 布局：每次从「家」重算整张桌面
+    def _relayout(self, win=None) -> bool:
+        """把所有人摆回自己的家，再让占地方的那几个把别人推开。
 
-        saved 里是 (id, 是否盒子, 轴 "x"/"y", 原来位置, 让到位置)。同一个盒子、同一个
-        轴的记录会**留着原来的位置**、只更新「让到位置」：一声长开里推过两三次
-        （1 → 0 → 1 这种来回）最后还是要回到当初那个家。
+        每一块的位置都是**从家算出来的**，不是「上次推到哪儿、再按记录吸回去」。
+        以前是记录 + 吸回：只要有一环没吸回去（你亲手拖过、路上被挡了一下、连着
+        展开两个盒子、或者那一步正好在动画中间），记录就和实际对不上，位置越推
+        越歪、再也回不到原位（用户报的「各种怪异」）。现在挤开只是这一次的临时
+        结果，收起时按家重算一遍，必然回得去。
 
-        height 是**这次为它让出来的那个高度**：缩回去的时候拿盒子当时的收起高度
-        跟它比——展开完点到外面只会落回 0（一样大），那不算缩回去，不能还原。
+        `win`：刚变大的那个盒子（横杠 → 正常 / 拖进图标变高）。它自己那块也算
+        占地方，别人要给它让开；让不开返回 False，调用方抖两下。
         """
-        table = getattr(self, "_grow_saved", None)
-        if table is None:
-            table = self._grow_saved = {}
-        got = table.get(win.box.id)
-        if got is None or int(got[0]) != int(height):
-            entries: list[list] = []
-            table[win.box.id] = [int(height), entries]
-        else:
-            entries = got[1]
-        have = {(entry[0], entry[2]): entry for entry in entries}
-        for ident, is_box, axis, old, new in saved:
-            entry = have.get((ident, axis))
-            if entry is not None:
-                if abs(entry[4] - old) <= self.SETTLE_GAP:
-                    entry[4] = new      # 还停在上次让到的地方：家不变，只更新终点
-                else:
-                    entry[3], entry[4] = old, new   # 位置被改过：这条当新的用
-                continue
-            entries.append([ident, is_box, axis, old, new])
-
-    def _restore_grow(self, win) -> bool:
-        """盒子**真的缩回去**了：把刚才为它让开的东西按记录放回原位。
-
-        「真的缩回去」= 现在的收起高度比当初让出来的那个高度小。展开完点一下
-        盒子外面只是落回 0（跟长开时一样大），邻居还得让着，这时候还原就压住了。
-
-        吸的规矩（用户 2026-11-15 定的）：
-          * 只有**真被这次推开过**的东西才会被吸回来（记录里没有的绝不去吸）；
-          * 还停在「被推开的位置」上（差不超过一个空隙）才算这一环还在——你亲手
-            拖开过、或者被别的东西挪走的，那一环不抢，别的照样回。这样既不会把
-            远处的无关东西吸过来，也不会把被覆盖的东西拽走；
-          * 横竖都带障碍检测：路上撞到别的盒子/卡片就停在它 gap 外，已经叠着的
-            不动。正在收起来的这个盒子本身也算障碍（它可能只收小了一级）。
-        """
-        table = getattr(self, "_grow_saved", None)
-        if not table:
-            return False
-        key = getattr(getattr(win, "box", None), "id", "")
-        saved = table.get(key)
-        if not saved:
-            return False
-        rec_h, entries = saved
+        if self._in_layout:
+            # 回调套回调（收横杠 → on_shrunk 之类）：这一轮算完就够了
+            self._relayout_more = True
+            return True
+        from .box_widget import is_dragging
+        if is_dragging():
+            # 正在拖盒子：位置由鼠标说了算，这时候重排会把它从手里拽走
+            return True
+        self._in_layout = True
+        ok = True
         try:
-            cur_h = win.collapsed_rect().height()
-        except (RuntimeError, TypeError, AttributeError):
-            cur_h = 0
-        if cur_h >= rec_h - 1:
-            return False          # 还是当初那个大小：不算缩回去，记录留着
-        gap = self.SETTLE_GAP
-        # 分四串：往下推的、往上推的、往右推的、往左推的；各自按「离盒子由近到远」排
-        groups: dict[str, list[list]] = {"yd": [], "yu": [], "xr": [], "xl": []}
-        for entry in entries:
-            axis = entry[2]
-            if axis == "y":
-                groups["yd" if entry[4] >= entry[3] else "yu"].append(entry)
-            elif entry[4] > entry[3]:
-                groups["xr"].append(entry)
-            else:
-                groups["xl"].append(entry)
-        groups["yd"].sort(key=lambda e: e[3])
-        groups["yu"].sort(key=lambda e: -e[3])      # 往上推的：原来的 y 越大越近
-        groups["xr"].sort(key=lambda e: e[3])
-        groups["xl"].sort(key=lambda e: -e[3])
-        virt: dict[int, QRect] = {}
-        back = 0
-        for name in ("yd", "yu", "xr", "xl"):
-            axis = "x" if name in ("xr", "xl") else "y"
-            for entry in groups[name]:
-                ident, is_box, _axis, old, new = entry
-                other = (self.windows.get(ident) if is_box
-                         else self.card_widgets.get(ident))
-                if other is None:
-                    continue                  # 这一环没了：跳过，别的照样回
+            self._layout_pass = True
+            boxes = [w for w in self.windows.values() if w.isVisible()]
+            cards = [c for c in self.card_widgets.values() if c.isVisible()]
+            if not boxes:
+                return False
+            # 动画起点：现在显示在哪儿（这一步只改逻辑坐标，窗口还没动）
+            disp = {id(w): (int(w.box.x), int(w.box.y)) for w in boxes}
+            disp_card = {id(c): (int(c.card.x or 0), int(c.card.y or 0))
+                         for c in cards}
+            # 1) 全部回自己的家；上次挤开时临时收成横杠的先按原样算
+            for w in boxes:
+                w.box.x, w.box.y = int(w.box.home_x), int(w.box.home_y)
+                w._up = 0
+                if getattr(w, "_tmp_bar", False):
+                    w._tmp_bar = False
+                    w._bar = False
+            # 2) 展开的面板先占位，再把挡路的推开
+            for w in sorted((x for x in boxes if x.is_expanded),
+                            key=lambda x: (float(x.box.created or 0.0), x.box.id)):
+                got = self._panel_for(
+                    w, allow_collapse=not bool(getattr(w.box, "pinned", False)))
+                if got is None:
+                    continue
+                want, side, up, plan = got
                 try:
-                    if abs(self._axis_pos(other, is_box, axis) - new) > gap:
-                        continue              # 你已经挪过它：这一环不抢
-                    rect = self._flat_rect(other)
-                    # 正在收回去的盒子自己也算障碍，但要用**收完以后**那块：
-                    # 这一瞬间 `_flat_rect` 还是展开时的尺寸，拿它当障碍会把
-                    # 下面该回来的东西挡在半路（用户报的「收起后游戏启动还低一截」）
-                    others = self._rects_except([other, win], virt)
-                    try:
-                        others = others + [win.collapsed_rect()]
-                    except (RuntimeError, TypeError, AttributeError):
-                        pass
-                    if self._free_at(rect, others, gap, axis, old):
-                        stop = old             # 原位空着：直接回去（可以越过让开的那几个）
-                    else:
-                        stop = (aligner.stop_y(rect, old, others, gap)
-                                if axis == "y" else
-                                aligner.stop_x(rect, old, others, gap))
-                    if stop is None:
-                        continue              # 原位/被挡：这一环不动
-                    self._axis_move(other, is_box, axis, stop)
-                    # 记成「现在停在哪儿」：下一级收起（1→0→-1）还会再吸一次，
-                    # 靠这个才对得上位置。记录不删，`old` 一直是原来的位置。
-                    entry[4] = stop
-                    virt[id(other)] = rect.translated(
-                        stop - rect.left() if axis == "x" else 0,
-                        stop - rect.top() if axis == "y" else 0)
-                except (RuntimeError, OSError, TypeError, AttributeError):
+                    w._expand_side = side
+                    w._grew_up = bool(up)
+                    w.set_up(int(w.box.y) - int(want.top()))
+                except (RuntimeError, TypeError, AttributeError):
                     continue
-                back += 1
-        if back:
-            _log(f"grow: restore {back}/{len(entries)}")
-        return True
+                _log(f"grow: expand {w.box.name} side={side} up={up} at {want.left()},{want.top()}")
+                self._apply_plan(w, want, plan)
+            # 3) 刚变大的那个：它自己那块也算占地方
+            if win is not None and win in boxes and not win.is_expanded:
+                from .box_widget import TITLE_H
+                # 横杠 → 正常这一步发生在 `_set_bar` 把 `_bar` 改掉**之前**，
+                # 所以不能用 `_collapsed_h()`（那还是横杠的 28），要按长完的高度算
+                h_after = (int(win._side_h) + TITLE_H if getattr(win, "_bar", False)
+                           else int(win._collapsed_h()))
+                r = QRect(int(win.box.home_x), int(win.box.home_y),
+                          int(win._side_w), h_after)
+                items = self._snapshot(win)
+                plan = self._plan_all(win, r, items, r)
+                if plan is None:
+                    ok = False
+                else:
+                    _log(f"grow: place {win.box.name} {r.left()},{r.top()} {r.width()}x{r.height()}")
+                    self._apply_plan(win, r, plan)
+            # 3b) 收起的盒子之间也不许叠着：从家重算之后，谁和谁压住了就往下让
+            #     （展开面盖住是有意的，不算；这里只管「收起 × 收起」）
+            self._pack_collapsed(boxes)
+            self._layout_pass = False
+            # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
+            for w in boxes:
+                if w.is_expanded:
+                    continue
+                ox, oy = disp[id(w)]
+                try:
+                    if int(w.box.x) != ox:
+                        w.slide_x_to(int(w.box.x))
+                    if int(w.box.y) != oy:
+                        w.slide_to(int(w.box.y))
+                except (RuntimeError, TypeError):
+                    continue
+            card_moved = False
+            for c in cards:
+                ox, oy = disp_card[id(c)]
+                if (int(c.card.x or 0), int(c.card.y or 0)) == (ox, oy):
+                    continue
+                card_moved = True
+                inset = int(getattr(c, "inset", 0) or 0)
+                try:
+                    if int(c.card.x or 0) != ox:
+                        self._slide_widget_to(c, int(c.card.x) - inset, axis="x")
+                    if int(c.card.y or 0) != oy:
+                        self._slide_widget_to(c, int(c.card.y) - inset)
+                except (RuntimeError, TypeError):
+                    continue
+            if card_moved:
+                try:
+                    self.cfg.save()
+                except OSError:
+                    pass
+            # 5) 横杠：挤开时临时收的、临时收完又要长回来的，都在这儿动
+            for w in boxes:
+                if w.is_expanded:
+                    continue
+                want_bar = bool(w._bar)
+                if want_bar == (w._bar_t > 0.5):
+                    continue
+                try:
+                    w._set_bar(want_bar, persist=False)
+                except (RuntimeError, TypeError):
+                    pass
+            return ok
+        finally:
+            self._layout_pass = False
+            self._in_layout = False
+            self._relayout_more = False
 
-    def _snap_below(self, win, freed: int) -> None:
-        """盒子收小一截（改大小 / 收成横杠）：下面那一串顺着空隙贴上来。
+    def _panel_for(self, win, allow_collapse: bool = True):
+        """展开面摆哪儿：(want, side, up, plan) 或 None。全部按「家」算。"""
+        try:
+            m = win._win_margin()
+            size = win._expanded_rect()
+            w = size.width() - 2 * m
+            h = size.height() - 2 * m
+            base = QRect(int(win.box.home_x), int(win.box.home_y),
+                         int(win._side_w), int(win._collapsed_h()))
+            items = self._snapshot(win)
+        except (RuntimeError, TypeError, AttributeError):
+            return None
+        return self._place(win, w, h, items, base, allow_collapse=allow_collapse)
 
-        有记录（展开时推开的）先按记录放回；没有记录才走这里：只吸**紧贴着一个
-        空隙**的那一串——第一块离盒子的距离 ≈ 这次腾出来的高度 + 空隙，后面每块
-        要紧贴着前一块（也是一个空隙）才跟着挪，而且挪的距离一样（整串一起走）。
-        离得远的无关东西一律不动。
+    def _on_shrunk(self, win, _freed: int = 0) -> None:
+        """盒子收成横杠了（用户双击）：它那块地方腾出来了，整体重排一次。"""
+        self._relayout()
+
+    def _untangle_homes(self) -> int:
+        """启动时把互相压着的「家」分开（只动真压着的，算完存盘）。
+
+        旧版本把挤开的位置也写进了配置，可能留下两块叠在一起的家；不修的话
+        一展开就更容易叠，看着还是「又乱了」。没有重叠时一个像素都不动。
         """
-        if self._restore_grow(win):
-            return
-        if getattr(win, "_grew_up", False):
-            # 这次是「往上长」展开的：下面谁都没被推开，收回去凭什么把下面吸上来
-            # （用户报的「游戏启动常驻着，展开别的盒子再收起，它反而被吸上去叠住」）
-            return
-        if freed <= 0:
-            return
+        moved = 0
+        wins = [w for w in self.windows.values() if w.isVisible()]
+        if not wins:
+            return 0
+        wins.sort(key=lambda w: (float(getattr(w.box, "created", 0.0) or 0.0),
+                                 w.box.id))
+        try:
+            scr = (wins[0].screen() or self.app.primaryScreen()).availableGeometry()
+        except (RuntimeError, TypeError, AttributeError):
+            return 0
+        gap = self.SETTLE_GAP
+        placed: list[QRect] = []
+
+        def hits(r: QRect) -> bool:
+            probe = r.adjusted(-gap, -gap, gap, gap)
+            return any(probe.intersects(o) for o in placed)
+
+        for w in wins:
+            w0, h0 = int(w._side_w), int(w._collapsed_h())
+            hx, hy = int(w.box.home_x), int(w.box.home_y)
+            r = QRect(hx, hy, w0, h0)
+            # 先夹进屏幕（老配置可能存过一个跑到屏幕外的位置）
+            r.moveLeft(min(max(r.left(), scr.left()), scr.right() + 1 - w0))
+            r.moveTop(min(max(r.top(), scr.top()), scr.bottom() + 1 - h0))
+            if not hits(r):
+                if (r.x(), r.y()) != (hx, hy):
+                    w.box.home_x, w.box.home_y = r.x(), r.y()
+                    w.box.x, w.box.y = r.x(), r.y()
+                    try:
+                        w._apply_collapsed_geometry()
+                    except (RuntimeError, TypeError):
+                        pass
+                    moved += 1
+                placed.append(r)
+                continue
+            # 找离原位置最近的空位：先往下、再往右、最后往上（尽量不改变原来的排列）
+            step_x, step_y = w0 + gap, h0 + gap
+            cands: list[tuple[int, int]] = []
+            for by in range(hy, scr.bottom() + 2 - h0, step_y):
+                for bx in range(hx, scr.right() + 2 - w0, step_x):
+                    cands.append((bx, by))
+            for by in range(hy - step_y, scr.top() - 1, -step_y):
+                for bx in range(hx, scr.right() + 2 - w0, step_x):
+                    cands.append((bx, by))
+            for bx in range(hx + step_x, scr.right() + 2 - w0, step_x):
+                for by in range(scr.top(), scr.bottom() + 2 - h0, step_y):
+                    cands.append((bx, by))
+            best = None
+            seen: set[tuple[int, int]] = set()
+            for bx, by in cands:
+                if (bx, by) in seen:
+                    continue
+                seen.add((bx, by))
+                if bx < scr.left() or bx + w0 > scr.right() + 1:
+                    continue
+                if by < scr.top() or by + h0 > scr.bottom() + 1:
+                    continue
+                rr = QRect(bx, by, w0, h0)
+                if not hits(rr):
+                    best = rr
+                    break
+            if best is None:
+                placed.append(r)      # 一个空位都没有：留着，别乱动
+                continue
+            w.box.home_x, w.box.home_y = best.x(), best.y()
+            w.box.x, w.box.y = best.x(), best.y()
+            try:
+                w._apply_collapsed_geometry()
+            except (RuntimeError, TypeError):
+                pass
+            moved += 1
+            placed.append(best)
+        if moved:
+            self.store.save()
+            _log(f"homes untangled: {moved} moved")
+        return moved
+
+    def _pack_collapsed(self, boxes) -> None:
+        """收起的盒子互相压住时，后建的那个往下让（只改临时位置，家不动）。
+
+        为什么要有这一步：盒子变大（横杠 → 正常、拖进图标）时邻居会让开，可下
+        一次重排是从家算起的，那个「让开」本来会被抹掉，于是「一会儿叠、一会儿
+        不叠」。这里按「先建的先占位」重新排一遍，让开的结果就稳定了。
+        """
         gap = self.SETTLE_GAP
         try:
-            here = win.collapsed_rect()
-        except (RuntimeError, TypeError, AttributeError):
+            scr = (boxes[0].screen() or self.app.primaryScreen()).availableGeometry()
+        except (RuntimeError, TypeError, AttributeError, IndexError):
             return
-        items = self._snapshot(win)
-        virt: dict[int, QRect] = {}
-        used: set[int] = set()
-        shift: int | None = None
-        for _ in range(16):
-            best = None
-            for other, is_box, rect in items:
-                if id(other) in used:
-                    continue
-                if rect.top() < here.bottom():
-                    continue                    # 不在这一列的下面
-                if rect.right() < here.left() or rect.left() > here.right():
-                    continue
-                if best is None or rect.top() < best[2].top():
-                    best = (other, is_box, rect)
-            if best is None:
-                return
-            other, is_box, rect = best
-            dist = rect.top() - (here.bottom() + 1)
-            if shift is None:
-                if dist < gap - 2 or dist > gap + freed + 2:
-                    return                      # 不是这次腾出来的那一块
-                shift = -(dist - gap)
-            elif not (gap - 2 <= dist <= gap + 2):
-                return                          # 不是紧贴着这一串的：收手
-            if not shift:
-                return
-            used.add(id(other))
+        placed: list[QRect] = []
+        for w in sorted((x for x in boxes if not x.is_expanded),
+                        key=lambda x: (float(x.box.created or 0.0), x.box.id)):
             try:
-                stop = aligner.stop_y(rect, rect.top() + shift,
-                                      self._rects_except([other], virt), gap)
-            except (RuntimeError, TypeError):
-                return
-            if stop is None:
-                return
-            try:
-                self._axis_move(other, is_box, "y", stop)
-            except (RuntimeError, OSError, TypeError, AttributeError):
-                return
-            moved = stop - rect.top()
-            virt[id(other)] = rect.translated(0, moved)
-            here = rect.translated(0, moved)
-            shift = moved
+                r = QRect(int(w.box.x), int(w.box.y),
+                          int(w._side_w), int(w._collapsed_h()))
+            except (RuntimeError, TypeError, AttributeError):
+                continue
+            for _ in range(64):
+                clash = None
+                for o in placed:
+                    if r.intersects(o.adjusted(-gap, -gap, gap, gap)):
+                        clash = o
+                        break
+                if clash is None:
+                    break
+                down = clash.bottom() + 1 + gap
+                if down + r.height() <= scr.bottom() + 1:
+                    r.moveTop(max(r.top(), down))
+                    continue
+                right = clash.right() + 1 + gap
+                if right + r.width() <= scr.right() + 1:
+                    r.moveLeft(max(r.left(), right))
+                    continue
+                up = clash.top() - gap - r.height()
+                if up >= scr.top():
+                    r.moveTop(min(r.top(), up))
+                    continue
+                break
+            r.moveLeft(min(max(r.left(), scr.left()), scr.right() + 1 - r.width()))
+            r.moveTop(min(max(r.top(), scr.top()), scr.bottom() + 1 - r.height()))
+            w.box.x, w.box.y = int(r.x()), int(r.y())
+            placed.append(QRect(r))
 
     def _plan_all(self, win, target, items, base, allow_collapse: bool = True):
         """一份完整方案：(down, collapsed, row, up, side, blocked) 或 None（放不下）。"""
@@ -1576,16 +1688,18 @@ class Controller(QObject):
                     return want, side, up, plan      # 谁都不挡、也不用收横杠
         return best
 
-    def _apply_plan(self, win, target, plan, remember: bool) -> None:
-        """把方案搬到窗口上：收横杠、往下推、往上推、往左右推，全记进 `_grow_saved`。"""
+    def _apply_plan(self, win, target, plan, remember: bool = False) -> None:
+        """把方案搬到窗口上：收横杠、往下推、往上推、往左右推。
+
+        只改逻辑坐标——挤开是这一次的临时结果，**家不动**（见 `_relayout`）。
+        `remember` 留着只为兼容老调用，已经不需要了：位置不再靠记录吸回来。
+        """
         moves, collapsed, row, up, side, _blocked = plan
-        saved: list[tuple] = []
         for _top, is_box, other, _rect in row:
             if is_box and other.box.id in collapsed:
-                try:
-                    other._set_bar(True)
-                except (RuntimeError, TypeError):
-                    pass
+                # 临时收成横杠腾地方：只改这一刻的样子，**不落盘**（落盘就变永久了）
+                other._tmp_bar = True
+                other._bar = True
         for other, is_box, ny in up:
             old = self._axis_pos(other, is_box, "y")
             try:
@@ -1593,7 +1707,6 @@ class Controller(QObject):
             except (RuntimeError, OSError, TypeError, AttributeError):
                 continue
             _log(f"grow: up {self._label(other, is_box)} {old}->{ny}")
-            saved.append((self._ident(other, is_box), is_box, "y", old, ny))
         for other, is_box, ny in moves:
             old = self._axis_pos(other, is_box, "y")
             try:
@@ -1601,18 +1714,14 @@ class Controller(QObject):
             except (RuntimeError, OSError, TypeError, AttributeError):
                 continue
             _log(f"grow: down {self._label(other, is_box)} {old}->{ny}")
-            saved.append((self._ident(other, is_box), is_box, "y", old, ny))
         for other, is_box, axis, here, got in side:
             try:
                 self._axis_move(other, is_box, axis, got)
             except (RuntimeError, OSError, TypeError, AttributeError):
                 continue
             _log(f"grow: side {self._label(other, is_box)} {here}->{got}")
-            saved.append((self._ident(other, is_box), is_box, axis, here, got))
         if collapsed:
             _log(f"grow: collapse {len(collapsed)} move {len(moves)}")
-        if saved and remember:
-            self._remember_grow(win, saved, target.height())
 
     def _plan_up(self, win, target, above):
         """底部放不下、把盒子往上抬着展开：把上方挡路的**往上推**。
@@ -1821,75 +1930,26 @@ class Controller(QObject):
         return moves, blocked
 
     def _grow_request(self, win, target=None, remember: bool = True) -> bool:
-        """-1 → 0 / 盒子变大 / 展开到 1 之前先算：长出来有没有地方。
+        """盒子要变大（横杠 → 正常 / 永久变大）：有地方吗？有就整张桌面重排一次。
 
-        位置交给 `_place` 挑：默认往右长、往下展开；右边不行往左长，下面不行往上
-        长（底边不动）。**这个入口只管不再变宽的那几种**（-1 → 0、永久变大），所以
-        只试「右」——宽度没变，往左往右是同一个位置。
-
-        1) 只把真正挡住的往下让；并排挨着的两块**一起**让到同一条线上；
-        2) 让不开就从下往上把 0 状态盒子收成 -1（卡片不收），腾出地方后贴紧排；
-        3) 上下都放不下就返回 False，调用方抖两下（用户定的「上下都没空间就抖」）。
-
-        remember=True 时把「谁被让到哪儿」记下来（见 `_restore_grow`）：盒子缩
-        回去时按记录吸回来。盒子**永久变大**（拖进图标、改大小）那条路传 False。
+        位置不再靠记录：`_relayout` 先把所有人摆回家，再按新尺寸把挡路的推开，
+        收起时同样按家重算。`target` / `remember` 只为兼容老调用留着。
         """
-        from .box_widget import TITLE_H
-        if target is None:
-            w = win._side_w
-            h = win._side_h + TITLE_H
-        else:
-            w = target.width()
-            h = target.height()
-        try:
-            items = self._snapshot(win)
-            base = win.collapsed_rect()
-        except (RuntimeError, TypeError):
-            return False
-        got = self._place(win, w, h, items, base, sides=("right",))
-        if got is None:
-            return False
-        want, side, up, plan = got
-        try:
-            win._expand_side = side
-            win._grew_up = bool(up)
-            win.set_up(int(win.box.y) - int(want.top()))
-        except (RuntimeError, TypeError, AttributeError):
-            return False
-        _log(f"grow: place {want.left()},{want.top()} {w}x{h} up={up}")
-        self._apply_plan(win, want, plan, remember)
-        return True
+        if self._in_layout:
+            return True
+        return self._relayout(win)
 
     def _expand_room(self, win) -> bool:
-        """展开到 1：先挑位置（右/左 × 下/上），再把挡路的推开。
+        """展开到 1：整张桌面重排一次（展开的面板在 `_relayout` 里占位）。
 
         用户 2026-11-15 定的：**右边没地方就往左长**——编程在屏幕右边，右边是
         时钟卡（贴着屏幕边、推不动），那就往左展开，把左边的收纳盒往左挤，右边
-        两张卡一个像素都不动；上下同理（下面没地方就往上长）。侧面照样推不开就
+        两张卡一个像素都不动；上下同理（下面没地方就往上长）。侧面推不开就
         盖住+模糊。
         """
-        try:
-            m = win._win_margin()
-            size = win._expanded_rect()
-            w = size.width() - 2 * m
-            h = size.height() - 2 * m
-            items = self._snapshot(win)
-            base = win.collapsed_rect()
-        except (RuntimeError, TypeError, AttributeError):
-            return False
-        got = self._place(win, w, h, items, base)
-        if got is None:
-            return False
-        want, side, up, plan = got
-        try:
-            win._expand_side = side
-            win._grew_up = bool(up)
-            win.set_up(int(win.box.y) - int(want.top()))
-        except (RuntimeError, TypeError, AttributeError):
-            return False
-        _log(f"grow: expand side={side} up={up} at {want.left()},{want.top()}")
-        self._apply_plan(win, want, plan, True)
-        return True
+        if self._in_layout:
+            return True
+        return self._relayout()
 
     def _pin_check(self, win) -> bool:
         """勾「常驻展开」之前问一句：四个方向都让得开吗？（只算，绝不动）
@@ -1900,13 +1960,7 @@ class Controller(QObject):
         的待遇。
         """
         try:
-            m = win._win_margin()
-            size = win._expanded_rect()
-            w = size.width() - 2 * m
-            h = size.height() - 2 * m
-            items = self._snapshot(win)
-            base = win.collapsed_rect()
-            got = self._place(win, w, h, items, base, allow_collapse=False)
+            got = self._panel_for(win, allow_collapse=False)
             if got is None:
                 return False
             return not got[3][5]            # 侧面有推不开的就勾不上
@@ -1914,24 +1968,13 @@ class Controller(QObject):
             return True
 
     def _after_grow(self, win) -> None:
-        """盒子自动变大之后：新压住的桌面图标挪出去，挡路的盒子/卡片让开。
-
-        以前只有建盒和拖盒子会清场；盒子里多拖进几个图标、盒子自己长大会直接
-        压在下面的盒子上（用户报的「扩充完重叠」）。
-        """
-        rect = win.collapsed_rect()
+        """盒子自动变大之后：新压住的桌面图标挪出去，挡路的盒子/卡片让开。"""
         try:
             win._push_desktop_icons()
         except Exception:  # noqa: BLE001 - 桌面接口抽风不能挡住别的
             pass
-        # 正下方的：沿用「长高之前先问有没有地方」那套（推下去 / 必要时收横杠）
-        # 这里是盒子**永久变大**（拖进图标 / 改了大小）：邻居该一直让着，别记
-        # 「可以放回来」，也别留着上一次临时长开的旧记录
         try:
-            table = getattr(self, "_grow_saved", None)
-            if table:
-                table.pop(getattr(getattr(win, "box", None), "id", ""), None)
-            self._grow_request(win, rect, remember=False)
+            self._relayout(win)
         except Exception:  # noqa: BLE001
             pass
 
@@ -2522,14 +2565,14 @@ class Controller(QObject):
             px, py = int(x), int(y)
         px, py = self._clamp_box_pos(px, py, w, h)
         win.box.x, win.box.y = px, py
-        self.store.move(win.box, px, py)
+        self.store.place(win.box, px, py)      # 新建的盒子：这儿就是它的家
         win._apply_collapsed_geometry()
         if beside is not None:
             # 「贴边建盒」时如果一圈都占满了，最后还得把新盒子推出去；
             # 重心建盒 / 落在图标上建盒不能这么干——那个位置本来就是目标点
             win._avoid_overlap()
             if (win.box.x, win.box.y) != (px, py):
-                self.store.move(win.box, win.box.x, win.box.y)
+                self.store.place(win.box, win.box.x, win.box.y)
         QTimer.singleShot(0, lambda: self._make_room(win))
         self._sync_ui()
         return win
