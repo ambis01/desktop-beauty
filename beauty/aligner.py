@@ -67,6 +67,68 @@ def main_clash(rect: QRect, others, gap: int) -> QRect | None:
 X_BIAS = 1.25
 
 
+def stop_y(rect: QRect, want_top: int, others, gap: int) -> int | None:
+    """竖直方向挪 rect：想去 want_top，路上被别的矩形挡住就停在它 gap 外。
+
+    挡路只看**横向有交集**的矩形。已经跟谁叠着（距离 < 0）就返回 None —— 这时候
+    动哪儿都还是叠着，用户要的是「距离小于 0 就直接不移动」。挪不动也返回 None。
+    """
+    cur = rect.top()
+    if want_top == cur:
+        return None
+    down = want_top > cur
+    stop = want_top
+    for o in others:
+        if o.left() > rect.right() or o.right() < rect.left():
+            continue
+        if down:
+            if o.top() <= rect.bottom():
+                if o.bottom() >= rect.top():
+                    return None            # 已经叠着
+                continue                   # 在头顶上方：往下走碰不到
+            stop = min(stop, o.top() - gap - 1)
+        else:
+            if o.bottom() >= rect.top():
+                if o.top() <= rect.bottom():
+                    return None            # 已经叠着
+                continue                   # 在下面：往上走碰不到
+            stop = max(stop, o.bottom() + gap + 1)
+    if down and stop <= cur:
+        return None
+    if not down and stop >= cur:
+        return None
+    return stop
+
+
+def stop_x(rect: QRect, want_left: int, others, gap: int) -> int | None:
+    """横向挪 rect：想去 want_left，路上被别的矩形挡住就停在它 gap 外（规则同 stop_y）。"""
+    cur = rect.left()
+    if want_left == cur:
+        return None
+    right = want_left > cur
+    stop = want_left
+    for o in others:
+        if o.top() > rect.bottom() or o.bottom() < rect.top():
+            continue
+        if right:
+            if o.left() <= rect.right():
+                if o.right() >= rect.left():
+                    return None
+                continue
+            stop = min(stop, o.left() - gap - 1)
+        else:
+            if o.right() >= rect.left():
+                if o.left() <= rect.right():
+                    return None
+                continue
+            stop = max(stop, o.right() + gap + 1)
+    if right and stop <= cur:
+        return None
+    if not right and stop >= cur:
+        return None
+    return stop
+
+
 def place_clear(rect: QRect, others, gap: int, clamp,
                 max_shift: int | None = None) -> QRect | None:
     """松手后别叠着：沿**重叠最浅**的那条边推出去。

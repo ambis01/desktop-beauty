@@ -518,6 +518,7 @@ class BoxWidget(GlassWindow):
         self.on_grow_request = None   # 盒子要长高：先问 Controller 有没有地方
         self.on_shrunk = None         # 收到横杠：让下面的东西吸上来
         self.on_collapsed = None      # 收起来（展开 → 收起）：把为它让开的放回去
+        self.on_expanded = None       # 展开了：把正下方挡路的挤开
         self.on_grew = None           # 自动变大之后：把被压住的盒子和桌面图标挪开
         self._grow_pending = False    # 长大了还没清场（拖图标进来时通常还是展开的）
         # 多选：桌面上拉框选中几个盒子，它们一起高亮、一起搬
@@ -857,6 +858,17 @@ class BoxWidget(GlassWindow):
             self.refresh()
             return
         self._dissolve_when_thin()
+
+    def _notify_expanded(self) -> None:
+        """要展开了：让 Controller 把挡路的下方、侧面挤开。"""
+        cb = getattr(self, "on_expanded", None)
+        if cb is None:
+            return
+        try:
+            m = self._win_margin()
+            cb(self, self._expanded_rect().adjusted(m, m, -m, -m))
+        except (RuntimeError, TypeError):
+            pass
 
     def _notify_collapsed(self) -> None:
         """收起来了：让 Controller 把刚才为它让开的东西放回原位。"""
@@ -1485,6 +1497,8 @@ class BoxWidget(GlassWindow):
         self._anim_dur = 0.30 if target else 0.26
         self._anim_rect_from = self.geometry()
         self._anim_rect_to = self._rect_expanded if target else self._rect_collapsed
+        if target:
+            self._notify_expanded()
         self._start_anim()
         # 展开时盯着「有没有点到盒子外面」
         if target:

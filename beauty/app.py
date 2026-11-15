@@ -1027,6 +1027,8 @@ class Controller(QObject):
         win.on_grow_request = self._grow_request
         win.on_shrunk = self._snap_below
         win.on_collapsed = self._restore_grow
+        # 展开（1）：下方 + 侧面都挤开；勾常驻展开之前先问侧面让不让得开
+        win.on_expanded = self._expand_room
         win.on_grew = self._after_grow
         win.on_group = lambda w=win: self._group_for(w)
         win.on_widget_press = self._on_widget_press
@@ -1116,11 +1118,86 @@ class Controller(QObject):
         win._push_anim = anim
         anim.start(QAbstractAnimation.DeleteWhenStopped)
 
+    # ------------------------------------------------------------ 挤开 / 吸附
+    SETTLE_GAP = 10
+
+    def _flat_rect(self, w) -> QRect:
+        """盒子/卡片现在在屏幕上占的那块**玻璃**区域（展开的盒子按展开尺寸算）。"""
+        if hasattr(w, "collapsed_rect"):
+            if getattr(w, "is_expanded", False):
+                m = w._win_margin()
+                return w._expanded_rect().adjusted(m, m, -m, -m)
+            return w.collapsed_rect()
+        return aligner.glass_rect(w)
+
+    def _rects_except(self, skip) -> list[QRect]:
+        out = []
+        for w in self._siblings():
+            try:
+                if not w.isVisible() or any(w is s for s in skip):
+                    continue
+                out.append(self._flat_rect(w))
+            except (RuntimeError, TypeError, AttributeError):
+                continue
+        return out
+
+    def _axis_pos(self, w, is_box: bool, axis: str) -> int:
+        """某一块在某个轴上的位置（玻璃坐标：盒子是 box.x/y，卡片是 card.x/y）。"""
+        if is_box:
+            return w.box.y if axis == "y" else w.box.x
+        return w.card.y if axis == "y" else w.card.x
+
+    def _axis_move(self, w, is_box: bool, axis: str, value: int) -> None:
+        """沿一个轴挪过去（玻璃坐标），带滑动动画。"""
+        if is_box:
+            if axis == "y":
+                w.box.y = value
+                w.store.move(w.box, w.box.x, w.box.y)
+                w.changed.emit()
+                w.slide_to(value)
+            else:
+                w.box.x = value
+                w.store.move(w.box, w.box.x, w.box.y)
+                w.changed.emit()
+                w._apply_collapsed_geometry()
+        else:
+            inset = int(getattr(w, "inset", 0) or 0)
+            if axis == "y":
+                w.card.y = value
+                self.cfg.save()
+                self._slide_widget_to(w, value - inset)
+            else:
+                w.card.x = value
+                self.cfg.save()
+                w.move(value - inset, w.y())
+
+    def _is_below(self, r: QRect, target: QRect) -> bool:
+        """这一块算不算「target 下方」的挡路者（只有下方的会被往下让开）。
+
+        整块在下面 → 是；
+        横向压掉它自己一半以上宽度 → 是（大部分压在 target 底下，整块一起往下让，
+        并排那一行才不会被挤成一上一下）；
+        只擦到一点边 → 不是：那是侧面，侧面不推（用户定的）。
+        """
+        if r.top() >= target.bottom() - 1:
+            return True
+        if r.bottom() <= target.top() + 1:
+            return False
+        overlap = min(r.right(), target.right()) - max(r.left(), target.left()) + 1
+        return overlap * 2 > r.width()
+
+    def _expand_room(self, win, rect) -> bool:
+        """盒子要长到 rect：把正下方的让开（下方带记录，收起来时吸回来）。"""
+        try:
+            return self._grow_request(win, rect)
+        except Exception:  # noqa: BLE001
+            return False
+
     def _remember_grow(self, win, saved, height: int) -> None:
         """记下「盒子长开时把谁让到哪儿了」：缩回去时按这个放回原位。
 
-        saved 里是 (id, 是否盒子, 原来的 y, 让到 y)。同一个盒子的记录会合并：
-        已经记过原来的 y 就不覆盖（第二次长开时，邻居已经不在原位了）。
+        saved 里是 (id, 是否盒子, 轴 "x"/"y", 原来位置, 让到位置)。同一个盒子的记录
+        会合并：已经记过原来的位置就不覆盖（第二次长开时，邻居已经不在原位了）。
 
         height 是**这次为它让出来的那个高度**：缩回去的时候拿盒子当时的收起高度
         跟它比——展开完点到外面只会落回 0（一样大），那不算缩回去，不能还原。
@@ -1134,14 +1211,14 @@ class Controller(QObject):
             table[win.box.id] = [int(height), entries]
         else:
             entries = got[1]
-        have = {entry[0]: entry for entry in entries}
-        for ident, is_box, old_y, new_y in saved:
-            got = have.get(ident)
-            if got is not None:
-                if abs(got[2] - old_y) <= 1:
-                    got[3] = new_y
+        have = {(entry[0], entry[2]): entry for entry in entries}
+        for ident, is_box, axis, old, new in saved:
+            entry = have.get((ident, axis))
+            if entry is not None:
+                if abs(entry[3] - old) <= 1:
+                    entry[4] = new
                 continue
-            entries.append([ident, is_box, old_y, new_y])
+            entries.append([ident, is_box, axis, old, new])
 
     def _restore_grow(self, win) -> bool:
         """盒子**真的缩回去**了：把刚才为它让开的东西按记录放回原位。
@@ -1149,7 +1226,8 @@ class Controller(QObject):
         「真的缩回去」= 现在的收起高度比当初让出来的那个高度小。展开完点一下
         盒子外面只是落回 0（跟长开时一样大），邻居还得让着，这时候还原就压住了。
 
-        用户自己挪过的（不在当初让到的位置）不动——那是他的意思，不抢。
+        放的时候带距离检测：路上被别的盒子/卡片挡住就停在它 gap 外，已经叠着的不动
+        （所以「展开时覆盖住的侧面东西」不会被拽到别处）。用户自己挪过的不抢。
         """
         table = getattr(self, "_grow_saved", None)
         if not table:
@@ -1166,67 +1244,67 @@ class Controller(QObject):
         if cur_h >= rec_h - 1:
             return False          # 还是当初那个大小：不算缩回去，记录留着
         table.pop(key, None)
+        gap = self.SETTLE_GAP
         back = 0
-        for ident, is_box, old_y, new_y in entries:
+        for ident, is_box, axis, old, new in entries:
             other = (self.windows.get(ident) if is_box
                      else self.card_widgets.get(ident))
             if other is None:
                 continue
             try:
-                if is_box:
-                    if abs(other.box.y - new_y) > 2:
-                        continue
-                    other.box.y = old_y
-                    other.store.move(other.box, other.box.x, other.box.y)
-                    other.changed.emit()
-                    other.slide_to(old_y)
-                else:
-                    if abs((other.card.y - other.inset) - new_y) > 2:
-                        continue
-                    other.card.y = old_y + other.inset
-                    self.cfg.save()
-                    self._slide_widget_to(other, old_y)
-            except (RuntimeError, OSError, TypeError):
+                if abs(self._axis_pos(other, is_box, axis) - new) > 2:
+                    continue                      # 用户挪过：不抢
+                rect = self._flat_rect(other)
+                # 把「正在收起来的这个盒子」也算障碍：它可能只收小了一级（1 → 0），
+                # 邻居原来的位置已经在它下面了，直接放回去会压住
+                others = self._rects_except([other])
+                stop = (aligner.stop_y(rect, old, others, gap) if axis == "y"
+                        else aligner.stop_x(rect, old, others, gap))
+                if stop is None:
+                    continue                      # 会让到别人身上：停在原地
+                self._axis_move(other, is_box, axis, stop)
+            except (RuntimeError, OSError, TypeError, AttributeError):
                 continue
             back += 1
         if back:
-            _log("grow: restore %d/%d", back, len(entries))
+            _log(f"grow: restore {back}/{len(entries)}")
         return back > 0
 
     def _snap_below(self, win, freed: int) -> None:
-        """盒子收成横杠：先按记录把刚才挤开的放回原位，没有记录再让下面的吸上来。"""
+        """盒子收成横杠：先按记录把挤开的放回去；没有记录就让下面的吸上来。
+
+        吸的时候带距离检测：上面有别的盒子/卡片挡着就停在它 gap 外，已经叠着的
+        一动不动（用户要的「距离小于等于空隙就停下 / 小于 0 就不移动」）。
+        """
         if self._restore_grow(win):
             return
         if freed <= 0:
             return
-        top = win.box.y + win._collapsed_h()
-        GAP = 10
+        gap = self.SETTLE_GAP
+        try:
+            box_rect = win.collapsed_rect()
+        except (RuntimeError, TypeError, AttributeError):
+            return
+        want = box_rect.bottom() + 1 + gap
         for other in self._siblings():
-            if other is win or not other.isVisible():
-                continue
-            is_box = hasattr(other, "collapsed_rect")
-            try:
-                rect = other.frameGeometry()
-            except (RuntimeError, TypeError):
-                continue
-            if rect.top() < top - 4:
-                continue
-            if rect.right() < win.box.x or rect.left() > win.box.x + win._side_w:
-                continue
-            ny = max(top + GAP, rect.top() - freed)
-            if ny >= rect.top():
+            if other is win:
                 continue
             try:
-                if is_box:
-                    other.box.y = ny
-                    other.store.move(other.box, other.box.x, other.box.y)
-                    other.changed.emit()
-                    other.slide_to(ny)
-                else:
-                    other.card.y = ny + other.inset
-                    self.cfg.save()
-                    self._slide_widget_to(other, ny)
-            except (RuntimeError, OSError, TypeError):
+                if not other.isVisible():
+                    continue
+                rect = self._flat_rect(other)
+            except (RuntimeError, TypeError, AttributeError):
+                continue
+            if rect.top() < box_rect.top() - 1:
+                continue
+            if not (rect.left() <= box_rect.right() and rect.right() >= box_rect.left()):
+                continue
+            try:
+                stop = aligner.stop_y(rect, want, self._rects_except([win, other]), gap)
+                if stop is None:
+                    continue
+                self._axis_move(other, hasattr(other, "collapsed_rect"), "y", stop)
+            except (RuntimeError, OSError, TypeError, AttributeError):
                 continue
 
     def _grow_request(self, win, target, remember: bool = True) -> bool:
@@ -1259,7 +1337,7 @@ class Controller(QObject):
                 continue
             if rect.right() < target.left() or rect.left() > target.right():
                 continue
-            if rect.top() < target.top():
+            if not self._is_below(rect, target):
                 continue
             row.append([rect.top(), is_box, other, rect])
         row.sort(key=lambda item: item[0])
@@ -1313,17 +1391,17 @@ class Controller(QObject):
             for other, is_box, ny in moves:
                 try:
                     if is_box:
-                        saved.append((other.box.id, True, other.box.y, ny))
+                        saved.append((other.box.id, True, "y", other.box.y, ny))
                         other.box.y = ny
                         other.store.move(other.box, other.box.x, other.box.y)
                         other.changed.emit()
                         other.slide_to(ny)
                     else:
-                        saved.append((getattr(other.card, "id", ""), False,
-                                      other.card.y - other.inset, ny))
-                        other.card.y = ny + other.inset
+                        saved.append((getattr(other.card, "id", ""), False, "y",
+                                      other.card.y, ny))
+                        other.card.y = ny
                         self.cfg.save()
-                        self._slide_widget_to(other, ny)
+                        self._slide_widget_to(other, ny - int(other.inset or 0))
                 except (RuntimeError, OSError, TypeError):
                     continue
             if saved and remember:
@@ -1357,7 +1435,6 @@ class Controller(QObject):
         以前只有建盒和拖盒子会清场；盒子里多拖进几个图标、盒子自己长大会直接
         压在下面的盒子上（用户报的「扩充完重叠」）。
         """
-        gap = 10
         rect = win.collapsed_rect()
         try:
             win._push_desktop_icons()
@@ -1373,42 +1450,6 @@ class Controller(QObject):
             self._grow_request(win, rect, remember=False)
         except Exception:  # noqa: BLE001
             pass
-        # 左右两侧的：往右让（_grow_request 只看正下方那一列）
-        self._shift_sideways(win, rect, gap)
-
-    def _shift_sideways(self, win, rect, gap: int) -> None:
-        """把被新尺寸压住、且在上半侧的盒子/卡片整体往右让开。"""
-        scr = win.screen() or self.app.primaryScreen()
-        avail = scr.availableGeometry() if scr is not None else rect
-        for other in self._siblings():
-            if other is win or not other.isVisible():
-                continue
-            is_box = hasattr(other, "collapsed_rect")
-            try:
-                r = (other.collapsed_rect() if is_box and not other.is_expanded
-                     else other.frameGeometry())
-            except (RuntimeError, TypeError):
-                continue
-            if r.top() >= rect.top():
-                continue          # 在正下方：交给 _grow_request
-            if not r.adjusted(-gap, -gap, gap, gap).intersects(rect):
-                continue
-            nx = rect.right() + gap + 1
-            if nx + r.width() > avail.right() + 1:
-                continue          # 右边放不下：宁可压着，也别把它推到屏幕外
-            try:
-                if is_box:
-                    other.box.x = nx
-                    other.store.move(other.box, nx, other.box.y)
-                    other._apply_collapsed_geometry()
-                else:
-                    # 卡片的 card.x 是玻璃坐标：窗口 x = 玻璃 x - inset
-                    other.card.x = nx + other.inset
-                    other.move(nx, r.top())
-                    self.cfg.save()
-            except (RuntimeError, OSError, TypeError):
-                continue
-            _log("grow: shift right %s", getattr(getattr(other, "box", None), "id", "card"))
 
     # ------------------------------------------------------------ 窗口层级
     def _z_windows(self) -> list:
