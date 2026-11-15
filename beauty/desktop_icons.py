@@ -819,8 +819,10 @@ _INDEX_CACHE: tuple[float, dict[str, Path]] | None = None
 
 
 def desktop_index() -> dict[str, Path]:
-    """显示名（小写）→ 真实路径。桌面会藏掉 .lnk 后缀，所以同时登记 stem。
+    """显示名（小写）→ 真实路径。
 
+    资源管理器会藏掉「已知文件类型」的后缀（.lnk / .url / .doc / .txt / .png …），
+    所以 name 和 stem 都要登记；快捷方式只是其中一例，普通文件同样要认。
     拖拽时每 20ms 就要查一次，做个 0.5 秒的缓存，避免反复列目录。
     """
     global _INDEX_CACHE
@@ -835,7 +837,7 @@ def desktop_index() -> dict[str, Path]:
             continue
         for p in entries:
             index.setdefault(p.name.lower(), p)
-            if p.suffix.lower() in (".lnk", ".url"):
+            if p.is_file():
                 index.setdefault(p.stem.lower(), p)
     _INDEX_CACHE = (now, index)
     return index
@@ -876,12 +878,12 @@ def find_desktop_copy(name: str) -> Path | None:
 
 
 def item_at_screen(x: int, y: int) -> tuple[int, str, Path | None]:
-    """屏幕坐标下命中的图标：索引、显示名、可收纳的快捷方式路径。"""
+    """屏幕坐标下命中的图标：索引、显示名、可收纳路径（普通文件也算，目录不算）。"""
     idx = hit_test(x, y)
     if idx < 0:
         return -1, "", None
     name = icon_name(idx)
     path = resolve_item(name) if name else None
-    if path is not None and path.suffix.lower() not in (".lnk", ".url"):
+    if path is not None and not path.is_file():
         path = None
     return idx, name, path

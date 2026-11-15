@@ -22,6 +22,8 @@ from .shortcut import make_clsid_link
 
 BOX_ROOT = DATA_DIR / "boxes"
 INDEX_PATH = DATA_DIR / "boxes.json"
+# 桌面的显示名会藏掉这些后缀（资源管理器「隐藏已知文件类型的扩展名」），
+# 按显示名找文件时要同时认 name 和 stem。
 SHORTCUT_EXT = (".lnk", ".url")
 DEBUG = bool(os.environ.get("DESKBEAUTY_DEBUG"))
 
@@ -38,13 +40,16 @@ def _log(msg: str, *args) -> None:
 
 
 def _acceptable(src: Path) -> bool:
-    """只有快捷方式文件才允许被收纳。目录一律拒绝，程序自己的数据也不许碰。"""
+    """能收进盒子的东西：任意普通文件，目录一律拒绝，程序自己的数据也不许碰。
+
+    以前这里只放行 `.lnk` / `.url`，桌面上的文档、图片、压缩包拖进来会被静默
+    吞掉（用户报的「只适配了图标，桌面上的文件不适配」）。现在文件都收：拖动是
+    `shutil.move`，同一个卷上就是一次 rename，跟文件大小无关；换卷才会真的拷贝。
+    """
     try:
         if not src.is_absolute() or not src.name:
             return False
         if not src.is_file():
-            return False
-        if src.suffix.lower() not in SHORTCUT_EXT:
             return False
         # 盒子之间互相搬图标是正常操作，所以盒子目录里的文件要放行；
         # 但 DATA_DIR 底下别的（配置 / 日志 / 图标缓存）绝对不许进来。
@@ -55,6 +60,14 @@ def _acceptable(src: Path) -> bool:
     except OSError:
         return False
     return True
+
+
+def acceptable(path) -> bool:
+    """给别的模块用（app / dragwatch 判断「这一项能不能收」）：接受 str / Path。"""
+    try:
+        return _acceptable(Path(str(path)))
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass
@@ -388,10 +401,10 @@ class BoxStore:
             pass
         # 放回桌面的文件要立刻长出图标，否则空等 explorer 批量刷新，看着像没反应
         di.notify_created(moved)
-        # .lnk 刚从盒子目录搬回来，explorer 偶尔按旧路径缓存画成一张白纸，
-        # 再发一次「这一项变了」逼它重读图标（`_land_restored` 踩过同样的坑）
-        if moved.suffix.lower() in (".lnk", ".url"):
-            di.notify_updated(moved)
+        # 刚从盒子目录搬回来，explorer 偶尔按旧路径缓存画成一张白纸，
+        # 再发一次「这一项变了」逼它重读图标（`_land_restored` 踩过同样的坑）。
+        # 以前只对 .lnk/.url 发，普通文件（.doc/图片/folder）同样会白，所以全都发。
+        di.notify_updated(moved)
         box.order = [n for n in box.order if n != path.name]
         box.origins.pop(path.name, None)
         # 理论上 remove_to 不会被用来放回系统图标（走 restore_ns），这里兜一下：

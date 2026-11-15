@@ -375,73 +375,194 @@ def _replace_with_fixed(path, ico) -> bool:
     return True
 
 
+def _ensure_ico(src: str) -> Path | None:
+    """取 src 的图标 → 裁透明边 → 补正方形 → 落成内容哈希命名的 .ico。
+
+    返回 .ico 路径；取不到像样的图（空图/白纸/太小）返回 None。
+    内容哈希做文件名：内容一变就是新路径，绕开 explorer 按路径缓存的图标库。
+    """
+    import hashlib
+
+    from .config import DATA_DIR
+
+    img = _square_ink(src)
+    if img is None or _looks_blank(img):
+        return None
+    data = _ico_bytes(img)
+    if data is None:
+        return None
+    out = DATA_DIR / "icons" / "lnk" / (hashlib.sha1(data).hexdigest()[:16] + ".ico")
+    if not out.exists():
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+        except OSError:
+            return None
+    return out
+
+
+def ico_ink_ratio(path) -> float:
+    """一个 .ico 的「有内容部分 / 整张画布」比例（1.0 = 画满）。
+
+    小于 1 说明它是「大画布套小图」：explorer 会把整块画布缩到格子里显示，
+    图标看起来就只有内容那么大。读不出来返回 0。
+    """
+    from pathlib import Path
+
+    p = Path(str(path))
+    img = None
+    try:                                  # Qt 自带 ico 解码：BMP / PNG 条目都认
+        img = QImage(str(p))
+    except Exception:  # noqa: BLE001
+        img = None
+    if img is None or img.isNull():
+        try:                              # 退路：自己写的 .ico 是单条目 PNG
+            import struct
+            data = p.read_bytes()
+            n = struct.unpack("<I", data[14:18])[0]
+            img = QImage.fromData(data[22:22 + n], "PNG")
+        except Exception:  # noqa: BLE001
+            return 0.0
+    if img is None or img.isNull() or img.width() <= 0:
+        return 0.0
+    bbox = _ink_bbox(img.convertToFormat(QImage.Format_ARGB32))
+    if bbox is None:
+        return 0.0
+    return max(bbox.width(), bbox.height()) / float(img.width())
+
+
+def _fix_url_icon(p) -> bool:
+    """修 `.url`（Steam 那种游戏快捷方式）的图标。
+
+    `.url` 不是二进制快捷方式，图标写在文本的 `IconFile=` 那行。Steam 生成的
+    `.ico` 有些是「大画布套小图」——底特律：化身为人那个缓存 ico 实测内容只占
+    20%，桌面上就是一个看不清的小点。这里按内容重新生成一份填满画布的 .ico，
+    只改 `IconFile=` / 补 `IconIndex=0`，`URL=` 一个字不动。
+    """
+    from pathlib import Path
+
+    try:
+        raw = p.read_bytes()
+    except OSError:
+        return False
+    if raw[:2] == b"\xff\xfe" or raw[:2] == b"\xfe\xff":
+        enc = "utf-16"
+    elif raw[:3] == b"\xef\xbb\xbf":
+        enc = "utf-8-sig"
+    else:
+        enc = "mbcs"                      # 中文 Windows 上 Steam / 浏览器写的是 ANSI
+    try:
+        text = raw.decode(enc)
+    except (UnicodeDecodeError, LookupError):
+        return False
+    nl = "\r\n" if "\r\n" in text else "\n"
+    trailing = text.endswith(("\n", "\r"))
+    lines = text.splitlines()
+    where = None
+    cur = ""
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.lower().startswith("iconfile="):
+            where = i
+            cur = s.split("=", 1)[1].strip().strip('"')
+            break
+    if where is None or not cur:
+        return False                      # 没写图标来源：无从下手（那是系统按扩展名给的）
+    src = Path(cur)
+    if not src.is_file():
+        return False
+    if src.suffix.lower() == ".ico" and ico_ink_ratio(src) >= 0.9:
+        return False                      # 这张本来就画满了，别折腾用户的文件
+    out = _ensure_ico(str(src))
+    if out is None:
+        return False
+    try:
+        if src.resolve() == out.resolve():
+            return False                  # 已经是我们这份
+    except OSError:
+        pass
+    lines[where] = f"IconFile={out}"
+    if not any(ln.strip().lower().startswith("iconindex=") for ln in lines):
+        lines.append("IconIndex=0")
+    try:
+        p.write_bytes((nl.join(lines) + (nl if trailing else "")).encode(enc))
+    except OSError:
+        return False
+    try:
+        from . import desktop_icons as _di
+        _di.notify_updated(p)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def _fix_lnk_icon(p) -> bool:
+    from pathlib import Path
+
+    from . import shortcut
+    from .config import DATA_DIR
+
+    loc = shortcut.icon_location(p)
+    if loc is None:
+        return False
+    icon_file, _index = loc
+    icons_root = (DATA_DIR / "icons").resolve()
+    if icon_file:
+        ip = Path(icon_file)
+        if ip.suffix.lower() in (".ico", ".png", ".bmp"):
+            try:
+                rp = ip.resolve()
+            except OSError:
+                rp = ip
+            if rp != icons_root and icons_root not in rp.parents:
+                return False        # 用户自己指定的图标文件，别抢
+        # 指向 .exe / .dll（或者空）只是「用程序自己的图标」，可以接手
+    target = shortcut.target_of(p)
+    out = _ensure_ico(str(target) if target else str(p))
+    if out is None:
+        return False
+    if icon_file and str(Path(icon_file)).lower() == str(out).lower():
+        return False                # 已经指着这一份了
+    if not shortcut.set_icon_location(p, out, 0):
+        # 管理员装出来的快捷方式，普通用户只有「删除」权限，内容改不了。
+        # 那就照内容复制一份（新文件继承桌面目录的权限）→ 删原文件 → 挪回来。
+        if not _replace_with_fixed(p, out):
+            return False
+    try:
+        from . import desktop_icons as _di
+        _di.notify_updated(p)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 def fix_shortcut_icon(lnk) -> bool:
-    """给 .lnk 换上一个「我们保证画得对」的图标文件，返回有没有动它。
+    """桌面条目回到桌面之前，修一下「图标从哪儿来」，返回有没有动它。
 
     三个用户报过的 bug 都出在「图标从哪儿来」：
     1. 快捷方式没写死 IconLocation（NVIDIA App）：explorer 自己从目标 exe
        抠图标会失败，画成一张白纸；
     2. 写死成「用 exe 自己的图标」（QQ音乐 → `QQMusic.exe,0`）：那个 exe 又大又
        慢，批量刷新时 explorer 抠不出来，同样先画成白纸（白纸会一直挂着）；
-    3. 抠出来的是「256 画布套 50px 小图」（无畏契约）：整张写进 .ico，explorer
-       缩到 48px 显示就成了小人国。
+    3. 抠出来的是「256 画布套 50px 小图」（无畏契约、Steam 的 .url 也中招）：
+       整张写进 .ico，explorer 缩到 48px 显示就成了小人国。
 
-    所以统一处理：抠图 → 裁透明边 → 补正方形 → 写成 .ico（文件名 = **内容哈希**，
-    内容一变就是新路径，顺手绕开 explorer 那个按路径缓存的图标库）→ 把 .lnk 指过去。
-    目标、参数、工作目录一概不动；用户自己挑过 .ico / .png 的不碰。
+    所以统一处理：抠图 → 裁透明边 → 补正方形 → 写成 .ico（文件名 = **内容哈希**）→
+    把图标来源指过去。`.lnk` 走 IShellLink，`.url` 改 `IconFile=` 那行；目标、参数、
+    URL 一概不动，用户自己挑过 .ico / .png 的也不碰。
     """
     from pathlib import Path
 
-    from . import shortcut
-    from .config import DATA_DIR
-
     try:
         p = Path(str(lnk))
-        if p.suffix.lower() != ".lnk" or not p.is_file():
+        if not p.is_file():
             return False
-        loc = shortcut.icon_location(p)
-        if loc is None:
-            return False
-        icon_file, _index = loc
-        icons_root = (DATA_DIR / "icons").resolve()
-        if icon_file:
-            ip = Path(icon_file)
-            if ip.suffix.lower() in (".ico", ".png", ".bmp"):
-                try:
-                    rp = ip.resolve()
-                except OSError:
-                    rp = ip
-                if rp != icons_root and icons_root not in rp.parents:
-                    return False    # 用户自己指定的图标文件，别抢
-            # 指向 .exe / .dll（或者空）只是「用程序自己的图标」，可以接手
-        target = shortcut.target_of(p)
-        img = _square_ink(str(target) if target else str(p))
-        if img is None or _looks_blank(img):
-            return False
-        data = _ico_bytes(img)
-        if data is None:
-            return False
-        import hashlib
-        out = DATA_DIR / "icons" / "lnk" / (hashlib.sha1(data).hexdigest()[:16] + ".ico")
-        if not out.exists():
-            try:
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_bytes(data)
-            except OSError:
-                return False
-        if icon_file and str(Path(icon_file)).lower() == str(out).lower():
-            return False            # 已经指着这一份了
-        if not shortcut.set_icon_location(p, out, 0):
-            # 管理员装出来的快捷方式，普通用户只有「删除」权限，内容改不了。
-            # 那就照内容复制一份（新文件继承桌面目录的权限）→ 删原文件 → 挪回来。
-            if not _replace_with_fixed(p, out):
-                return False
-        try:
-            from . import desktop_icons as _di
-            _di.notify_updated(p)
-        except Exception:  # noqa: BLE001
-            pass
-        return True
+        suffix = p.suffix.lower()
+        if suffix == ".url":
+            return _fix_url_icon(p)
+        if suffix != ".lnk":
+            return False            # 普通文件（.doc/.txt/…）的图标按扩展名来，不归我们改
+        return _fix_lnk_icon(p)
     except Exception:  # noqa: BLE001 - 图标修补失败绝不能影响放回桌面
         return False
 

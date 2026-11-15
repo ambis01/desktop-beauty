@@ -21,6 +21,7 @@ from PySide6.QtCore import QObject, QPoint, QRect, QTimer, Signal
 
 from . import desktop_icons as di
 from . import ns_items
+from .boxes import acceptable as boxable
 
 DEBUG = bool(os.environ.get("DESKBEAUTY_DEBUG"))
 
@@ -404,11 +405,11 @@ class DragWatcher(QObject):
         self._cache_ok = True
 
     def _path_for(self, name: str) -> str | None:
-        """显示名 → 可收纳的路径：快捷方式真实路径，或系统图标的 `ns::{CLSID}`。"""
+        """显示名 → 可收纳的路径：普通文件（含快捷方式）的真实路径，或系统图标的 `ns::{CLSID}`。"""
         if not name:
             return None
         p = di.resolve_item(name)
-        if p is not None and p.suffix.lower() in (".lnk", ".url"):
+        if p is not None and boxable(p):
             return str(p)
         clsid = ns_items.clsid_for(name)
         if not clsid or ns_items.is_excluded(clsid):

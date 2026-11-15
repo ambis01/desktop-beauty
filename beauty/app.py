@@ -31,7 +31,7 @@ from .box_widget import (
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
     user32 as box_user32,
 )
-from .boxes import BoxStore
+from .boxes import BoxStore, acceptable as boxable
 from .calendar_widget import CalendarWidget
 from .clock_widget import ClockWidget
 from .config import DATA_DIR, CardData, Config, ensure_dirs
@@ -1574,8 +1574,8 @@ class Controller(QObject):
     def _on_merged(self, rect, src: str, dst: str) -> None:
         """两个图标被拖到一起了。
 
-        src/dst 可能是：桌面上真实的 .lnk/.url 文件，或者 `ns::{CLSID}`
-        ——后者是此电脑/回收站/控制面板这类命名空间项（不是文件）。
+        src/dst 可能是：桌面上的普通文件（快捷方式、文档、图片…都算），
+        或者 `ns::{CLSID}`——后者是此电脑/回收站/控制面板这类命名空间项（不是文件）。
         """
         files: list[Path] = []
         nss: list[str] = []
@@ -1584,7 +1584,7 @@ class Controller(QObject):
                 nss.append(ns_items.clsid_of(raw))
                 continue
             p = Path(raw)
-            if not (p.is_file() and p.suffix.lower() in (".lnk", ".url")):
+            if not boxable(p):
                 return
             files.append(p)
         if not files and not nss:
@@ -1618,7 +1618,7 @@ class Controller(QObject):
             target = Path(str(target_path))
         except (TypeError, ValueError):
             return
-        if not target.is_file() or target.suffix.lower() not in (".lnk", ".url"):
+        if not target.is_file() or not boxable(target):
             return
         # 松手那一刻 explorer 会先把拖出来的文件放到桌面，它慢半拍才落地，
         # 所以这里跟 _land_restored 一样等一会儿再找。
@@ -1661,7 +1661,7 @@ class Controller(QObject):
             if rect is not None:
                 rects.append(rect)
             p = di.resolve_item(name)
-            if p is not None and p.suffix.lower() in (".lnk", ".url"):
+            if p is not None and boxable(p):
                 files.append(str(p))
                 continue
             clsid = ns_items.clsid_for(name)
