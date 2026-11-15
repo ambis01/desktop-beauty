@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
+from .boxes import _name_key
 from .controls import ColorSwatches, GlassCheck, GlassCombo, ThemePicker
 from .glass import GlassMenu, GlassWindow, paint_frost, round_corners
 from .hotkey import (
@@ -297,6 +298,18 @@ class SettingsWindow(GlassWindow):
         self.edit_search.textChanged.connect(self._on_box_search)
         col.addWidget(self.edit_search)
 
+        sort_row = QHBoxLayout()
+        sort_row.setContentsMargins(0, 0, 0, 0)
+        sort_row.setSpacing(u(8))
+        sort_row.addWidget(self._row_label(tr("boxes.sort")))
+        self.cmb_box_sort = GlassCombo(
+            [(tr("boxes.sort.name"), "name"), (tr("boxes.sort.size"), "size"),
+             (tr("boxes.sort.created"), "created")],
+            light=not self._dark)
+        self.cmb_box_sort.changed.connect(self._on_box_sort)
+        sort_row.addWidget(self.cmb_box_sort, 1)
+        col.addLayout(sort_row)
+
         empty = QLabel(tr("boxes.empty"))
         empty.setObjectName("empty")
         self.lbl_boxes_empty = empty
@@ -408,6 +421,24 @@ class SettingsWindow(GlassWindow):
     def _on_box_search(self, _text: str) -> None:
         self._rebuild_boxes()
 
+    def _on_box_sort(self, key) -> None:
+        if self._building:
+            return
+        self.ctrl.set_box_sort(str(key or "name"))
+        self._rebuild_boxes()
+
+    def _sorted_boxes(self, boxes: list) -> list:
+        """面板里的收纳盒排序：名称 / 图标数量（多的在前）/ 创建时间（早的在前）。"""
+        mode = str(getattr(self.ctrl.cfg, "box_sort", "name") or "name")
+        if mode == "size":
+            return sorted(boxes, key=lambda b: (-len(self._box_items(b)),
+                                                _name_key(str(b.name))))
+        if mode == "created":
+            return sorted(boxes,
+                          key=lambda b: (float(getattr(b, "created", 0.0) or 0.0),
+                                         _name_key(str(b.name))))
+        return sorted(boxes, key=lambda b: _name_key(str(b.name)))
+
     def _rebuild_boxes(self) -> None:
         holder = getattr(self, "_boxes_box", None)
         if holder is None:
@@ -418,7 +449,7 @@ class SettingsWindow(GlassWindow):
         if edit is not None:
             query = edit.text().strip().casefold()
         shown = 0
-        boxes = list(self.ctrl.store.boxes)
+        boxes = self._sorted_boxes(list(self.ctrl.store.boxes))
         if query:
             for data in boxes:
                 for path in self._box_items(data):
@@ -880,6 +911,7 @@ class SettingsWindow(GlassWindow):
         self.picker.set_dark(self._dark)
         self.cmb_scheme.set_light(not self._dark)
         self.cmb_lang.set_light(not self._dark)
+        self.cmb_box_sort.set_light(not self._dark)
         self.update()
 
     def _toggle_theme(self) -> None:
@@ -1035,6 +1067,8 @@ class SettingsWindow(GlassWindow):
             self.chk_box_merge_bar.setChecked(
                 bool(getattr(cfg, "box_merge_bar", False)))
             self.picker.set_current(str(getattr(cfg, "panel_theme", "light")))
+            self.cmb_box_sort.set_current_data(
+                str(getattr(cfg, "box_sort", "name") or "name"))
             codes = [c for c, _ in LANGS]
             cur = str(getattr(cfg, "lang", "zh") or "zh")
             self.cmb_lang.set_items([(lang_label(c), c) for c in codes],

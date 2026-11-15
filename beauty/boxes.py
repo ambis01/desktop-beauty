@@ -209,6 +209,8 @@ class BoxData:
     bar: bool = False
     # 收起尺寸：auto = 跟着图标数量长（默认），否则是固定格子 "2x2"/"3x3"/...
     size: str = "auto"
+    # 建盒时间（epoch 秒），面板里「按创建时间排序」用；老数据没有就退回目录时间
+    created: float = 0.0
 
 
 def _name_key(name: str) -> tuple:
@@ -305,10 +307,19 @@ class BoxStore:
                     pinned=bool(item.get("pinned", False)),
                     bar=bool(item.get("bar", False)),
                     size=str(item.get("size", "auto") or "auto"),
+                    created=float(item.get("created", 0.0) or 0.0),
                 ))
             except (KeyError, TypeError, ValueError):
                 continue
         self.boxes = boxes
+        # 老配置没有 created：拿盒子目录的时间顶上（面板里按创建时间排序才有意义）
+        for box in self.boxes:
+            if box.created:
+                continue
+            try:
+                box.created = BOX_ROOT.joinpath(box.id).stat().st_mtime
+            except OSError:
+                box.created = 0.0
 
     def save(self) -> None:
         ensure_dirs()
@@ -340,7 +351,8 @@ class BoxStore:
 
     # ---------- 增删 ----------
     def create(self, name: str, x: int, y: int, paths=()) -> BoxData:
-        box = BoxData(id=uuid.uuid4().hex[:8], name=name or "收纳盒", x=int(x), y=int(y))
+        box = BoxData(id=uuid.uuid4().hex[:8], name=name or "收纳盒", x=int(x),
+                      y=int(y), created=time.time())
         self.boxes.append(box)
         self.box_dir(box, create=True)
         self.add_paths(box, paths)

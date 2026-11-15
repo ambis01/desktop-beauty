@@ -94,6 +94,7 @@ class Config:
     auto_align: bool = True               # 自适应对齐：拖动卡片时自动避让 / 贴边
     box_merge: bool = True                # 允许把一个收纳盒拖到另一个上面合并
     box_merge_bar: bool = False           # 两个都只剩横杠（状态 -1）的盒子也能互相合并
+    box_sort: str = "name"                # 面板里收纳盒列表的排序：name / size / created
     lang: str = "zh"                      # 界面语言：zh / en
     hide_fullscreen: bool = True         # 全屏应用（游戏/视频）时把所有卡片藏起来
     # 全局快捷键（mods 位掩码 + vk 虚拟键码），面板的快捷键页里改
@@ -153,6 +154,8 @@ class Config:
         cfg.auto_align = bool(raw.get("auto_align", True))
         cfg.box_merge = bool(raw.get("box_merge", True))
         cfg.box_merge_bar = bool(raw.get("box_merge_bar", False))
+        sort = str(raw.get("box_sort", "name") or "name")
+        cfg.box_sort = sort if sort in ("name", "size", "created") else "name"
         cfg.lang = str(raw.get("lang", "zh") or "zh")
         cfg.hide_fullscreen = bool(raw.get("hide_fullscreen", True))
         cfg.hotkey_panel = normalize(raw.get("hotkey_panel") or {}, DEFAULT_PANEL)
@@ -217,6 +220,7 @@ class Config:
             "auto_align": bool(self.auto_align),
             "box_merge": bool(self.box_merge),
             "box_merge_bar": bool(self.box_merge_bar),
+            "box_sort": str(self.box_sort),
             "lang": str(self.lang),
             "hide_fullscreen": bool(self.hide_fullscreen),
             "hotkey_panel": dict(self.hotkey_panel),

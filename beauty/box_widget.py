@@ -517,6 +517,7 @@ class BoxWidget(GlassWindow):
         self.allow_bar_merge = False   # 两个都是横杠（-1）时也不许并？默认不许
         self.on_grow_request = None   # 盒子要长高：先问 Controller 有没有地方
         self.on_shrunk = None         # 收到横杠：让下面的东西吸上来
+        self.on_collapsed = None      # 收起来（展开 → 收起）：把为它让开的放回去
         self.on_grew = None           # 自动变大之后：把被压住的盒子和桌面图标挪开
         self._grow_pending = False    # 长大了还没清场（拖图标进来时通常还是展开的）
         # 多选：桌面上拉框选中几个盒子，它们一起高亮、一起搬
@@ -856,6 +857,16 @@ class BoxWidget(GlassWindow):
             self.refresh()
             return
         self._dissolve_when_thin()
+
+    def _notify_collapsed(self) -> None:
+        """收起来了：让 Controller 把刚才为它让开的东西放回原位。"""
+        cb = getattr(self, "on_collapsed", None)
+        if cb is None:
+            return
+        try:
+            cb(self)
+        except (RuntimeError, TypeError):
+            pass
 
     def _flush_grow(self) -> None:
         """自动变大之后清场：让 Controller 把新压住的盒子、卡片、桌面图标挪开。
@@ -1465,6 +1476,7 @@ class BoxWidget(GlassWindow):
         if not target:
             # 变大的那一刻如果还展开着，清场推迟到这儿：现在盒子要落回新尺寸了
             self._flush_grow()
+            self._notify_collapsed()
         # 收放都是「两头慢、中间快」：起步有加速、落地有缓冲，看着是滑过去
         # 而不是「啪」地弹开（OutQuint 起手太猛、尾巴太长，容易觉得先冲后顿）
         self._anim_field = "t"

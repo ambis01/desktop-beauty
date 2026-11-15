@@ -116,6 +116,8 @@ class Controller(QObject):
             pass
         self.store = BoxStore()
         self.windows: dict[str, BoxWidget] = {}
+        # 盒子临时长开时把谁让到哪儿了：缩回去要放回原位（见 _restore_grow）
+        self._grow_saved: dict[str, list[list]] = {}
         self.card_widgets: dict[str, ClockWidget] = {}
         self.settings = None
         # 撤销栈：按建盒顺序记盒子 id，面板「撤销上次建盒」一次弹一个
@@ -1024,6 +1026,7 @@ class Controller(QObject):
         win.on_drag_preview = self._on_drag_preview
         win.on_grow_request = self._grow_request
         win.on_shrunk = self._snap_below
+        win.on_collapsed = self._restore_grow
         win.on_grew = self._after_grow
         win.on_group = lambda w=win: self._group_for(w)
         win.on_widget_press = self._on_widget_press
@@ -1113,8 +1116,67 @@ class Controller(QObject):
         win._push_anim = anim
         anim.start(QAbstractAnimation.DeleteWhenStopped)
 
+    def _remember_grow(self, win, saved) -> None:
+        """记下「盒子长开时把谁让到哪儿了」：缩回去时按这个放回原位。
+
+        saved 里是 (id, 是否盒子, 原来的 y, 让到 y)。同一个盒子的记录会合并：
+        已经记过原来的 y 就不覆盖（第二次长开时，邻居已经不在原位了）。
+        """
+        table = getattr(self, "_grow_saved", None)
+        if table is None:
+            table = self._grow_saved = {}
+        entries = table.setdefault(win.box.id, [])
+        have = {entry[0]: entry for entry in entries}
+        for ident, is_box, old_y, new_y in saved:
+            got = have.get(ident)
+            if got is not None:
+                if abs(got[2] - old_y) <= 1:
+                    got[3] = new_y
+                continue
+            entries.append([ident, is_box, old_y, new_y])
+
+    def _restore_grow(self, win) -> bool:
+        """盒子缩回去：把刚才为它让开的东西按记录放回原位。
+
+        用户自己挪过的（不在当初让到的位置）不动——那是他的意思，不抢。
+        """
+        table = getattr(self, "_grow_saved", None)
+        if not table:
+            return False
+        entries = table.pop(getattr(getattr(win, "box", None), "id", ""), None)
+        if not entries:
+            return False
+        back = 0
+        for ident, is_box, old_y, new_y in entries:
+            other = (self.windows.get(ident) if is_box
+                     else self.card_widgets.get(ident))
+            if other is None:
+                continue
+            try:
+                if is_box:
+                    if abs(other.box.y - new_y) > 2:
+                        continue
+                    other.box.y = old_y
+                    other.store.move(other.box, other.box.x, other.box.y)
+                    other.changed.emit()
+                    other.slide_to(old_y)
+                else:
+                    if abs((other.card.y - other.inset) - new_y) > 2:
+                        continue
+                    other.card.y = old_y + other.inset
+                    self.cfg.save()
+                    self._slide_widget_to(other, old_y)
+            except (RuntimeError, OSError, TypeError):
+                continue
+            back += 1
+        if back:
+            _log("grow: restore %d/%d", back, len(entries))
+        return back > 0
+
     def _snap_below(self, win, freed: int) -> None:
-        """盒子收成横杠：同一列里它下面的盒子/卡片一起往上吸，补上空出来的高度。"""
+        """盒子收成横杠：先按记录把刚才挤开的放回原位，没有记录再让下面的吸上来。"""
+        if self._restore_grow(win):
+            return
         if freed <= 0:
             return
         top = win.box.y + win._collapsed_h()
@@ -1147,13 +1209,18 @@ class Controller(QObject):
             except (RuntimeError, OSError, TypeError):
                 continue
 
-    def _grow_request(self, win, target) -> bool:
-        """-1 → 0 之前先算：长出来有没有地方。盒子、卡片都算挡路的。
+    def _grow_request(self, win, target, remember: bool = True) -> bool:
+        """-1 → 0 / 盒子变大之前先算：长出来有没有地方。盒子、卡片都算挡路的。
 
-        1) 只把真正挡住的往下让，让得开就到此为止；
+        1) 只把真正挡住的往下让，让得开就到此为止。并排挨着的两块**一起**让到
+           同一条线上，谁也不许多让一格：以前是从上往下一块块叠着排（第二块的
+           起点 = 第一块的下沿），左右两列的盒子就被挤成一上一下了；
         2) 让不开就从下往上把 0 状态盒子收成 -1（卡片不收），腾出地方后整列
            重新贴紧排一遍；
         3) 还是放不下（或者下面是常驻展开的盒子）就返回 False，调用方抖两下。
+
+        remember=True 时把「谁被让到哪儿」记下来（见 `_restore_grow`）：盒子缩
+        回去时按记录放回原位。盒子**永久变大**（拖进图标、改大小）那条路传 False。
         """
         from .box_widget import TITLE_H
         GAP = 10
@@ -1174,7 +1241,7 @@ class Controller(QObject):
                 continue
             if rect.top() < target.top():
                 continue
-            row.append([rect.top(), is_box, other])
+            row.append([rect.top(), is_box, other, rect])
         row.sort(key=lambda item: item[0])
 
         def height_of(is_box, other, collapsed) -> int:
@@ -1184,44 +1251,63 @@ class Controller(QObject):
                 return TITLE_H
             return other._collapsed_h()
 
+        target_bottom = target.y() + target.height()
+
         def sim(collapsed, pack):
-            prev = target.y() + target.height()
+            placed: list[tuple[int, int, int]] = []   # 已摆好的：(left, right, bottom)
             stop = limit
             moves = []
-            for _top, is_box, other in row:
+            for _top, is_box, other, rect in row:
                 if is_box and other.is_expanded:
                     top = other.frameGeometry().top()
-                    if prev + GAP > top:
+                    if any(left <= rect.right() and rect.left() <= right
+                           and bottom + GAP > top for left, right, bottom in placed):
                         return None
                     stop = min(stop, top)
                     break
                 h = height_of(is_box, other, collapsed)
+                left, right = rect.left(), rect.right()
                 cur = other.frameGeometry().top()
-                ny = prev + GAP if pack else max(cur, prev + GAP)
+                need = 0
+                if left <= target.right() and target.left() <= right:
+                    need = target_bottom + GAP
+                # 只有「同一列」的上方才继续往下挤；并排的互不影响
+                for o_left, o_right, o_bottom in placed:
+                    if left <= o_right and o_left <= right:
+                        need = max(need, o_bottom + GAP)
+                # pack：贴紧排（没东西压着就往上吸）；否则只往下让
+                ny = need if (pack and need) else max(cur, need)
                 if ny != cur:
                     moves.append((other, is_box, ny))
-                prev = ny + h
-                if prev > stop:
+                bottom = ny + h
+                if bottom > stop:
                     return None
-            return moves if prev <= stop else None
+                placed.append((left, right, bottom))
+            return moves
 
         def put(moves, collapsed) -> None:
-            for _top, is_box, other in row:
+            for _top, is_box, other, _rect in row:
                 if is_box and other.box.id in collapsed:
                     other._set_bar(True)
+            saved = []
             for other, is_box, ny in moves:
                 try:
                     if is_box:
+                        saved.append((other.box.id, True, other.box.y, ny))
                         other.box.y = ny
                         other.store.move(other.box, other.box.x, other.box.y)
                         other.changed.emit()
                         other.slide_to(ny)
                     else:
+                        saved.append((getattr(other.card, "id", ""), False,
+                                      other.card.y - other.inset, ny))
                         other.card.y = ny + other.inset
                         self.cfg.save()
                         self._slide_widget_to(other, ny)
                 except (RuntimeError, OSError, TypeError):
                     continue
+            if saved and remember:
+                self._remember_grow(win, saved)
 
         plan = sim(set(), False)
         if plan is not None:
@@ -1230,7 +1316,7 @@ class Controller(QObject):
         collapsed: set[str] = set()
         while True:
             victim = None
-            for _top, is_box, other in row:
+            for _top, is_box, other, _rect in row:
                 if not is_box or other.is_expanded:
                     continue
                 if other.box.id in collapsed or getattr(other, "_bar", False):
@@ -1258,8 +1344,13 @@ class Controller(QObject):
         except Exception:  # noqa: BLE001 - 桌面接口抽风不能挡住别的
             pass
         # 正下方的：沿用「长高之前先问有没有地方」那套（推下去 / 必要时收横杠）
+        # 这里是盒子**永久变大**（拖进图标 / 改了大小）：邻居该一直让着，别记
+        # 「可以放回来」，也别留着上一次临时长开的旧记录
         try:
-            self._grow_request(win, rect)
+            table = getattr(self, "_grow_saved", None)
+            if table:
+                table.pop(getattr(getattr(win, "box", None), "id", ""), None)
+            self._grow_request(win, rect, remember=False)
         except Exception:  # noqa: BLE001
             pass
         # 左右两侧的：往右让（_grow_request 只看正下方那一列）
@@ -2054,6 +2145,12 @@ class Controller(QObject):
                 win.allow_bar_merge = bool(on)
             except (RuntimeError, TypeError):
                 continue
+
+    def set_box_sort(self, key: str) -> None:
+        """面板里收纳盒列表的排序：name（默认）/ size / created。"""
+        key = str(key or "name")
+        self.cfg.box_sort = key if key in ("name", "size", "created") else "name"
+        self.cfg.save()
 
     def set_lang(self, code: str) -> None:
         """换界面语言（zh / en）。
