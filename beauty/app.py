@@ -1650,14 +1650,18 @@ class Controller(QObject):
         self._relayout()
 
     def _any_box_expanded(self) -> bool:
-        """现在有没有盒子处于展开（1）状态。
+        """现在有没有**会自动收起的**盒子处于展开（1）状态。
 
         `box_widget` / `card_base` 的按下事件靠它判断「这一下该不该吞掉」：
-        有盒子展开着的时候，点别处只负责把那个盒子收起来（见 beauty/gate.py）。
+        有一个展开着的盒子时，点别处只负责把那个盒子收起来（见 beauty/gate.py）。
+
+        只算**没勾常驻**的：常驻展开点外面不会收起，要是也拦着，别的盒子就
+        永远点不开了。
         """
         for w in self.windows.values():
             try:
-                if w.isVisible() and w.is_expanded:
+                if (w.isVisible() and w.is_expanded
+                        and not bool(getattr(w.box, "pinned", False))):
                     return True
             except (RuntimeError, TypeError):
                 continue
