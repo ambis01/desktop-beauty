@@ -569,7 +569,11 @@ class BoxWidget(GlassWindow):
         # 收放动画**马上**要起：这段时间里 Controller 的重排别给这个窗口叠滑动
         # （两段动画抢同一个窗口 = 抽搐，见 `_set_bar` / `toggle`）
         self._anim_queued = False
-        self._anim_curve = QEasingCurve(QEasingCurve.Type.InOutCubic)
+        # 收放动画期间窗口固定成「起点∪终点」，这段矩形记的是「现在这块玻璃在
+        # 窗口里的位置和大小」（`_paint_box` 是加过余量、可以直接给画笔用的那份）
+        self._anim_win = QRect()
+        self._paint_rect = QRect()
+        self._paint_box = None
         # 一次动画推「_t」（展开↔收起）或者「_bar_t」（缩略↔只剩横杠）
         self._anim_field = "t"
         self._anim_from = 0.0
@@ -580,6 +584,7 @@ class BoxWidget(GlassWindow):
         self._anim_t0 = 0.0
         self._anim_last = 0.0
         self._anim_gap_max = 0.0
+        self._anim_curve = QEasingCurve(QEasingCurve.Type.InOutCubic)
         # 几何按「起止矩形」插值：这样从横杠、缩略、展开任意两态之间都能直接滑，
         # 中途尺寸变了也不会跳。
         self._anim_rect_from = QRect()
@@ -752,17 +757,24 @@ class BoxWidget(GlassWindow):
         return self._win_margin()
 
     def _cw(self) -> float:
-        """玻璃的宽（窗口宽减去两边的余量）。"""
+        """玻璃的宽（窗口宽减去两边的余量）。动画中按「现在这块玻璃」算。"""
+        r = self._paint_rect
+        if not r.isNull():
+            return float(r.width() - self._win_margin() * 2)
         return float(self.width() - self._win_margin() * 2)
 
     def _ch(self) -> float:
-        """玻璃的高。"""
+        """玻璃的高。动画中按「现在这块玻璃」算。"""
+        r = self._paint_rect
+        if not r.isNull():
+            return float(r.height() - self._win_margin() * 2)
         return float(self.height() - self._win_margin() * 2)
 
     def _to_content(self, pos: QPoint) -> QPoint:
         """窗口坐标 → 玻璃坐标（绘制和命中判断都用玻璃坐标）。"""
         m = self._win_margin()
-        return QPoint(pos.x() - m, pos.y() - m)
+        off = self._paint_offset()
+        return QPoint(pos.x() - m - off.x(), pos.y() - m - off.y())
 
     def _paint_z(self) -> float:
         """当前这一帧玻璃被放大的比例（和 paintEvent 里算的 z 一致）。"""
@@ -1814,6 +1826,18 @@ class BoxWidget(GlassWindow):
         self._slide = None
         if getattr(self, "_slide_timer", None) is not None:
             self._slide_timer.stop()
+        # ⚠️ 窗口在这段动画里**不动**：一次开到「起点 ∪ 终点」，之后就只改里面的
+        # 绘制（`_paint_rect`）。为什么：让一个带透明的窗口往**左/往上**变尺寸时，
+        # Windows 会先把旧画面按新尺寸拉一下、等下一次重画才补上，肉眼就是「右边框 /
+        # 下边框在抽」——只有往左长、往上长的盒子有这个毛病（用户 2026-11-16 实测：
+        # 往右长、往下长的都不抽）。窗口不动就没有这个中间态。
+        union = QRect(self._anim_rect_from).united(self._anim_rect_to)
+        self._anim_win = QRect(union)
+        self._paint_rect = QRect(self._anim_rect_from)
+        if union != self.geometry():
+            self.setGeometry(union)
+        # 先挪窗口再算偏移：`_sync_paint_box` 用的是窗口原点的相对位置
+        self._sync_paint_box()
         self._anim_p = 0.0
         self._anim_frames = 0
         self._anim_t0 = time.perf_counter()
@@ -1841,17 +1865,35 @@ class BoxWidget(GlassWindow):
             self._on_anim_finished()
 
     def _anim_geometry(self) -> None:
-        """按这次动画的起止矩形插值窗口几何（缓动进度在 _anim_p）。"""
+        """插值「现在这块玻璃占哪块」（窗口本身不动，见 `_start_anim`）。"""
         a, b = self._anim_rect_from, self._anim_rect_to
         if a.isNull() or b.isNull():
             return
         p = self._anim_p
-        self.setGeometry(QRect(
+        self._paint_rect = QRect(
             round(a.x() + (b.x() - a.x()) * p),
             round(a.y() + (b.y() - a.y()) * p),
             round(a.width() + (b.width() - a.width()) * p),
             round(a.height() + (b.height() - a.height()) * p),
-        ))
+        )
+        self._sync_paint_box()
+
+    def _sync_paint_box(self) -> None:
+        """按 `_paint_rect` 算画笔用的「玻璃矩形」（窗口坐标，已含余量）。"""
+        r = self._paint_rect
+        if r.isNull():
+            self._paint_box = None
+            return
+        m = self._win_margin()
+        self._paint_box = QRect(r.x() - self.x() + m, r.y() - self.y() + m,
+                                r.width() - 2 * m, r.height() - 2 * m)
+
+    def _paint_offset(self) -> QPoint:
+        """绘制原点相对窗口原点的偏移（动画期间窗口固定，玻璃在里面长/收）。"""
+        r = self._paint_rect
+        if r.isNull():
+            return QPoint(0, 0)
+        return QPoint(r.x() - self.x(), r.y() - self.y())
 
     def _anim_frame_stat(self) -> None:
         now = time.perf_counter()
@@ -1882,12 +1924,19 @@ class BoxWidget(GlassWindow):
                    ("bar" if self._bar_t > 0.5 else "mini"),
                    self._anim_frames, dur, self._anim_gap_max * 1000.0)
         self._anim_t0 = 0.0
+        # 动画结束：窗口收/放回这一帧该在的矩形（动画期间它是「起点∪终点」）
+        target = QRect(self._anim_rect_to)
+        self._anim_win = QRect()
+        self._paint_rect = QRect()
+        self._paint_box = None
         if not self._expanded:
             self._bar_t = 1.0 if self._bar else 0.0
             self._apply_collapsed_geometry()
             self._set_expanded_blur(False)
             self.update()
             return
+        if not target.isNull() and self.geometry() != target:
+            self.setGeometry(target)
         # 展开完成：收起形态回到「缩略图标」（下次收起 / 拖动按它算）
         self._bar = False
         self._bar_t = 0.0
@@ -2014,7 +2063,13 @@ class BoxWidget(GlassWindow):
             p.translate(c.x(), c.y())
             p.scale(z, z)
             p.translate(-c.x(), -c.y())
-        p.translate(self._win_margin(), self._win_margin())
+        # 动画期间窗口固定、玻璃在里面长/收：整块内容按同一份「玻璃矩形」平移，
+        # 不然内容和玻璃会错位（`_paint_box` 由 `_anim_geometry` 每帧算好）。
+        box = getattr(self, "_paint_box", None)
+        if box is not None and not box.isNull():
+            p.translate(box.x(), box.y())
+        else:
+            p.translate(self._win_margin(), self._win_margin())
         # 收放动画期间内容钉在「原来那块」上（见 `_mini_rect` / `_paint_expanded`），
         # 可能会伸到当前窗口外面去；裁到玻璃圆角里，别让图标残影露到盒子外面
         # （用户 2026-11-16 报的「残影冲出收纳盒」）。

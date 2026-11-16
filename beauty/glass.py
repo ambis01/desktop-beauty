@@ -681,9 +681,17 @@ class GlassWindow(QWidget):
             p.scale(z, z)
             p.translate(-c.x(), -c.y())
         # 之后所有绘制都用「玻璃自己的坐标」：左上角 (0,0)
-        p.translate(ins, ins)
-        w = float(self.width() - ins * 2)
-        h = float(self.height() - ins * 2)
+        # 收放动画期间窗口是「起点∪终点」那么大、玻璃在里面长/收，所以要先按
+        # 现在这块玻璃的偏移平移、尺寸也按它算（见 BoxWidget._paint_rect）。
+        box = getattr(self, "_paint_box", None)
+        if box is not None and not box.isNull():
+            p.translate(box.x(), box.y())
+            w = float(box.width())
+            h = float(box.height())
+        else:
+            p.translate(ins, ins)
+            w = float(self.width() - ins * 2)
+            h = float(self.height() - ins * 2)
         if w <= 0.0 or h <= 0.0:
             return
         plate = QRectF(0.0, 0.0, w, h)
