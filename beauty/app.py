@@ -1688,7 +1688,7 @@ class Controller(QObject):
                     moved += 1
                 placed.append(r)
                 continue
-            best = self._free_slot(r, placed, scr)
+            best = self._nearest_slot(r, placed, scr, 0)
             if best is None:
                 placed.append(r)      # 一个空位都没有：留着，别乱动
                 continue
