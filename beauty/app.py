@@ -1643,6 +1643,13 @@ class Controller(QObject):
 
         旧版本把挤开的位置也写进了配置，可能留下两块叠在一起的家；不修的话
         一展开就更容易叠，看着还是「又乱了」。没有重叠时一个像素都不动。
+
+        ⚠️ 判重叠用**摆下它那一刻的尺寸**（`home_w/home_h`），不是现在的尺寸。
+        用现在尺寸的话，用户只要展开过盒子（横杠 28 → 缩略图 138/182），它的
+        「家」就和邻居的家压上了——下次启动启动整理会把邻居挪到别的空位、
+        还落盘，看着就是「重启之后盒子自己跳列了」（2026-11-16 实测：展开
+        视听 + 外设控制之后重启，外设 499→645、收纳盒 162,530→368,530）。
+        长大之后互相压住是**正常**的（要么盖住、要么由推让让开），不是坏配置。
         """
         moved = 0
         wins = [w for w in self.windows.values() if w.isVisible()]
@@ -1665,7 +1672,13 @@ class Controller(QObject):
             return any(probe.intersects(o) for o in placed)
 
         for w in wins:
-            w0, h0 = int(w._side_w), int(w._collapsed_h())
+            # 取「摆下那一刻」和「现在」里**小**的那个：长大了就按原来的小尺寸判
+            # （长大之后互相压住是正常的），收回横杠了就按横杠判（别拿旧的大尺寸
+            # 去顶邻居）。只有连最小形态都压住，才算真坏了的家。
+            w0 = min(int(getattr(w.box, "home_w", -1) or -1) or int(w._side_w),
+                     int(w._side_w))
+            h0 = min(int(getattr(w.box, "home_h", -1) or -1) or int(w._collapsed_h()),
+                     int(w._collapsed_h()))
             hx, hy = int(w.box.home_x), int(w.box.home_y)
             r = QRect(hx, hy, w0, h0)
             # 先夹进屏幕（老配置可能存过一个跑到屏幕外的位置）
