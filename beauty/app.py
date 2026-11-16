@@ -1364,8 +1364,10 @@ class Controller(QObject):
             return True
         self._in_layout = True
         ok = True
-        # 面板里「自适应对齐」关着：只摆自己的展开面，不去推别人（桌面立刻安静）
-        align_ok = bool(getattr(self.cfg, "auto_align", True))
+        # 「展开时把挡住的推开」是实验功能，默认**关**：关着的时候展开只会盖住
+        # （模糊），桌面上的盒子一个像素都不会自己动（用户 2026-11-16 定的：
+        # 宁可盖住也不要乱动，先把稳定保住，推让以后再一条一条加回来）
+        align_ok = bool(getattr(self.cfg, "box_push", False))
         try:
             self._layout_pass = True
             boxes = [w for w in self.windows.values() if w.isVisible()]
@@ -1383,11 +1385,14 @@ class Controller(QObject):
                 if getattr(w, "_tmp_bar", False):
                     w._tmp_bar = False
                     w._bar = False
-            # 2) 展开的面板先占位，再把挡路的推开
+            # 2) 展开的面板先占位；开着「挤开」才把挡路的推开
             for w in sorted((x for x in boxes if x.is_expanded),
                             key=lambda x: (float(x.box.created or 0.0), x.box.id)):
-                got = self._panel_for(
-                    w, allow_collapse=not bool(getattr(w.box, "pinned", False)))
+                if align_ok:
+                    got = self._panel_for(
+                        w, allow_collapse=not bool(getattr(w.box, "pinned", False)))
+                else:
+                    got = self._panel_free(w)
                 if got is None:
                     continue
                 want, side, up, plan = got
@@ -1398,7 +1403,7 @@ class Controller(QObject):
                 except (RuntimeError, TypeError, AttributeError):
                     continue
                 _log(f"grow: expand {w.box.name} side={side} up={up} at {want.left()},{want.top()}")
-                if align_ok:
+                if align_ok and plan is not None:
                     self._apply_plan(w, want, plan)
             # 3) 刚变大的那个：它自己那块也算占地方
             if win is not None and win in boxes and not win.is_expanded:
@@ -1427,6 +1432,9 @@ class Controller(QObject):
                 else:
                     _log(f"grow: place {win.box.name} {r.left()},{r.top()} {r.width()}x{r.height()}")
                     self._apply_plan(win, r, plan)
+            # 3b) 只有开着「挤开」时才做：收起的盒子之间真叠住了，后建的那个让开
+            if align_ok:
+                self._pack_collapsed(boxes)
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
@@ -1570,6 +1578,35 @@ class Controller(QObject):
         self.store.save()
         _log(f"homes untangled: {moved} moved")
         return moved
+
+    def _panel_free(self, win):
+        """不推任何东西时展开面摆哪儿：(rect, side, up, None)。
+
+        只在四个候选里挑**整块都在屏幕内**的（右+下 → 左+下 → 右+上 → 左+上），
+        不看别人、更不挪别人——展开只是盖上去（压住的会糊掉）。
+        """
+        try:
+            m = win._win_margin()
+            size = win._expanded_rect()
+            w = size.width() - 2 * m
+            h = size.height() - 2 * m
+            base = QRect(int(win.box.home_x), int(win.box.home_y),
+                         int(win._side_w), int(win._collapsed_h()))
+            scr = (win.screen() or self.app.primaryScreen()).availableGeometry()
+        except (RuntimeError, TypeError, AttributeError):
+            return None
+        for side, up in (("right", False), ("left", False),
+                         ("right", True), ("left", True)):
+            x = base.x() if side == "right" else base.x() + base.width() - w
+            y = base.y() + base.height() - h if up else base.y()
+            rect = QRect(x, y, w, h)
+            if (rect.left() < scr.left() or rect.right() > scr.right()
+                    or rect.top() < scr.top() or rect.bottom() > scr.bottom()):
+                continue
+            return rect, side, up, None
+        x = max(scr.left(), min(base.x(), scr.right() + 1 - w))
+        y = max(scr.top(), min(base.y(), scr.bottom() + 1 - h))
+        return QRect(x, y, w, h), "right", False, None
 
     def _free_slot(self, r: QRect, placed, scr, gap: int = 0) -> QRect | None:
         """离 r 最近的空位：不压 placed 里任何一块，整块还在屏幕内。
@@ -1979,6 +2016,9 @@ class Controller(QObject):
         的待遇。
         """
         try:
+            if not bool(getattr(self.cfg, "box_push", False)):
+                # 不推别人：只要展开面整块放得下就算勾得上
+                return self._panel_free(win) is not None
             got = self._panel_for(win, allow_collapse=False)
             if got is None:
                 return False
