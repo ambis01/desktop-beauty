@@ -1420,6 +1420,13 @@ class Controller(QObject):
                 # 让到了下面（5 级），按家算会在展开那一瞬间把整块拽回原位、收起时
                 # 又滑回来——用户 2026-11-16 报的「点一下盒子就抽搐」就是这个。
                 ox, oy = disp[id(w)]
+                if getattr(w, "_panel_pushed", False):
+                    # 但上一次是**被另一块展开面挤开**的（`_settle_layout` 第 0 步）：
+                    # 那是这一轮的临时结果，推它的那块收起来它就该回家。所以位置
+                    # 按家重算，挪不挪由这一轮的挤开重新决定（不然它会一直赖在
+                    # 被挤开的地方，用户 2026-11-16 报的「推开的盒子不回家」）。
+                    ox, oy = int(w.box.home_x), int(w.box.home_y)
+                    w._panel_pushed = False
                 w.box.x, w.box.y = int(ox), int(oy)
                 got = None
                 if align_ok and w is not win:
@@ -1468,14 +1475,39 @@ class Controller(QObject):
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
-                if w.is_expanded:
-                    continue
                 ox, oy = disp[id(w)]
                 moved_x = int(w.box.x) != ox
                 moved_y = int(w.box.y) != oy
                 if not (moved_x or moved_y):
                     continue
+                if w.is_expanded:
+                    # 展开面被另一块展开面挤开了（`_settle_layout` 第 0 步）：整块
+                    # 滑过去。不滑的话逻辑位置和窗口位置就对不上——面板上的东西
+                    # 还画在老地方，等下一次谁再动一下才「啪」地跳过去。
+                    # ⚠️ 展开面的窗口左上角**不是** box.x（面板可能往左长），要按
+                    #    `_expanded_rect()` 算；按 box.x 滑会把整块往右甩 174px。
+                    try:
+                        if w._anim_timer.isActive():
+                            w._rect_expanded = w._expanded_rect()
+                            w._anim_rect_to = w._rect_expanded
+                            continue
+                        r = w._expanded_rect()
+                        m = w._win_margin()
+                        if moved_x:
+                            w.slide_x_to(int(r.x()) + int(m))
+                        if moved_y:
+                            w.slide_to(int(r.y()) + int(m))
+                    except (RuntimeError, TypeError, AttributeError):
+                        continue
+                    continue
                 try:
+                    if getattr(w, "_anim_queued", False):
+                        # 它自己的收放动画**马上就要起**（`_set_bar` / `toggle` 正调我们，
+                        # 动画还没 start，`_anim_timer` 这时候还是停的）：落点会在它那
+                        # 段动画里按新的 box 位置算，这里再叠一段滑动就是两个动画抢同
+                        # 一个窗口——用户 2026-11-16 报的「X 从横杠展开一直在抖」：
+                        # 0→226 那段窗口 y 在 1011/939/1007/921 之间来回跳。
+                        continue
                     if w._anim_timer.isActive():
                         # 它自己的「横杠长回正常 / 收起」动画还在跑：那段动画的落点
                         # 本来就是按**现在**的位置算的，这里再起一段滑动会两个动画
@@ -1802,6 +1834,46 @@ class Controller(QObject):
                     return cand
         return None
 
+    def _panel_shift(self, r: QRect, others, scr,
+                     gap: int | None = None) -> tuple[int, int] | None:
+        """把一块展开面整体挪开、不再压住 `others` 里的面板：挑挪得最少的那个方向。
+
+        为什么整块搬：展开面（面板）是钉在盒子上跟着盒子走的，想让面板离开别人，
+        只能改盒子的位置。四个方向里挑位移最小的、挪完还在屏幕内、也不压住别人的；
+        四个都不行就返回 None（那就只好先盖着了，下一轮再说）。
+        """
+        if gap is None:
+            gap = self.SETTLE_GAP
+        if not others:
+            return 0, 0
+        left = min(o.left() for o in others)
+        right = max(o.right() for o in others)
+        top = min(o.top() for o in others)
+        bottom = max(o.bottom() for o in others)
+        cands = (
+            ((left - gap - 1) - r.right(), 0),      # 往左让：右边缘贴着别人左边缘
+            ((right + 1 + gap) - r.left(), 0),      # 往右让
+            (0, (top - gap - 1) - r.bottom()),      # 往上让
+            (0, (bottom + 1 + gap) - r.top()),      # 往下让
+        )
+        best = None
+        for dx, dy in cands:
+            dx, dy = int(dx), int(dy)
+            if dx == 0 and dy == 0:
+                continue
+            moved = r.translated(dx, dy)
+            if (moved.left() < scr.left() or moved.top() < scr.top()
+                    or moved.right() > scr.right() or moved.bottom() > scr.bottom()):
+                continue
+            if any(moved.intersects(o) for o in others):
+                continue
+            cost = abs(dx) + abs(dy)
+            if best is None or cost < best[0]:
+                best = (cost, dx, dy)
+        if best is None:
+            return None
+        return best[1], best[2]
+
     def _settle_layout(self, boxes, win=None, win_h: int | None = None) -> None:
         """5 级：让「占地方」的盒子按**离原位最近**安置，而不是一条链往下推。
 
@@ -1828,22 +1900,57 @@ class Controller(QObject):
         panels: list[QRect] = []         # 展开面（**真实**玻璃矩形，判「压住了没有」）
         pinned_panels: list[QRect] = []  # 勾了常驻的展开面：下面的盒子必须让开
         movable: list = []
-        for w in boxes:
-            if w.is_expanded:
-                try:
-                    m = w._win_margin()
-                    r_true = w._expanded_rect().adjusted(m, m, -m, -m)
-                    # 用**真实**面板矩形（不撑大）：撑大 10px 的话，只差 1~2px 的盒子
-                    # 也会被当成压住、被顶开几十像素（实测「聊天工作 1588→1639」）。
-                    # 面板自己推让时留的 10px 空隙由第 2 步负责，这里只管别压住。
-                    placed.append(r_true)
-                    panels.append(r_true)
-                    if bool(getattr(w.box, "pinned", False)):
-                        pinned_panels.append(r_true)
-                except (RuntimeError, TypeError, AttributeError):
-                    pass
+
+        def true_panel(w) -> QRect | None:
+            try:
+                m = w._win_margin()
+                return w._expanded_rect().adjusted(m, m, -m, -m)
+            except (RuntimeError, TypeError, AttributeError):
+                return None
+
+        # 0) 展开面**之间**也不许叠：刚展开的那块不动，别人才让开——哪怕是勾了
+        #    常驻的那块（用户 2026-11-16 报的：Z 展开直接压在常驻的聊天工作上，
+        #    他说「不应该要推开聊天工作吗，怎么重叠了」）。面板是钉在盒子上跟着
+        #    盒子走的，所以「让开」就是改盒子的位置；搬完按新位置登记，第 3 步
+        #    才不会再按老位置算。顺序只看状态（刚展开的先占位，其余按创建时间），
+        #    同一套状态算两遍结果一样。
+        panels_of: dict[int, QRect] = {}
+        order = sorted((w for w in boxes if w.is_expanded),
+                       key=lambda x: (x is not win,
+                                      float(getattr(x.box, "created", 0.0) or 0.0),
+                                      x.box.id))
+        for w in order:
+            r = true_panel(w)
+            if r is None:
                 continue
-            movable.append(w)
+            clash = [p for p in panels_of.values() if r.intersects(p)]
+            if clash:
+                shift = self._panel_shift(r, clash, scr)
+                if shift is not None:
+                    dx, dy = shift
+                    w.box.x = int(w.box.x) + dx
+                    w.box.y = int(w.box.y) + dy
+                    moved = true_panel(w)
+                    if moved is not None and (moved.x(), moved.y()) != (r.x(), r.y()):
+                        _log(f"grow: panel {w.box.name} {r.x()},{r.y()}"
+                             f"->{moved.x()},{moved.y()}")
+                        r = moved
+                        try:
+                            w._panel_pushed = True
+                        except AttributeError:
+                            pass
+            panels_of[id(w)] = r
+        for w in boxes:
+            if not w.is_expanded:
+                movable.append(w)
+                continue
+            r = panels_of.get(id(w))
+            if r is None:
+                continue
+            placed.append(r)
+            panels.append(r)
+            if bool(getattr(w.box, "pinned", False)):
+                pinned_panels.append(r)
 
         def size_of(w) -> tuple[int, int]:
             try:
@@ -1898,6 +2005,19 @@ class Controller(QObject):
                         return cx, cy
                 except (RuntimeError, TypeError, AttributeError):
                     pass
+            # 家在屏幕底下、长高之后放不下的那种（用户报的：X 在屏幕底部，横杠 →
+            # 图标方块）：**底边钉住家的底边**，往上长。
+            # 以前直接把「家」丢给 `_nearest_slot` 按 1/3 块大小的步长找空位，
+            # 会多往上挪出几十像素（1018 → 868，其实 820 就够了），于是每次横杠
+            # 长回来整块先往上弹一截、收起来再掉回去，看着就是抽搐。
+            try:
+                home_h = int(getattr(w.box, "home_h", 0) or 0)
+                if home_h > 0 and hy + int(wh) > scr.bottom() + 1:
+                    ny = hy + home_h - int(wh)
+                    if ny >= scr.top() and ny != hy:
+                        return hx, ny
+            except (TypeError, ValueError, AttributeError):
+                pass
             return hx, hy
 
         grown_rects: list[QRect] = []

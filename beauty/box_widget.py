@@ -566,6 +566,9 @@ class BoxWidget(GlassWindow):
         self._anim_timer.setTimerType(Qt.PreciseTimer)
         self._anim_timer.setInterval(8)
         self._anim_timer.timeout.connect(self._tick_anim)
+        # 收放动画**马上**要起：这段时间里 Controller 的重排别给这个窗口叠滑动
+        # （两段动画抢同一个窗口 = 抽搐，见 `_set_bar` / `toggle`）
+        self._anim_queued = False
         self._anim_curve = QEasingCurve(QEasingCurve.Type.InOutCubic)
         # 一次动画推「_t」（展开↔收起）或者「_bar_t」（缩略↔只剩横杠）
         self._anim_field = "t"
@@ -1575,10 +1578,17 @@ class BoxWidget(GlassWindow):
                                      self._win_w(), self._win_h())
         self._rect_expanded = self._expanded_rect()
         self._anim_timer.stop()
-        if not target:
-            # 变大的那一刻如果还展开着，清场推迟到这儿：现在盒子要落回新尺寸了
-            self._flush_grow()
-            self._notify_collapsed()
+        # 这一小段里调过去的重排**别给这个窗口叠滑动动画**：下面 `_start_anim()`
+        # 会自己把窗口从当前位置收到/放到新位置，两段动画抢同一个窗口就是抽搐
+        # （用户 2026-11-16 报的 X：横杠 ↔ 图标方块时窗口一直在抖）。
+        self._anim_queued = True
+        try:
+            if not target:
+                # 变大的那一刻如果还展开着，清场推迟到这儿：现在盒子要落回新尺寸了
+                self._flush_grow()
+                self._notify_collapsed()
+        finally:
+            self._anim_queued = False
         # 收放都是「两头慢、中间快」：起步有加速、落地有缓冲，看着是滑过去
         # 而不是「啪」地弹开（OutQuint 起手太猛、尾巴太长，容易觉得先冲后顿）
         self._anim_field = "t"
@@ -1588,8 +1598,18 @@ class BoxWidget(GlassWindow):
         self._anim_rect_from = self.geometry()
         if target:
             # 先让 Controller 选好往哪边长（右/左、下/上）再算落点
-            self._notify_expanded()
+            self._anim_queued = True
+            try:
+                self._notify_expanded()
+            finally:
+                self._anim_queued = False
             self._rect_expanded = self._expanded_rect()
+        else:
+            # 重排可能把盒子挪了（挤开/归位的结果每轮按家重算）：落点要按**现在**
+            # 的位置重算，不然动画会往老位置收，最后一帧再「啪」地跳一下
+            self._rect_collapsed = QRect(self.box.x - self._win_margin(),
+                                         self._glass_top() - self._win_margin(),
+                                         self._win_w(), self._win_h())
         self._anim_rect_to = self._rect_expanded if target else self._rect_collapsed
         self._start_anim()
         # 展开时盯着「有没有点到盒子外面」
@@ -1638,15 +1658,20 @@ class BoxWidget(GlassWindow):
         调用方先 toggle(False) —— 那条路是 1 → -1 一步收到底。
         """
         on = bool(on)
-        if not on and not self._expanded and persist:
-            cb = getattr(self, "on_grow_request", None)
-            if cb is not None:
-                try:
-                    if not cb(self):        # Controller 自己算 0 状态那块、往下还是往上
-                        self.shake()
-                        return
-                except (RuntimeError, TypeError) as exc:
-                    _log_force("grow_request failed box=%s: %r", self.box.id, exc)
+        # 这一小段里调过去的重排别给这个窗口叠滑动动画（见 toggle 里同一段注释）
+        self._anim_queued = True
+        try:
+            if not on and not self._expanded and persist:
+                cb = getattr(self, "on_grow_request", None)
+                if cb is not None:
+                    try:
+                        if not cb(self):        # Controller 自己算 0 状态那块、往下还是往上
+                            self.shake()
+                            return
+                    except (RuntimeError, TypeError) as exc:
+                        _log_force("grow_request failed box=%s: %r", self.box.id, exc)
+        finally:
+            self._anim_queued = False
         if on:
             self._gear_up(TITLE_H, self._collapsed_h())   # 收到横杠：底边不动
         self._bar = on
@@ -1659,13 +1684,17 @@ class BoxWidget(GlassWindow):
             return
         self._save_bar(persist)
         self._anim_timer.stop()
-        if on:
-            cb = getattr(self, "on_shrunk", None)
-            if cb is not None:
-                try:
-                    cb(self, self._side_h)
-                except (RuntimeError, TypeError) as exc:
-                    _log_force("shrunk callback failed box=%s: %r", self.box.id, exc)
+        self._anim_queued = True
+        try:
+            if on:
+                cb = getattr(self, "on_shrunk", None)
+                if cb is not None:
+                    try:
+                        cb(self, self._side_h)
+                    except (RuntimeError, TypeError) as exc:
+                        _log_force("shrunk callback failed box=%s: %r", self.box.id, exc)
+        finally:
+            self._anim_queued = False
         self._anim_field = "bar"
         self._anim_from = self._bar_t
         self._anim_to = target
@@ -1760,6 +1789,11 @@ class BoxWidget(GlassWindow):
 
     def _start_anim(self) -> None:
         """起一次动画：先出一帧，别让动画「等一下才开始」。"""
+        # 这段动画接管窗口位置：还挂着的滑动（挤开/吸回）必须停掉。否则两个
+        # 定时器轮流 setGeometry，窗口就在两个落点之间来回跳（用户报的抽搐）。
+        self._slide = None
+        if getattr(self, "_slide_timer", None) is not None:
+            self._slide_timer.stop()
         self._anim_p = 0.0
         self._anim_frames = 0
         self._anim_t0 = time.perf_counter()
