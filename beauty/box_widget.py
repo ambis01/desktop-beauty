@@ -796,6 +796,12 @@ class BoxWidget(GlassWindow):
         一格跳」。玻璃轮廓是真的在变大，圆角也由 QPainter 自己画，不会被
         窗口边界切成直角。
         """
+        # ⚠️ 收放动画期间**不许**放大：玻璃是绕「窗口中心」缩放的，动画中窗口
+        # 中心一直在动，那条约好不动的边就会被这 5% 拖着来回晃。用户 2026-11-16
+        # 报的「A 展开时右边框抽搐」实测就是这样：面板右边框一帧 363、一帧 368、
+        # 又退回 352，而窗口矩形本身是单调的——晃的是画出来的边框。
+        if self._anim_timer.isActive():
+            return 1.0
         return 1.0 + HOVER_GROW * self._hover_t
 
     def _apply_collapsed_geometry(self) -> None:
@@ -833,12 +839,26 @@ class BoxWidget(GlassWindow):
         avail = self._screen()
         hx = min(max(int(self.box.home_x), avail.left()),
                  avail.right() + 1 - self._side_w)
+        # 「家」按**基准高度**夹，不按现在的高度：盒子此刻可能正处在图标方块
+        # （比横杠高）状态，按它夹会把用户放在屏幕底部的家一路往上搬——重启一次
+        # 家就变了，之后收成横杠也跑不回底部（用户 2026-11-16 报的「X 自己往上跑」）。
+        base_h = int(getattr(self.box, "home_h", 0) or 0)
+        if base_h <= 0:
+            base_h = int(self._collapsed_h())
         hy = min(max(int(self.box.home_y), avail.top()),
-                 avail.bottom() + 1 - self._collapsed_h())
+                 avail.bottom() + 1 - max(base_h, TITLE_H))
         if (hx, hy) != (int(self.box.home_x), int(self.box.home_y)):
-            self.store.place(self.box, hx, hy, self._side_w, self._collapsed_h())
+            self.store.place(self.box, hx, hy,
+                             self._side_w if self._side_w else self.box.home_w,
+                             base_h)
         x = min(max(int(self.box.x), avail.left()), avail.right() + 1 - self._side_w)
-        y = min(max(int(self.box.y), avail.top()), avail.bottom() + 1 - self._collapsed_h())
+        y = int(self.box.y)
+        cur_h = int(self._collapsed_h())
+        if cur_h <= base_h + 1:
+            # 只有「不比基准高」的时候才按现在的高度往下夹。图标方块比横杠高一截，
+            # 按它夹会把显示位置拽到屏幕边上去，跟 `_settle_layout` 里「底边钉住
+            # 家的底边往上长」打架——那一下就是用户看到的「盒子先跳一下」。
+            y = min(max(y, avail.top()), avail.bottom() + 1 - cur_h)
         if (x, y) != (int(self.box.x), int(self.box.y)):
             self.box.x, self.box.y = x, y
             self.store.move(self.box, x, y)
@@ -2035,6 +2055,16 @@ class BoxWidget(GlassWindow):
             p.scale(z, z)
             p.translate(-c.x(), -c.y())
         p.translate(self._win_margin(), self._win_margin())
+        # 收放动画期间内容钉在「原来那块」上（见 `_mini_rect` / `_paint_expanded`），
+        # 可能会伸到当前窗口外面去；裁到玻璃圆角里，别让图标残影露到盒子外面
+        # （用户 2026-11-16 报的「残影冲出收纳盒」）。
+        anim = self._anim_timer.isActive()
+        if anim:
+            glass_path = QPainterPath()
+            glass_path.addRoundedRect(
+                QRectF(0.0, 0.0, self._cw(), self._ch()),
+                float(self.radius), float(self.radius))
+            p.setClipPath(glass_path)
         self._paint_titlebar(p)
         # 悬停只放大、不提亮（用户要的是「不变白」）；局部重画时把裁剪区传下去
         clip = event.rect() if abs(z - 1.0) < 1e-6 else None
@@ -2200,8 +2230,11 @@ class BoxWidget(GlassWindow):
     def _paint_collapsed(self, p: QPainter, alpha: float) -> None:
         if alpha <= 0.02:
             return
-        # 「只剩横杠」形态：下面那排缩略图标跟着动画淡出，收到底就一点都不画
-        alpha *= max(0.0, 1.0 - self._bar_t)
+        # 「只剩横杠」形态：下面那排缩略图标跟着动画淡出，收到底就一点都不画。
+        # 用平方衰减：收得比窗口缩得快一点，别让横杠上还挂着半个图标（那看着就是
+        # 残影）。
+        fade = max(0.0, 1.0 - self._bar_t)
+        alpha *= fade * fade
         if alpha <= 0.02:
             return
         p.setOpacity(alpha)
@@ -2465,6 +2498,11 @@ class BoxWidget(GlassWindow):
         self._hover_until = time.monotonic() + HOVER_TOTAL
         _log("hover pulse start")
         if self._expanded or self._press_global is not None:
+            return
+        if self._anim_timer.isActive():
+            # 收放动画在跑：这时候窗口正在变尺寸，再叠一层「绕中心放大」会把
+            # 不动的那条边框拖着晃（见 `_hover_scale`）
+            self._pulse_restore()
             return
         self._pulse_anim.stop()
         self._pulse_anim.setDuration(HOVER_MS)
