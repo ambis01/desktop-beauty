@@ -1440,7 +1440,10 @@ class Controller(QObject):
                 # 所以不能用 `_collapsed_h()`（那还是横杠的 28），要按长完的高度算
                 h_after = (int(win._side_h) + TITLE_H if getattr(win, "_bar", False)
                            else int(win._collapsed_h()))
-                r = QRect(int(win.box.home_x), int(win.box.home_y),
+                # ⚠️ 起点用**它现在的位置**，不是「家」：它可能刚被第 2 步里某个展开面
+                # 的计划推到下面去了（比如 B 常驻展开着，C 长回正常已经在面板下面），
+                # 这里再按家重置，C 就会「啪」地跳回常驻展开之前的位置、压进面板里。
+                r = QRect(int(win.box.x), int(win.box.y),
                           int(win._side_w), h_after)
                 # 长完之后可能顶出屏幕（比如家就在最下面、它又变高了）：先夹回来，
                 # 夹完的位置就是它这次显示的位置（收起时还是回家）
@@ -1451,7 +1454,30 @@ class Controller(QObject):
                     r.moveTop(min(max(r.top(), scr.top()),
                                   scr.bottom() + 1 - r.height()))
                 except (RuntimeError, TypeError, AttributeError):
-                    pass
+                    scr = None
+                if align_ok and level >= 5:
+                    # 展开面是「不让」的；长大的这块要是压住了某块展开面，就**它自己
+                    # 往上让**（面板在上面 / 包住它的情况让不了，那就盖住）。
+                    # 用户 2026-11-16 报的「A 长回正常，没推开 B 常驻展开的面板，
+                    # 直接叠上去了」就是这里。
+                    for other in boxes:
+                        if other is win or not getattr(other, "is_expanded", False):
+                            continue
+                        try:
+                            panel = other.collapsed_rect()
+                        except (RuntimeError, TypeError):
+                            continue
+                        if not panel.intersects(r):
+                            continue
+                        if panel.top() < r.top() + 1:
+                            continue           # 面板在上面/包住它：往上让没用
+                        lifted = panel.top() - self.SETTLE_GAP - r.height()
+                        if scr is not None and lifted < scr.top():
+                            continue           # 上面也没地方：盖住
+                        _log(f"grow: lift {win.box.name} {r.top()}->{lifted} "
+                             f"给展开面 {other.box.name} 让开")
+                        r.moveTop(lifted)
+                        break
                 win.box.x, win.box.y = int(r.x()), int(r.y())
                 items = self._snapshot(win)
                 # base 用「家」的尺寸（长大前那块），这样「谁在它上面」才判得准
