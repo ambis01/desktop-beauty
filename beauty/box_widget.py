@@ -1838,6 +1838,10 @@ class BoxWidget(GlassWindow):
             self.setGeometry(union)
         # 先挪窗口再算偏移：`_sync_paint_box` 用的是窗口原点的相对位置
         self._sync_paint_box()
+        # ⚠️ 改完尺寸**当场画一遍**：不然 Windows 会先把旧画面按新尺寸拉一下顶上
+        # 那一帧（用户 2026-11-16 报的「所有盒子展开收起都闪一下」就是这个——
+        # 每段动画开头/结尾各一次尺寸变化，就会闪两次）。
+        self.repaint()
         self._anim_p = 0.0
         self._anim_frames = 0
         self._anim_t0 = time.perf_counter()
@@ -1933,10 +1937,11 @@ class BoxWidget(GlassWindow):
             self._bar_t = 1.0 if self._bar else 0.0
             self._apply_collapsed_geometry()
             self._set_expanded_blur(False)
-            self.update()
+            self.repaint()          # 同上：尺寸变了就当场画一遍，别让那一帧空着
             return
         if not target.isNull() and self.geometry() != target:
             self.setGeometry(target)
+            self.repaint()
         # 展开完成：收起形态回到「缩略图标」（下次收起 / 拖动按它算）
         self._bar = False
         self._bar_t = 0.0
