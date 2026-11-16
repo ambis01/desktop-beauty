@@ -1834,13 +1834,13 @@ class BoxWidget(GlassWindow):
         union = QRect(self._anim_rect_from).united(self._anim_rect_to)
         self._anim_win = QRect(union)
         self._paint_rect = QRect(self._anim_rect_from)
+        # ⚠️ 先按「union 当窗口原点」把玻璃矩形算好，**再**改窗口尺寸：改尺寸那一下
+        # Qt 可能立刻来一次 paintEvent，那时要还是「没算过」的状态，就会按整窗大小
+        # 画一块大玻璃——用户看到的那一下白闪就是它（实测展开 A 第 10 帧整块区域
+        # 平均亮度 116→143→116，正好一帧）。
+        self._sync_paint_box(union)
         if union != self.geometry():
             self.setGeometry(union)
-        # 先挪窗口再算偏移：`_sync_paint_box` 用的是窗口原点的相对位置
-        self._sync_paint_box()
-        # ⚠️ 改完尺寸**当场画一遍**：不然 Windows 会先把旧画面按新尺寸拉一下顶上
-        # 那一帧（用户 2026-11-16 报的「所有盒子展开收起都闪一下」就是这个——
-        # 每段动画开头/结尾各一次尺寸变化，就会闪两次）。
         self.repaint()
         self._anim_p = 0.0
         self._anim_frames = 0
@@ -1882,14 +1882,18 @@ class BoxWidget(GlassWindow):
         )
         self._sync_paint_box()
 
-    def _sync_paint_box(self) -> None:
-        """按 `_paint_rect` 算画笔用的「玻璃矩形」（窗口坐标，已含余量）。"""
+    def _sync_paint_box(self, win: QRect | None = None) -> None:
+        """按 `_paint_rect` 算画笔用的「玻璃矩形」（窗口坐标，已含余量）。
+
+        `win` 给的是「窗口原点该用哪个」（改尺寸之前先用 union 算一遍）。
+        """
         r = self._paint_rect
         if r.isNull():
             self._paint_box = None
             return
         m = self._win_margin()
-        self._paint_box = QRect(r.x() - self.x() + m, r.y() - self.y() + m,
+        base = win if win is not None and not win.isNull() else self.geometry()
+        self._paint_box = QRect(r.x() - base.x() + m, r.y() - base.y() + m,
                                 r.width() - 2 * m, r.height() - 2 * m)
 
     def _paint_offset(self) -> QPoint:
