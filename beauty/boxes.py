@@ -27,6 +27,21 @@ INDEX_PATH = DATA_DIR / "boxes.json"
 SHORTCUT_EXT = (".lnk", ".url")
 DEBUG = bool(os.environ.get("DESKBEAUTY_DEBUG"))
 
+# 启动守卫（见 `place()`）：进程起来这几秒里不吃「挪家」
+_BOOT_T = time.monotonic()
+BOOT_GRACE = 8.0
+_PLACE_GUARD = True
+
+
+def _note(msg: str, *args) -> None:
+    """守卫专用日志：无条件写，方便事后查「启动那几秒谁想挪家」。"""
+    try:
+        path = os.path.join(os.environ.get("TEMP", "."), "deskbeauty-place-guard.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%H:%M:%S')} {msg % args if args else msg}\n")
+    except OSError:
+        pass
+
 
 def _log(msg: str, *args) -> None:
     if not DEBUG:
@@ -679,7 +694,18 @@ class BoxStore:
 
         `w/h` 是这一刻的收起尺寸；一起记下来当「基准尺寸」，之后它变大
         （横杠长回正常、拖进图标）时别人就知道该给它让开多少。
+
+        ⚠️ 2026-11-17 00:30 热修：进程刚起来的这几秒里**不吃** place()。
+        启动那一刻窗口几何还没定型，常驻盒一展开就把邻居推一遍（日志
+        `grow: down Z 482->714`），推完再走 `_clamp_to_screen` 把「被推开的
+        位置」当新家存盘——用户每重启一次，Z / 聊天工作 / X / 音乐卡片 就被
+        永久挪走。启动只该显示配置里的位置，不该改配置。
+        要恢复旧行为：BEAUTY_BOOT_PLACE=1
         """
+        if (_PLACE_GUARD and time.monotonic() - _BOOT_T < BOOT_GRACE
+                and os.environ.get("BEAUTY_BOOT_PLACE") != "1"):
+            _note("place ignored during boot %s -> %s,%s", box.name, x, y)
+            return
         box.home_x, box.home_y = int(x), int(y)
         box.x, box.y = int(x), int(y)
         if w > 0 and h > 0:

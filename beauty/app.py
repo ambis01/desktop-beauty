@@ -1629,6 +1629,18 @@ class Controller(QObject):
             if fixed:
                 self.store.save()
                 _log(f"home sizes seeded: {fixed}")
+            # ⚠️ 2026-11-17 00:15 热修：启动时**不再**自动整理/重排布局。
+            # 事故现场（app.log，重启第一秒）：
+            #   grow: relayout win=聊天工作 expanded=1
+            #   grow: down Z 482->714
+            #   homes untangled: 1 moved          ← 直接写盘，把家改了
+            # 启动那一刻窗口几何还没定型，`_relayout()` 会把常驻盒当展开去推邻居，
+            # 紧接着 `_untangle_homes()` 又把推出来的位置当成「坏配置」存回去——用户
+            # 每重启一次，Z 和聊天工作 就被永久挪走并压在一起（还波及卡片）。
+            # 启动只该负责「显示配置里存的位置」。要恢复旧行为：BEAUTY_STARTUP_LAYOUT=1
+            if os.environ.get("BEAUTY_STARTUP_LAYOUT") != "1":
+                _log("startup layout skipped (hotfix)")
+                return
             self._untangle_homes()
         except Exception as exc:  # noqa: BLE001 - 摆位置出错不能拦着启动
             _log(f"untangle failed: {exc!r}")
