@@ -58,6 +58,13 @@ from . import signal as sig
 from . import taskbar as tb
 from . import weather as weather_mod
 
+# 启动那几秒不做推让重排（见 `Controller._relayout` 里的守卫）。
+# 事故：启动时窗口几何还没定型，常驻盒一展开就触发重排，`_settle_layout` 用还没
+# 定型的矩形算「空位」，把 Z 摆到 1486,2、C 摆到 1239,695（app.log 实测）——用户
+# 看到的就是「重启之后好多东西位置变了、Z 还压住聊天工作/时钟」。
+_BOOT_MONO = time.monotonic()
+BOOT_LAYOUT_GRACE = 2.5
+
 
 LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "logo.png"
 
@@ -1374,6 +1381,13 @@ class Controller(QObject):
             # 以前只在 `_relayout_more` 上记了一笔、从来没人看它：展开/变大和重排撞在
             # 一起时，这次重排就永远不发生了——展开的盒子摆在那儿却没把邻居让开。
             self._relayout_more = True
+            return True
+        if (time.monotonic() - _BOOT_MONO < BOOT_LAYOUT_GRACE
+                and os.environ.get("BEAUTY_BOOT_LAYOUT") != "1"):
+            # 启动这几秒**不做推让**：窗口几何还没定型，算出来的「空位」是假的，
+            # 会把盒子摆到屏幕角上（实测 Z -> 1486,2、C -> 1239,695）。盒子先按配置
+            # 里的位置显示，之后正常操作再排（`BEAUTY_BOOT_LAYOUT=1` 恢复旧行为）。
+            _log("relayout skipped during boot")
             return True
         from .box_widget import is_dragging
         if is_dragging():
