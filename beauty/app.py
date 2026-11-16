@@ -122,6 +122,7 @@ class Controller(QObject):
         # `_layout_pass` 表示现在只在算逻辑坐标，窗口等算完统一滑过去。
         self._in_layout = False
         self._layout_pass = False
+        self._push_level = 0
         self._relayout_more = False
         self.card_widgets: dict[str, ClockWidget] = {}
         self.settings = None
@@ -1364,10 +1365,16 @@ class Controller(QObject):
             return True
         self._in_layout = True
         ok = True
-        # 「展开时把挡住的推开」是实验功能，默认**关**：关着的时候展开只会盖住
-        # （模糊），桌面上的盒子一个像素都不会自己动（用户 2026-11-16 定的：
-        # 宁可盖住也不要乱动，先把稳定保住，推让以后再一条一条加回来）
-        align_ok = bool(getattr(self.cfg, "box_push", False))
+        # 「展开时把挡住的推开」按等级一条一条开（见 Config.push_rules）：
+        # 0 = 只盖住、谁都不动；1 = 正下方；2 = +正侧面；3 = +往上；4 = +临时收横杠。
+        # 每级都过了压力测试才往上升（用户 2026-11-16 定的：一次只加一条）。
+        try:
+            level = int(getattr(self.cfg, "push_rules", 0) or 0)
+        except (TypeError, ValueError):
+            level = 0
+        level = max(0, min(4, level))
+        self._push_level = level
+        align_ok = level >= 1
         try:
             self._layout_pass = True
             boxes = [w for w in self.windows.values() if w.isVisible()]
@@ -1432,9 +1439,8 @@ class Controller(QObject):
                 else:
                     _log(f"grow: place {win.box.name} {r.left()},{r.top()} {r.width()}x{r.height()}")
                     self._apply_plan(win, r, plan)
-            # 3b) 只有开着「挤开」时才做：收起的盒子之间真叠住了，后建的那个让开
-            if align_ok:
-                self._pack_collapsed(boxes)
+            # 3b) 不再做「每次重排都重新打包」：那是之前「盒子自己乱跳」的来源。
+            #     真叠住的家由启动时 _untangle_homes 修一次，其余交给「盖住」。
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
@@ -1672,18 +1678,35 @@ class Controller(QObject):
             placed.append(QRect(best))
 
     def _plan_all(self, win, target, items, base, allow_collapse: bool = True):
-        """一份完整方案：(down, collapsed, row, up, side, blocked) 或 None（放不下）。"""
+        """一份完整方案：(down, collapsed, row, up, side, blocked)；让不开就等于空方案。
+
+        按 `_push_level` 只做已经验证过的那几条规则，其余的**一律盖住**：
+          1 正下方往下让；2 再加正侧面；3 再加往上；4 再加临时收横杠。
+        「让不开」不再等于失败（以前会直接放弃这次展开），而是盖住 + 模糊——
+        展开本身永远成立，这样每加一条规则都不会把「展开」整个搞坏。
+        """
+        try:
+            level = int(getattr(self, "_push_level", 0) or 0)
+        except (TypeError, ValueError):
+            level = 0
         below, sideable, above = self._split(win, target, items, base)
-        plan = self._plan_below(win, target, below, allow_collapse)
+        if level >= 1:
+            plan = self._plan_below(win, target, below,
+                                    bool(allow_collapse) and level >= 4)
+        else:
+            plan = ([], set(), [])
         if plan is None:
-            return None
+            plan = ([], set(), [])          # 让不开：盖住，不动别人
         moves, collapsed, row = plan
-        up = self._plan_up(win, target, above) if above else []
-        if up is None:
-            return None
-        virt = self._virt_items(items, list(moves) + list(up or []))
-        side, blocked = self._plan_sides(win, target, virt, sideable)
-        return moves, collapsed, row, up or [], side, blocked
+        up: list = []
+        if above and level >= 3:
+            up = self._plan_up(win, target, above) or []
+        virt = self._virt_items(items, list(moves) + list(up))
+        if level >= 2:
+            side, blocked = self._plan_sides(win, target, virt, sideable)
+        else:
+            side, blocked = [], [o for o, _b, _r in sideable]
+        return moves, collapsed, row, up, side, blocked
 
     def _place(self, win, w: int, h: int, items, base,
                allow_collapse: bool = True, sides=("right", "left")):
@@ -1714,7 +1737,8 @@ class Controller(QObject):
         best = None
         best_key = None
         for side in sides:
-            for up in (False, True):
+            ups = (False, True) if self._push_level >= 3 else (False,)
+            for up in ups:
                 y = bottom - h if up else top0
                 if side == "right":
                     x = win.box.x
@@ -2016,13 +2040,21 @@ class Controller(QObject):
         的待遇。
         """
         try:
-            if not bool(getattr(self.cfg, "box_push", False)):
+            try:
+                level = int(getattr(self.cfg, "push_rules", 0) or 0)
+            except (TypeError, ValueError):
+                level = 0
+            self._push_level = max(0, min(4, level))
+            if self._push_level == 0:
                 # 不推别人：只要展开面整块放得下就算勾得上
                 return self._panel_free(win) is not None
             got = self._panel_for(win, allow_collapse=False)
             if got is None:
                 return False
-            return not got[3][5]            # 侧面有推不开的就勾不上
+            plan = got[3]
+            if plan is None:
+                return True
+            return not plan[5]              # 侧面有推不开的就勾不上
         except Exception:  # noqa: BLE001 - 算不出来就别拦着人家
             return True
 

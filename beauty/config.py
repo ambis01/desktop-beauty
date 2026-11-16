@@ -119,9 +119,10 @@ class Config:
     panel_dark: bool = False             # 面板用深色（老字段，等价 panel_theme == dark）
     panel_theme: str = "light"           # 面板主题：light / dark / auto（跟随系统）
     auto_align: bool = True               # 自适应对齐：拖动卡片时自动避让 / 贴边
-    # 展开时把挡路的盒子推开（实验功能，**默认关**）。关着的时候展开只盖住，
-    # 桌面上的盒子一个像素都不会被挪走——用户 2026-11-16 定的：先要稳定。
-    box_push: bool = False
+    # 展开时把挡路的盒子推开：0 = 完全不推（只盖住）；1 = 只推正下方；2 = 再加正侧面；
+    # 3 = 再加「下面没地方就往上长 + 往上推」；4 = 再加「让不开就把 0 状态临时收成横杠」。
+    # **每加一级都要先过压力测试**（不压别人、不出屏、收起精确回原位、重复不漂移）。
+    push_rules: int = 0
     box_merge: bool = True                # 允许把一个收纳盒拖到另一个上面合并
     box_merge_bar: bool = False           # 两个都只剩横杠（状态 -1）的盒子也能互相合并
     box_sort: str = "name"                # 面板里收纳盒列表的排序：name / size / created
@@ -193,8 +194,12 @@ class Config:
         cfg.panel_theme = theme
         cfg.panel_dark = theme == "dark"
         cfg.auto_align = bool(raw.get("auto_align", True))
-        # 老配置里没有这个键 = 关（它是实验功能，默认关）
-        cfg.box_push = bool(raw.get("box_push", False))
+        # 老配置里只有 box_push（布尔）：true 当年等于「四个方向全开」
+        try:
+            cfg.push_rules = int(raw.get("push_rules", 4 if raw.get("box_push") else 0))
+        except (TypeError, ValueError):
+            cfg.push_rules = 0
+        cfg.push_rules = max(0, min(4, cfg.push_rules))
         cfg.box_merge = bool(raw.get("box_merge", True))
         cfg.box_merge_bar = bool(raw.get("box_merge_bar", False))
         sort = str(raw.get("box_sort", "name") or "name")
@@ -273,7 +278,7 @@ class Config:
             "panel_dark": bool(self.panel_dark),
             "panel_theme": str(self.panel_theme),
             "auto_align": bool(self.auto_align),
-            "box_push": bool(self.box_push),
+            "push_rules": int(self.push_rules),
             "box_merge": bool(self.box_merge),
             "box_merge_bar": bool(self.box_merge_bar),
             "box_sort": str(self.box_sort),
