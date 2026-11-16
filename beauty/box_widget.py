@@ -1847,8 +1847,14 @@ class BoxWidget(GlassWindow):
         # 平均亮度 116→143→116，正好一帧）。
         self._sync_paint_box(union)
         if union != self.geometry():
+            # 改尺寸那一瞬间把整窗透明度压到 0：合成器就算拿旧画面去拉，拉的也是
+            # 全透明的，看不到；同一次事件里马上恢复，不会真少一帧。
+            self.setWindowOpacity(0.0)
             self.setGeometry(union)
-        self.repaint()
+            self.repaint()
+            self.setWindowOpacity(1.0)
+        else:
+            self.repaint()
         self._anim_p = 0.0
         self._anim_frames = 0
         self._anim_t0 = time.perf_counter()
