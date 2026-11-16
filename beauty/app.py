@@ -1440,11 +1440,15 @@ class Controller(QObject):
                 # 所以不能用 `_collapsed_h()`（那还是横杠的 28），要按长完的高度算
                 h_after = (int(win._side_h) + TITLE_H if getattr(win, "_bar", False)
                            else int(win._collapsed_h()))
-                # ⚠️ 起点用**它现在的位置**，不是「家」：它可能刚被第 2 步里某个展开面
-                # 的计划推到下面去了（比如 B 常驻展开着，C 长回正常已经在面板下面），
-                # 这里再按家重置，C 就会「啪」地跳回常驻展开之前的位置、压进面板里。
-                r = QRect(int(win.box.x), int(win.box.y),
-                          int(win._side_w), h_after)
+                # ⚠️ 起点用**它现在显示在哪儿**（这次重排开始时的位置），不是「家」：
+                # 它可能正被长大的邻居让在下面（或正被某块展开面挤开）。按家算，
+                # 一长大就会「啪」地跳回那个被压住的家，然后才让别人来推——看着就是
+                # 抽搐/换位（用户 2026-11-16 报的两回都是这个）。
+                try:
+                    ox, oy = disp[id(win)]
+                except KeyError:
+                    ox, oy = int(win.box.x), int(win.box.y)
+                r = QRect(int(ox), int(oy), int(win._side_w), h_after)
                 # 长完之后可能顶出屏幕（比如家就在最下面、它又变高了）：先夹回来，
                 # 夹完的位置就是它这次显示的位置（收起时还是回家）
                 try:
@@ -1578,12 +1582,26 @@ class Controller(QObject):
                 if w.is_expanded:
                     continue
                 ox, oy = disp[id(w)]
+                moved_x = int(w.box.x) != ox
+                moved_y = int(w.box.y) != oy
+                if not (moved_x or moved_y):
+                    continue
                 try:
-                    if int(w.box.x) != ox:
+                    if w._anim_timer.isActive():
+                        # 它自己的「横杠长回正常 / 收起」动画还在跑：那段动画的落点
+                        # 本来就是按**现在**的位置算的，这里再起一段滑动会两个动画
+                        # 抢 geometry——看着就是抽搐（用户 2026-11-16：B 常驻展开着，
+                        # A 从横杠长回正常，A 的窗口 y 一会儿 79 一会儿 48 一会儿 91）。
+                        # 所以只把落点换成新位置，不再叠一段滑动。
+                        m = w._win_margin()
+                        w._anim_rect_to = QRect(int(w.box.x) - m, int(w._glass_top()) - m,
+                                                int(w._win_w()), int(w._win_h()))
+                        continue
+                    if moved_x:
                         w.slide_x_to(int(w.box.x))
-                    if int(w.box.y) != oy:
+                    if moved_y:
                         w.slide_to(int(w.box.y))
-                except (RuntimeError, TypeError):
+                except (RuntimeError, TypeError, AttributeError):
                     continue
             card_moved = False
             for c in cards:

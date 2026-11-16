@@ -1206,6 +1206,12 @@ class BoxWidget(GlassWindow):
         **勾不成功**（抖一下、保持不勾），用户定的「展不成 1 就不许勾着」。
         """
         on = bool(on)
+        if on and self._state() == -1:
+            # 横杠状态下不许勾「常驻展开」（用户 2026-11-16 定的）：勾着就得是 1，
+            # 可它现在是一条横杠，一勾要连着变两次状态——以前就这么变出
+            # 「pinned=1 但状态是 -1」的双重状态，后面一堆逻辑按 1 算，越修越乱。
+            self.shake()
+            return
         if on and not getattr(self.box, "pinned", False) and not self._pin_room():
             self.shake()
             return
@@ -2695,6 +2701,12 @@ class BoxWidget(GlassWindow):
                        -1 if st != -1 else
                        (1 if getattr(self.box, "pinned", False) else 0))
             if st == 1:
+                if getattr(self.box, "pinned", False):
+                    # 常驻展开（勾着常驻）不许双击收成横杠：勾着就必须是 1，收成 -1
+                    # 就留下「pinned=1 + 状态 -1」的双重状态（用户 2026-11-16 要求
+                    # 直接挡住）。想收起来先到三点菜单里取消「常驻展开」。
+                    self.shake()
+                    return
                 # 展开 → -1：一步收到只剩横杠（缩略图标这一路都不画，
                 # 不然动画最后一帧会「啪」地消失）
                 self._bar = True
