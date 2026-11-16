@@ -218,6 +218,11 @@ class BoxData:
     # 「展开再收起，盒子回不到原位、还越推越远」）。
     home_x: int = -1
     home_y: int = -1
+    # 摆好那一刻的收起尺寸。现在比它大 = 这块「长大了」（横杠长回正常、拖进图标），
+    # 别人得给它让开：每次重排都按「现尺寸 vs home 尺寸」重新算，所以让开的结果
+    # 不会丢、也不用把别人的位置写死。拖动 / 建盒时跟着更新。
+    home_w: int = -1
+    home_h: int = -1
 
     def __post_init__(self) -> None:
         if self.home_x < 0:
@@ -323,6 +328,8 @@ class BoxStore:
                     created=float(item.get("created", 0.0) or 0.0),
                     home_x=int(item.get("home_x", -1)),
                     home_y=int(item.get("home_y", -1)),
+                    home_w=int(item.get("home_w", -1)),
+                    home_h=int(item.get("home_h", -1)),
                 ))
             except (KeyError, TypeError, ValueError):
                 continue
@@ -666,8 +673,15 @@ class BoxStore:
         """
         box.x, box.y = int(x), int(y)
 
-    def place(self, box: BoxData, x: int, y: int) -> None:
-        """用户亲手把它放在这儿：这才是它的家，落盘。"""
+    def place(self, box: BoxData, x: int, y: int,
+              w: int = -1, h: int = -1) -> None:
+        """用户亲手把它放在这儿：这才是它的家，落盘。
+
+        `w/h` 是这一刻的收起尺寸；一起记下来当「基准尺寸」，之后它变大
+        （横杠长回正常、拖进图标）时别人就知道该给它让开多少。
+        """
         box.home_x, box.home_y = int(x), int(y)
         box.x, box.y = int(x), int(y)
+        if w > 0 and h > 0:
+            box.home_w, box.home_h = int(w), int(h)
         self.save()

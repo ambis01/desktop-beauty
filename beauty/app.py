@@ -1372,7 +1372,7 @@ class Controller(QObject):
             level = int(getattr(self.cfg, "push_rules", 0) or 0)
         except (TypeError, ValueError):
             level = 0
-        level = max(0, min(4, level))
+        level = max(0, min(5, level))
         self._push_level = level
         align_ok = level >= 1
         try:
@@ -1441,6 +1441,35 @@ class Controller(QObject):
                     self._apply_plan(win, r, plan)
             # 3b) 不再做「每次重排都重新打包」：那是之前「盒子自己乱跳」的来源。
             #     真叠住的家由启动时 _untangle_homes 修一次，其余交给「盖住」。
+            # 3c) 「长大了」的那几块（横杠长回正常、拖进图标变高）也要占地方：
+            #     现尺寸 > 家的尺寸就算长大，每次重排都按这个条件重新让开——
+            #     所以既不会把别人的位置写死，也不会「让开一次就丢」。
+            if level >= 5:
+                grown = []
+                for w in boxes:
+                    if w.is_expanded:
+                        continue
+                    hw = int(getattr(w.box, "home_w", -1) or -1)
+                    hh = int(getattr(w.box, "home_h", -1) or -1)
+                    if hw <= 0 or hh <= 0:
+                        continue
+                    try:
+                        if int(w._side_w) > hw or int(w._collapsed_h()) > hh:
+                            grown.append(w)
+                    except (RuntimeError, TypeError, AttributeError):
+                        continue
+                for w in sorted(grown,
+                                key=lambda x: (float(x.box.created or 0.0), x.box.id)):
+                    try:
+                        r = QRect(int(w.box.x), int(w.box.y),
+                                  int(w._side_w), int(w._collapsed_h()))
+                    except (RuntimeError, TypeError, AttributeError):
+                        continue
+                    items = self._snapshot(w)
+                    plan = self._plan_all(w, r, items, r)
+                    if plan is not None:
+                        _log(f"grow: grown {w.box.name} {r.width()}x{r.height()}")
+                        self._apply_plan(w, r, plan)
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
@@ -1511,8 +1540,18 @@ class Controller(QObject):
         当场算会把所有盒子都当成「不存在」，等于什么都没做。
         """
         try:
-            _log(f"startup layout: {len(self.windows)} boxes visible="
-                 f"{sum(1 for w in self.windows.values() if w.isVisible())}")
+            # 老数据没有「基准尺寸」：把现在这一刻的尺寸当成基准（不会因此挪任何东西），
+            # 之后它再变大（横杠长回正常 / 拖进图标）才有东西可比
+            fixed = 0
+            for w in self.windows.values():
+                if (int(getattr(w.box, "home_w", -1) or -1) <= 0
+                        or int(getattr(w.box, "home_h", -1) or -1) <= 0):
+                    w.box.home_w = int(w._side_w)
+                    w.box.home_h = int(w._collapsed_h())
+                    fixed += 1
+            if fixed:
+                self.store.save()
+                _log(f"home sizes seeded: {fixed}")
             self._untangle_homes()
         except Exception as exc:  # noqa: BLE001 - 摆位置出错不能拦着启动
             _log(f"untangle failed: {exc!r}")
@@ -2044,7 +2083,7 @@ class Controller(QObject):
                 level = int(getattr(self.cfg, "push_rules", 0) or 0)
             except (TypeError, ValueError):
                 level = 0
-            self._push_level = max(0, min(4, level))
+            self._push_level = max(0, min(5, level))
             if self._push_level == 0:
                 # 不推别人：只要展开面整块放得下就算勾得上
                 return self._panel_free(win) is not None
@@ -2656,14 +2695,14 @@ class Controller(QObject):
             px, py = int(x), int(y)
         px, py = self._clamp_box_pos(px, py, w, h)
         win.box.x, win.box.y = px, py
-        self.store.place(win.box, px, py)      # 新建的盒子：这儿就是它的家
+        self.store.place(win.box, px, py, w, h)   # 新建的盒子：这儿就是它的家
         win._apply_collapsed_geometry()
         if beside is not None:
             # 「贴边建盒」时如果一圈都占满了，最后还得把新盒子推出去；
             # 重心建盒 / 落在图标上建盒不能这么干——那个位置本来就是目标点
             win._avoid_overlap()
             if (win.box.x, win.box.y) != (px, py):
-                self.store.place(win.box, win.box.x, win.box.y)
+                self.store.place(win.box, win.box.x, win.box.y, w, h)
         QTimer.singleShot(0, lambda: self._make_room(win))
         self._sync_ui()
         return win

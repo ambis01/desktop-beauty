@@ -120,7 +120,8 @@ class Config:
     panel_theme: str = "light"           # 面板主题：light / dark / auto（跟随系统）
     auto_align: bool = True               # 自适应对齐：拖动卡片时自动避让 / 贴边
     # 展开时把挡路的盒子推开：0 = 完全不推（只盖住）；1 = 只推正下方；2 = 再加正侧面；
-    # 3 = 再加「下面没地方就往上长 + 往上推」；4 = 再加「让不开就把 0 状态临时收成横杠」。
+    # 3 = 再加「下面没地方就往上长 + 往上推」；4 = 再加「让不开就把 0 状态临时收成横杠」；
+    # 5 = 再加「盒子自己变大（横杠长回正常 / 拖进图标）时，邻居也让开」。
     # **每加一级都要先过压力测试**（不压别人、不出屏、收起精确回原位、重复不漂移）。
     push_rules: int = 0
     box_merge: bool = True                # 允许把一个收纳盒拖到另一个上面合并
@@ -199,7 +200,7 @@ class Config:
             cfg.push_rules = int(raw.get("push_rules", 4 if raw.get("box_push") else 0))
         except (TypeError, ValueError):
             cfg.push_rules = 0
-        cfg.push_rules = max(0, min(4, cfg.push_rules))
+        cfg.push_rules = max(0, min(5, cfg.push_rules))
         cfg.box_merge = bool(raw.get("box_merge", True))
         cfg.box_merge_bar = bool(raw.get("box_merge_bar", False))
         sort = str(raw.get("box_sort", "name") or "name")

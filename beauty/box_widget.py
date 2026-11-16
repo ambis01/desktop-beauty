@@ -830,7 +830,7 @@ class BoxWidget(GlassWindow):
         hy = min(max(int(self.box.home_y), avail.top()),
                  avail.bottom() + 1 - self._collapsed_h())
         if (hx, hy) != (int(self.box.home_x), int(self.box.home_y)):
-            self.store.place(self.box, hx, hy)
+            self.store.place(self.box, hx, hy, self._side_w, self._collapsed_h())
         x = min(max(int(self.box.x), avail.left()), avail.right() + 1 - self._side_w)
         y = min(max(int(self.box.y), avail.top()), avail.bottom() + 1 - self._collapsed_h())
         if (x, y) != (int(self.box.x), int(self.box.y)):
@@ -3032,7 +3032,8 @@ class BoxWidget(GlassWindow):
             self._clamp_to_screen()
             _log("after clamp pos=%s box=%s", self.pos(), (self.box.x, self.box.y))
             self._avoid_overlap()
-            self.store.place(self.box, self.box.x, self.box.y)
+            self.store.place(self.box, self.box.x, self.box.y,
+                              self._side_w, self._collapsed_h())
             self.changed.emit()
             # 盒子拖到哪儿，压在下面的桌面图标就挪开——放到事件之后再做，
             # 免得松手瞬间卡一下
@@ -3124,7 +3125,8 @@ class BoxWidget(GlassWindow):
             self.setGeometry(self._rect_expanded)
         else:
             self._apply_collapsed_geometry()
-        self.store.place(self.box, self.box.x, self.box.y)
+        self.store.place(self.box, self.box.x, self.box.y,
+                          self._side_w, self._collapsed_h())
         self.changed.emit()
         QTimer.singleShot(0, self._push_desktop_icons)
 
