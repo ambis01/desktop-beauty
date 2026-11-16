@@ -1730,8 +1730,10 @@ class Controller(QObject):
             level = 0
         below, sideable, above = self._split(win, target, items, base)
         if level >= 1:
-            plan = self._plan_below(win, target, below,
-                                    bool(allow_collapse) and level >= 4)
+            # 等级 4 是「临时收成横杠」那条规则，**单独一级**：只有在 4 级才允许。
+            # （5 级是「变大的时候让开」，不和这条混在一起——4 级还没有能稳定
+            #  复现的用例，不能因为升到 5 级就顺带把没验过的规则打开）
+            plan = self._plan_below(win, target, below, bool(allow_collapse) and level == 4)
         else:
             plan = ([], set(), [])
         if plan is None:
