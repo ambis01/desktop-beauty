@@ -2333,7 +2333,10 @@ class Controller(QObject):
         if self._in_layout:
             self._relayout_more = True      # 这一轮算完会补一轮，不会吞掉
             return True
-        return self._relayout()
+        # 把「是谁刚展开的」传进去：不传的话 `_panel_keep` 会把它当成「早就展开着
+        # 的那块」，沿用上一次的 side/up——一个从来没展开过的盒子默认 right/down，
+        # 于是面板就贴着原样摆，直接压到别的面板上（用户 2026-11-16 报的「和 A 重叠」）。
+        return self._relayout(win)
 
     def _pin_check(self, win) -> bool:
         """勾「常驻展开」之前问一句：四个方向都让得开吗？（只算，绝不动）
