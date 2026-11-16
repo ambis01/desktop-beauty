@@ -1416,11 +1416,18 @@ class Controller(QObject):
                 # 又滑回来——用户 2026-11-16 报的「点一下盒子就抽搐」就是这个。
                 ox, oy = disp[id(w)]
                 w.box.x, w.box.y = int(ox), int(oy)
-                if align_ok:
-                    got = self._panel_for(
-                        w, allow_collapse=not bool(getattr(w.box, "pinned", False)))
-                else:
-                    got = self._panel_free(w)
+                got = None
+                if align_ok and w is not win:
+                    # 已经展开着的那块：**面板位置别动**，只重算要不要推开别人。
+                    # 每块都重新挑位置的话，旁边再展开一块就会让它跳一下
+                    # （用户 2026-11-16：展开 C，A 的面板从 y=380 跳到 134）。
+                    got = self._panel_keep(w)
+                if got is None:
+                    if align_ok:
+                        got = self._panel_for(
+                            w, allow_collapse=not bool(getattr(w.box, "pinned", False)))
+                    else:
+                        got = self._panel_free(w)
                 if got is None:
                     continue
                 want, side, up, plan = got
@@ -1518,6 +1525,37 @@ class Controller(QObject):
             if self._relayout_more:
                 self._relayout_more = False
                 QTimer.singleShot(0, self._relayout)
+
+    def _panel_keep(self, win):
+        """已经展开着的那块：面板**留在原地**（side / up 沿用上一次），只算推让。
+
+        为什么不能每次都重新挑位置：`_place` 是「挡住的越少越好」，旁边再展开一块
+        就会改变它的评分，于是面板当场跳一下（用户 2026-11-16 报的：展开 C，
+        常驻的 A 面板从 y=380 跳到 134）。展开面本身不许被推、也不该自己乱动。
+        """
+        try:
+            m = win._win_margin()
+            size = win._expanded_rect()
+            w = size.width() - 2 * m
+            h = size.height() - 2 * m
+            base = QRect(int(win.box.x), int(win.box.y),
+                         int(win._side_w), int(win._collapsed_h()))
+            side = getattr(win, "_expand_side", "right")
+            side = "left" if side == "left" else "right"
+            up = bool(getattr(win, "_grew_up", False))
+            x = base.x() if side == "right" else base.x() + base.width() - w
+            y = base.y() + base.height() - h if up else base.y()
+            want = QRect(x, y, w, h)
+            scr = (win.screen() or self.app.primaryScreen()).availableGeometry()
+            want.moveLeft(min(max(want.left(), scr.left()), scr.right() + 1 - w))
+            want.moveTop(min(max(want.top(), scr.top()), scr.bottom() + 1 - h))
+            items = self._snapshot(win)
+        except (RuntimeError, TypeError, AttributeError):
+            return None
+        plan = self._plan_all(
+            win, want, items, base,
+            allow_collapse=not bool(getattr(win.box, "pinned", False)))
+        return want, side, up, plan
 
     def _panel_for(self, win, allow_collapse: bool = True):
         """展开面摆哪儿：(want, side, up, plan) 或 None。按它**现在的位置**算。"""
@@ -1781,16 +1819,22 @@ class Controller(QObject):
         gap = 0     # 盒子之间只要**不压住**就行（用户本来就常只隔 2~8px，
                     # 按 10px 排会把没挡路的箱子也顶开，就是以前那个「自己动几像素」）
         placed: list[QRect] = []
+        panels: list[QRect] = []         # 展开面（**真实**玻璃矩形，判「压住了没有」）
+        pinned_panels: list[QRect] = []  # 勾了常驻的展开面：下面的盒子必须让开
         movable: list = []
         for w in boxes:
             if w.is_expanded:
                 try:
                     m = w._win_margin()
-                    # 展开面周围留一个空隙（和 panel 自己推让用的 SETTLE_GAP 一致），
-                    # 所以把它按 -gap 撑大后放进 fixed 里
                     g = self.SETTLE_GAP
-                    placed.append(w._expanded_rect().adjusted(m - g, m - g,
-                                                              -m + g, -m + g))
+                    r_true = w._expanded_rect().adjusted(m, m, -m, -m)
+                    # 放的时候按撑大了 10px 的算（和面板自己推让留的空隙一致），
+                    # 但**判有没有压住**要用真实矩形：不然只差 2px 也算压住，
+                    # 会把明明没挡路的盒子顶开（用户报的「没挡路却被挪了」）。
+                    placed.append(r_true.adjusted(-g, -g, g, g))
+                    panels.append(r_true)
+                    if bool(getattr(w.box, "pinned", False)):
+                        pinned_panels.append(r_true)
                 except (RuntimeError, TypeError, AttributeError):
                     pass
                 continue
@@ -1826,17 +1870,29 @@ class Controller(QObject):
         grown.sort(key=lambda w: (-int(eff_size(w)[0]) * int(eff_size(w)[1]),
                                   int(w.box.home_y), int(w.box.home_x), w.box.id))
         # 2) 长大了的先占位
+        def preferred(w, ww: int, wh: int) -> tuple[int, int]:
+            """首选位置：一般是「家」；但要是**第 2 步的展开面已经把它推走了**
+            （现在的位置 != 家），而且那个位置没压着面板，就留在那儿——不然它会
+            滑回家、路上正好穿过另一块展开面（用户 2026-11-16 报的「聊天工作被
+            往左推着和 A 叠住」就是这么来的）。"""
+            cx, cy = int(w.box.x), int(w.box.y)
+            hx, hy = int(w.box.home_x), int(w.box.home_y)
+            if (cx, cy) != (hx, hy):
+                try:
+                    here = QRect(cx, cy, int(ww), int(wh)).adjusted(-gap, -gap, gap, gap)
+                    if not any(here.intersects(p) for p in panels):
+                        return cx, cy
+                except (RuntimeError, TypeError, AttributeError):
+                    pass
+            return hx, hy
+
         grown_rects: list[QRect] = []
         for w in grown:
             try:
                 ww, wh = size_of(w)
                 if w is win and win_h:
                     wh = int(win_h)
-                if w is win:
-                    # 刚长大的这块留在它现在显示的地方（用户刚点它，别跳）
-                    bx, by = int(w.box.x), int(w.box.y)
-                else:
-                    bx, by = int(w.box.home_x), int(w.box.home_y)
+                bx, by = preferred(w, ww, wh)
                 r = QRect(bx, by, int(ww), int(wh))
             except (RuntimeError, TypeError, AttributeError):
                 continue
@@ -1849,9 +1905,10 @@ class Controller(QObject):
             w.box.x, w.box.y = int(best.x()), int(best.y())
             placed.append(QRect(best))
             grown_rects.append(QRect(best))
-        if not grown_rects:
+        if not grown_rects and not pinned_panels:
             return
-        # 3) 只收拾「被长大的盒子压住」的那些（按家位置从左上往右下，结果稳定）
+        # 3) 收拾「被长大的盒子压住」和「压在常驻展开面底下」的那些
+        #    （按家位置从左上往右下，结果稳定）
         for w in sorted((x for x in boxes if not x.is_expanded),
                         key=lambda x: (int(x.box.home_y), int(x.box.home_x), x.box.id)):
             if w is win or w in grown:
@@ -1861,7 +1918,11 @@ class Controller(QObject):
                           int(w._side_w), int(w._collapsed_h()))
             except (RuntimeError, TypeError, AttributeError):
                 continue
-            if not any(r.intersects(g) for g in grown_rects):
+            hit = any(r.intersects(g) for g in grown_rects)
+            if not hit:
+                # 常驻展开的面板底下也不许压着（它不会自己收起来，压着就一直糊）
+                hit = any(r.intersects(p) for p in pinned_panels)
+            if not hit:
                 continue                     # 没被压住：一个像素都不动
             best = self._nearest_slot(r, placed, scr, gap)
             if best is None:
