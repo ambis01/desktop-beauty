@@ -1433,149 +1433,26 @@ class Controller(QObject):
                 _log(f"grow: expand {w.box.name} side={side} up={up} at {want.left()},{want.top()}")
                 if align_ok and plan is not None:
                     self._apply_plan(w, want, plan)
-            # 3) 刚变大的那个：它自己那块也算占地方
+            # 3) 长大了的那几块（横杠长回正常、拖进图标变高）要占地方。
+            #    ⚠️ 2026-11-16 换算法：不再「一条链往下推」，改成**按「离原位最近」
+            #    安置**（见 `_settle_layout`）。往下推会一路传到屏幕底，看着就是
+            #    「桌面排成一列一列」；就近安置是谁都在自己原来位置附近找空位。
+            win_h = None
             if win is not None and win in boxes and not win.is_expanded:
                 from .box_widget import TITLE_H
                 # 横杠 → 正常这一步发生在 `_set_bar` 把 `_bar` 改掉**之前**，
                 # 所以不能用 `_collapsed_h()`（那还是横杠的 28），要按长完的高度算
-                h_after = (int(win._side_h) + TITLE_H if getattr(win, "_bar", False)
-                           else int(win._collapsed_h()))
-                # ⚠️ 起点用**它现在显示在哪儿**（这次重排开始时的位置），不是「家」：
-                # 它可能正被长大的邻居让在下面（或正被某块展开面挤开）。按家算，
-                # 一长大就会「啪」地跳回那个被压住的家，然后才让别人来推——看着就是
-                # 抽搐/换位（用户 2026-11-16 报的两回都是这个）。
+                win_h = (int(win._side_h) + TITLE_H if getattr(win, "_bar", False)
+                         else int(win._collapsed_h()))
+                # 起点用**它现在显示在哪儿**（这次重排开始时的位置），不是「家」：
+                # 按家算，一长大就会「啪」地跳回那个被压住的家（抽搐/叠住）。
                 try:
                     ox, oy = disp[id(win)]
                 except KeyError:
                     ox, oy = int(win.box.x), int(win.box.y)
-                r = QRect(int(ox), int(oy), int(win._side_w), h_after)
-                # 长完之后可能顶出屏幕（比如家就在最下面、它又变高了）：先夹回来，
-                # 夹完的位置就是它这次显示的位置（收起时还是回家）
-                try:
-                    scr = (win.screen() or self.app.primaryScreen()).availableGeometry()
-                    r.moveLeft(min(max(r.left(), scr.left()),
-                                   scr.right() + 1 - r.width()))
-                    r.moveTop(min(max(r.top(), scr.top()),
-                                  scr.bottom() + 1 - r.height()))
-                except (RuntimeError, TypeError, AttributeError):
-                    scr = None
-                if align_ok and level >= 5:
-                    # 展开面是「不让」的；长大的这块要是压住了某块展开面，就**它自己
-                    # 往上让**（面板在上面 / 包住它的情况让不了，那就盖住）。
-                    # 用户 2026-11-16 报的「A 长回正常，没推开 B 常驻展开的面板，
-                    # 直接叠上去了」就是这里。
-                    for other in boxes:
-                        if other is win or not getattr(other, "is_expanded", False):
-                            continue
-                        try:
-                            panel = other.collapsed_rect()
-                        except (RuntimeError, TypeError):
-                            continue
-                        if not panel.intersects(r):
-                            continue
-                        if panel.top() < r.top() + 1:
-                            continue           # 面板在上面/包住它：往上让没用
-                        lifted = panel.top() - self.SETTLE_GAP - r.height()
-                        if scr is not None and lifted < scr.top():
-                            continue           # 上面也没地方：盖住
-                        _log(f"grow: lift {win.box.name} {r.top()}->{lifted} "
-                             f"给展开面 {other.box.name} 让开")
-                        r.moveTop(lifted)
-                        break
-                win.box.x, win.box.y = int(r.x()), int(r.y())
-                items = self._snapshot(win)
-                # base 用「家」的尺寸（长大前那块），这样「谁在它上面」才判得准
-                hw0 = int(getattr(win.box, "home_w", -1) or -1) or int(win._side_w)
-                hh0 = int(getattr(win.box, "home_h", -1) or -1) or int(win._collapsed_h())
-                base0 = QRect(int(win.box.home_x), int(win.box.home_y), hw0, hh0)
-                if align_ok and level >= 5:
-                    # 「变大时邻居让开」只在 5 级开。1~4 级**只摆它自己**、别人一个
-                    # 像素都不动（用户 2026-11-16 报的「展开两块换位」就是这里：
-                    # 只长高的盒子把上面的邻居往下推、它自己又被对方推走，两块对调）
-                    # 变大的时候只许往下/侧推、不许往上抬，和 3c 保持一致
-                    self._push_level = min(2, level)
-                    try:
-                        plan = self._plan_all(win, r, items, base0)
-                    finally:
-                        self._push_level = level
-                    if plan is None:
-                        ok = False
-                    else:
-                        _log(f"grow: place {win.box.name} {r.left()},{r.top()} "
-                             f"{r.width()}x{r.height()}")
-                        self._apply_plan(win, r, plan)
-            # 3b) 不再做「每次重排都重新打包」：那是之前「盒子自己乱跳」的来源。
-            #     真叠住的家由启动时 _untangle_homes 修一次，其余交给「盖住」。
-            # 3c) 「长大了」的那几块（横杠长回正常、拖进图标变高）也要占地方：
-            #     现尺寸 > 家的尺寸就算长大，每次重排都按这个条件重新让开——
-            #     所以既不会把别人的位置写死，也不会「让开一次就丢」。
-            #
-            # ⚠️ 这里的铁律（2026-11-16 用户报「两块换位」后定的）：
-            #   * 展开面**绝不**被推；长大了的盒子只许被「家位置在它上面」的那块往下推
-            #     （见下面的 `_ok`）——上下顺序永远不变，所以不会换位；
-            #   * 长大的盒子只把别人往**下 / 侧面**推，绝不往上抬（往上抬会跨到
-            #     上面那块头上，看着就是「换位」）。
+                win.box.x, win.box.y = int(ox), int(oy)
             if level >= 5:
-                grown = []
-                for w in boxes:
-                    if w.is_expanded:
-                        continue
-                    hw = int(getattr(w.box, "home_w", -1) or -1)
-                    hh = int(getattr(w.box, "home_h", -1) or -1)
-                    if hw <= 0 or hh <= 0:
-                        continue
-                    try:
-                        if int(w._side_w) > hw or int(w._collapsed_h()) > hh:
-                            grown.append(w)
-                    except (RuntimeError, TypeError, AttributeError):
-                        continue
-                solid = {id(w) for w in boxes if w.is_expanded}
-                solid |= {id(w) for w in grown}
-                old_level = self._push_level
-                self._push_level = min(2, old_level)   # 只往下/侧推，不往上抬
-                try:
-                    for w in sorted(grown,
-                                    key=lambda x: (float(x.box.created or 0.0), x.box.id)):
-                        try:
-                            r = QRect(int(w.box.x), int(w.box.y),
-                                      int(w._side_w), int(w._collapsed_h()))
-                        except (RuntimeError, TypeError, AttributeError):
-                            continue
-                        items = self._snapshot(w)
-                        hw0 = int(getattr(w.box, "home_w", -1) or -1) or int(w._side_w)
-                        hh0 = int(getattr(w.box, "home_h", -1) or -1) or int(w._collapsed_h())
-                        base0 = QRect(int(w.box.home_x), int(w.box.home_y), hw0, hh0)
-                        plan = self._plan_all(w, r, items, base0)
-                        if plan is None:
-                            continue
-                        moves, collapsed, row, up, side, blocked = plan
-                        # 谁能被推：不是固体的都能；**家位置在自己下面**的固体也能，
-                        # 但只许往下推。这样「两块都长大了」时不会出现「上一轮推开了、
-                        # 这一轮又缩回去」（随机压测里 展开 E 就把 B 弹回了家）；
-                        # 家位置在自己上面的固体一律不推——那才会换位。
-                        here = (int(w.box.home_y), int(w.box.home_x))
-
-                        def _ok(o, here=here):
-                            if getattr(o, "is_expanded", False):
-                                return False           # 展开面绝不推
-                            if id(o) not in solid:
-                                return True
-                            return (int(o.box.home_y), int(o.box.home_x)) > here
-
-                        moves = [m for m in moves if _ok(m[0])]
-                        up = [m for m in up if id(m[0]) not in solid]
-                        side = [m for m in side if id(m[0]) not in solid]
-                        if not (moves or up or side):
-                            continue
-                        _log(f"grow: grown {w.box.name} {r.width()}x{r.height()}")
-                        self._apply_plan(w, r, (moves, collapsed, row, up, side, blocked))
-                finally:
-                    self._push_level = old_level
-                # ⚠️ 这里以前还有一段「固体之间真叠住了就把靠下的那块再往下顶」的循环。
-                # 2026-11-16 删掉：它按 SETTLE_GAP（10px）顶，本来只压住 4px 的两块会被
-                # 顶开 7px；而且它一轮一轮往下传，9 块盒子都长大之后会一路顶到屏幕底
-                # （随机压测里 外设 499→646、收纳盒 →794）。让开已经由上面的 3c 算过，
-                # 这里再顶一遍只会造成「盒子自己跑了」。
+                self._settle_layout(boxes, win, win_h)
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
@@ -1849,6 +1726,151 @@ class Controller(QObject):
                 if not hits(cand):
                     return cand
         return None
+
+    def _nearest_slot(self, r: QRect, placed, scr, gap: int = 0) -> QRect | None:
+        """离 r 最近、不压 placed、整块在屏幕里的位置（上下左右 + 斜着都试）。
+
+        和 `_free_slot` 的区别：步长细一点（约 1/3 块大小），找出来的位置更贴近
+        原位；`_free_slot` 是「整块挪一格」的用法（启动整理），别混用。
+        """
+        def fits(rr: QRect) -> bool:
+            if (rr.left() < scr.left() or rr.top() < scr.top()
+                    or rr.right() > scr.right() or rr.bottom() > scr.bottom()):
+                return False
+            probe = rr.adjusted(-gap, -gap, gap, gap)
+            return not any(probe.intersects(o) for o in placed)
+
+        if fits(r):
+            return QRect(r)
+        step_x = max(16, r.width() // 3)
+        step_y = max(16, r.height() // 3)
+        seen = {(r.x(), r.y())}
+        for k in range(1, 160):
+            for dx, dy in ((0, k * step_y), (k * step_x, 0), (0, -k * step_y),
+                           (-k * step_x, 0),
+                           (k * step_x, k * step_y), (-k * step_x, k * step_y),
+                           (k * step_x, -k * step_y), (-k * step_x, -k * step_y)):
+                cand = r.translated(dx, dy)
+                key = (cand.x(), cand.y())
+                if key in seen:
+                    continue
+                seen.add(key)
+                if fits(cand):
+                    return cand
+        return None
+
+    def _settle_layout(self, boxes, win=None, win_h: int | None = None) -> None:
+        """5 级：让「占地方」的盒子按**离原位最近**安置，而不是一条链往下推。
+
+        用户 2026-11-16 定的：一堆盒子同时变成缩略图大小时，只往下推会一路顶到
+        屏幕底（看着像排成一列一列）；应该谁都在自己原来位置附近找个空位。
+
+        顺序（只看当前状态，不看「这次是谁点的」，所以同一套状态算两遍结果一样）：
+          1. 展开面不动（第 2 步已经摆好了，它周围留一个空隙）；
+          2. 长大了的盒子先占位（面积大的先）；
+          3. 最后只处理**被长大的盒子压住**的那些：挪到最近的不压住别人的位置。
+             没被压住的一块都不许动——第 2 步面板推让的结果要原样保留，否则
+             两套机制会互相打架（压测里展开 Z，A/C 被无端挪了 60/92px）。
+
+        「长大了」= 现在比基准尺寸大（横杠 → 缩略图 / 拖进图标变高）。
+        """
+        try:
+            scr = (boxes[0].screen() or self.app.primaryScreen()).availableGeometry()
+        except (RuntimeError, TypeError, AttributeError, IndexError):
+            return
+        gap = 0     # 盒子之间只要**不压住**就行（用户本来就常只隔 2~8px，
+                    # 按 10px 排会把没挡路的箱子也顶开，就是以前那个「自己动几像素」）
+        placed: list[QRect] = []
+        movable: list = []
+        for w in boxes:
+            if w.is_expanded:
+                try:
+                    m = w._win_margin()
+                    # 展开面周围留一个空隙（和 panel 自己推让用的 SETTLE_GAP 一致），
+                    # 所以把它按 -gap 撑大后放进 fixed 里
+                    g = self.SETTLE_GAP
+                    placed.append(w._expanded_rect().adjusted(m - g, m - g,
+                                                              -m + g, -m + g))
+                except (RuntimeError, TypeError, AttributeError):
+                    pass
+                continue
+            movable.append(w)
+
+        def size_of(w) -> tuple[int, int]:
+            try:
+                return int(w._side_w), int(w._collapsed_h())
+            except (RuntimeError, TypeError, AttributeError):
+                return 0, 0
+
+        def eff_size(w) -> tuple[int, int]:
+            """判「长大 / 谁先安置」用的尺寸：刚长的那块要用**长完之后**的高度，
+            不然它此刻 `_collapsed_h()` 还是横杠的 28，会被当成小盒子排到最后。"""
+            cw, ch = size_of(w)
+            if w is win and win_h:
+                ch = int(win_h)
+            return cw, ch
+
+        grown: list = []
+        rest: list = []
+        for w in movable:
+            hw = int(getattr(w.box, "home_w", -1) or -1)
+            hh = int(getattr(w.box, "home_h", -1) or -1)
+            cw, ch = eff_size(w)
+            if hw > 0 and hh > 0 and (cw > hw or ch > hh):
+                grown.append(w)
+            else:
+                rest.append(w)
+        # 顺序**只看状态**（面积大的先、再按家位置从左上往右下），不看「这次是谁
+        # 点的」：不然同一套布局会因为「先长大谁」而排出两种结果，下一次重排又
+        # 换一种——用户看到的就是盒子自己动。
+        grown.sort(key=lambda w: (-int(eff_size(w)[0]) * int(eff_size(w)[1]),
+                                  int(w.box.home_y), int(w.box.home_x), w.box.id))
+        # 2) 长大了的先占位
+        grown_rects: list[QRect] = []
+        for w in grown:
+            try:
+                ww, wh = size_of(w)
+                if w is win and win_h:
+                    wh = int(win_h)
+                if w is win:
+                    # 刚长大的这块留在它现在显示的地方（用户刚点它，别跳）
+                    bx, by = int(w.box.x), int(w.box.y)
+                else:
+                    bx, by = int(w.box.home_x), int(w.box.home_y)
+                r = QRect(bx, by, int(ww), int(wh))
+            except (RuntimeError, TypeError, AttributeError):
+                continue
+            best = self._nearest_slot(r, placed, scr, gap)
+            if best is None:
+                best = r
+            if (int(best.x()), int(best.y())) != (int(w.box.x), int(w.box.y)):
+                _log(f"grow: settle {w.box.name} {int(w.box.x)},{int(w.box.y)}"
+                     f"->{best.x()},{best.y()}")
+            w.box.x, w.box.y = int(best.x()), int(best.y())
+            placed.append(QRect(best))
+            grown_rects.append(QRect(best))
+        if not grown_rects:
+            return
+        # 3) 只收拾「被长大的盒子压住」的那些（按家位置从左上往右下，结果稳定）
+        for w in sorted((x for x in boxes if not x.is_expanded),
+                        key=lambda x: (int(x.box.home_y), int(x.box.home_x), x.box.id)):
+            if w is win or w in grown:
+                continue
+            try:
+                r = QRect(int(w.box.x), int(w.box.y),
+                          int(w._side_w), int(w._collapsed_h()))
+            except (RuntimeError, TypeError, AttributeError):
+                continue
+            if not any(r.intersects(g) for g in grown_rects):
+                continue                     # 没被压住：一个像素都不动
+            best = self._nearest_slot(r, placed, scr, gap)
+            if best is None:
+                continue
+            if (int(best.x()), int(best.y())) != (int(w.box.x), int(w.box.y)):
+                _log(f"grow: settle {w.box.name} {int(w.box.x)},{int(w.box.y)}"
+                     f"->{best.x()},{best.y()}")
+            w.box.x, w.box.y = int(best.x()), int(best.y())
+            placed.append(QRect(best))
 
     def _pack_collapsed(self, boxes) -> None:
         """收起的盒子互相压住时，后建的那个挪到最近的空位（只改临时位置，家不动）。
