@@ -1882,15 +1882,19 @@ class Controller(QObject):
         # 2) 长大了的先占位
         def preferred(w, ww: int, wh: int) -> tuple[int, int]:
             """首选位置：一般是「家」；但要是**第 2 步的展开面已经把它推走了**
-            （现在的位置 != 家），而且那个位置没压着面板，就留在那儿——不然它会
-            滑回家、路上正好穿过另一块展开面（用户 2026-11-16 报的「聊天工作被
-            往左推着和 A 叠住」就是这么来的）。"""
+            （现在的位置 != 家），而且那个位置现在没跟任何东西冲突，就留在那儿——
+            不然它会滑回家、路上正好穿过另一块展开面（用户 2026-11-16 报的
+            「聊天工作被往左推着和 A 叠住」），或者跟面板推让的结果来回打（抽搐）。
+
+            注意这里比对的是 `placed`（**所有**已经占好位的东西：展开面 + 排在它
+            前面的大块），不只看面板：只看面板的话，面板把它推到 A 上面也会保留。
+            """
             cx, cy = int(w.box.x), int(w.box.y)
             hx, hy = int(w.box.home_x), int(w.box.home_y)
             if (cx, cy) != (hx, hy):
                 try:
                     here = QRect(cx, cy, int(ww), int(wh)).adjusted(-gap, -gap, gap, gap)
-                    if not any(here.intersects(p) for p in panels):
+                    if not any(here.intersects(p) for p in placed):
                         return cx, cy
                 except (RuntimeError, TypeError, AttributeError):
                     pass
