@@ -1293,6 +1293,16 @@ class Controller(QObject):
             return "skip"           # 整个在上面
         if r.bottom() <= base.top() + 1:
             return "above"          # 整个在盒子上沿之上：往上推开
+        # 起手位置在盒子上沿之上的（跨着上沿的那种）：算「正上方」，往上推。
+        # 以前这种会落到下面那条「横向中心在盒子里 → 正下方」上，于是「上面的
+        # 那块」被往**下**推，正好越过下面那块 —— 用户 2026-11-16 报的「换位」。
+        # 判据用「家位置的上沿」，不能用目标中心：盒子自己变大时 target 和 base
+        # 是同一块，中心比较会把「压在里面」的邻居误判成上方。
+        try:
+            if r.top() < base.top() - 1:
+                return "above"
+        except (AttributeError, TypeError):
+            pass
         # 只是**往下长高**（宽度没变，比如横杠 → 0 状态）：这时候没有「往旁边让」
         # 这条路可走，展开面下面压着的东西一律往下让，斜着错开的也算。
         # 不这么判的话，边界正好斜着交叠的两块（用户报的「视听变回正常就压在编程
@@ -1433,17 +1443,38 @@ class Controller(QObject):
                     pass
                 win.box.x, win.box.y = int(r.x()), int(r.y())
                 items = self._snapshot(win)
-                plan = self._plan_all(win, r, items, r) if align_ok else None
-                if plan is None:
-                    ok = not align_ok      # 没开自适应：不推别人，但也不算「放不下」
-                else:
-                    _log(f"grow: place {win.box.name} {r.left()},{r.top()} {r.width()}x{r.height()}")
-                    self._apply_plan(win, r, plan)
+                # base 用「家」的尺寸（长大前那块），这样「谁在它上面」才判得准
+                hw0 = int(getattr(win.box, "home_w", -1) or -1) or int(win._side_w)
+                hh0 = int(getattr(win.box, "home_h", -1) or -1) or int(win._collapsed_h())
+                base0 = QRect(int(win.box.home_x), int(win.box.home_y), hw0, hh0)
+                if align_ok and level >= 5:
+                    # 「变大时邻居让开」只在 5 级开。1~4 级**只摆它自己**、别人一个
+                    # 像素都不动（用户 2026-11-16 报的「展开两块换位」就是这里：
+                    # 只长高的盒子把上面的邻居往下推、它自己又被对方推走，两块对调）
+                    # 变大的时候只许往下/侧推、不许往上抬，和 3c 保持一致
+                    self._push_level = min(2, level)
+                    try:
+                        plan = self._plan_all(win, r, items, base0)
+                    finally:
+                        self._push_level = level
+                    if plan is None:
+                        ok = False
+                    else:
+                        _log(f"grow: place {win.box.name} {r.left()},{r.top()} "
+                             f"{r.width()}x{r.height()}")
+                        self._apply_plan(win, r, plan)
             # 3b) 不再做「每次重排都重新打包」：那是之前「盒子自己乱跳」的来源。
             #     真叠住的家由启动时 _untangle_homes 修一次，其余交给「盖住」。
             # 3c) 「长大了」的那几块（横杠长回正常、拖进图标变高）也要占地方：
             #     现尺寸 > 家的尺寸就算长大，每次重排都按这个条件重新让开——
             #     所以既不会把别人的位置写死，也不会「让开一次就丢」。
+            #
+            # ⚠️ 这里的铁律（2026-11-16 用户报「两块换位」后定的）：
+            #   * 展开面 / 长大了的盒子是**固体**，任何情况下都不许被别人推走；
+            #   * 长大的盒子只把别人往**下 / 侧面**推，绝不往上抬（往上抬会跨到
+            #     上面那块头上，看着就是「换位」）；
+            #   * 两个盒子真叠住了，**家位置更靠上的那块留在原地**，靠下的往下让——
+            #     这样上下顺序永远不变，不会因为「先展开谁」而翻过来。
             if level >= 5:
                 grown = []
                 for w in boxes:
@@ -1458,18 +1489,64 @@ class Controller(QObject):
                             grown.append(w)
                     except (RuntimeError, TypeError, AttributeError):
                         continue
-                for w in sorted(grown,
-                                key=lambda x: (float(x.box.created or 0.0), x.box.id)):
-                    try:
-                        r = QRect(int(w.box.x), int(w.box.y),
-                                  int(w._side_w), int(w._collapsed_h()))
-                    except (RuntimeError, TypeError, AttributeError):
-                        continue
-                    items = self._snapshot(w)
-                    plan = self._plan_all(w, r, items, r)
-                    if plan is not None:
+                solid = {id(w) for w in boxes if w.is_expanded}
+                solid |= {id(w) for w in grown}
+                old_level = self._push_level
+                self._push_level = min(2, old_level)   # 只往下/侧推，不往上抬
+                try:
+                    for w in sorted(grown,
+                                    key=lambda x: (float(x.box.created or 0.0), x.box.id)):
+                        try:
+                            r = QRect(int(w.box.x), int(w.box.y),
+                                      int(w._side_w), int(w._collapsed_h()))
+                        except (RuntimeError, TypeError, AttributeError):
+                            continue
+                        items = self._snapshot(w)
+                        hw0 = int(getattr(w.box, "home_w", -1) or -1) or int(w._side_w)
+                        hh0 = int(getattr(w.box, "home_h", -1) or -1) or int(w._collapsed_h())
+                        base0 = QRect(int(w.box.home_x), int(w.box.home_y), hw0, hh0)
+                        plan = self._plan_all(w, r, items, base0)
+                        if plan is None:
+                            continue
+                        moves, collapsed, row, up, side, blocked = plan
+                        moves = [m for m in moves if id(m[0]) not in solid]
+                        up = [m for m in up if id(m[0]) not in solid]
+                        side = [m for m in side if id(m[0]) not in solid]
+                        if not (moves or up or side):
+                            continue
                         _log(f"grow: grown {w.box.name} {r.width()}x{r.height()}")
-                        self._apply_plan(w, r, plan)
+                        self._apply_plan(w, r, (moves, collapsed, row, up, side, blocked))
+                finally:
+                    self._push_level = old_level
+                # 固体之间（或被固体压住的）真叠住了：靠下的那块往下让，绝不往上抬
+                gap = self.SETTLE_GAP
+                try:
+                    scr2 = (boxes[0].screen()
+                            or self.app.primaryScreen()).availableGeometry()
+                except (RuntimeError, TypeError, AttributeError, IndexError):
+                    scr2 = None
+                order = sorted(boxes, key=lambda x: (int(x.box.home_y), int(x.box.home_x),
+                                                     x.box.id))
+                for _ in range(6):
+                    changed = False
+                    for i, low in enumerate(order):
+                        if low.is_expanded:
+                            continue
+                        for high in order[:i]:
+                            if high.is_expanded:
+                                continue
+                            if not low.collapsed_rect().intersects(high.collapsed_rect()):
+                                continue
+                            if (id(low) not in solid) and (id(high) not in solid):
+                                continue          # 两个都不是固体：用户自己摆的，不动
+                            need = high.collapsed_rect().bottom() + 1 + gap
+                            if int(low.box.y) < need:
+                                # 别推出屏幕：到底了就贴着屏幕底（宁可压一点，也不许跑出去）
+                                room = scr2.bottom() + 1 - int(low._collapsed_h())
+                                low.box.y = min(need, max(room, int(low.box.y)))
+                                changed = True
+                    if not changed:
+                        break
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
