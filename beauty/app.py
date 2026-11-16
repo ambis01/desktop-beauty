@@ -1391,6 +1391,11 @@ class Controller(QObject):
         level = max(0, min(5, level))
         self._push_level = level
         align_ok = level >= 1
+        if win is not None:
+            try:
+                _log(f"grow: relayout win={win.box.name} expanded={int(bool(win.is_expanded))}")
+            except (RuntimeError, TypeError, AttributeError):
+                pass
         try:
             self._layout_pass = True
             boxes = [w for w in self.windows.values() if w.isVisible()]
@@ -1818,6 +1823,7 @@ class Controller(QObject):
             return
         gap = 0     # 盒子之间只要**不压住**就行（用户本来就常只隔 2~8px，
                     # 按 10px 排会把没挡路的箱子也顶开，就是以前那个「自己动几像素」）
+        from .box_widget import TITLE_H
         placed: list[QRect] = []
         panels: list[QRect] = []         # 展开面（**真实**玻璃矩形，判「压住了没有」）
         pinned_panels: list[QRect] = []  # 勾了常驻的展开面：下面的盒子必须让开
@@ -1826,12 +1832,11 @@ class Controller(QObject):
             if w.is_expanded:
                 try:
                     m = w._win_margin()
-                    g = self.SETTLE_GAP
                     r_true = w._expanded_rect().adjusted(m, m, -m, -m)
-                    # 放的时候按撑大了 10px 的算（和面板自己推让留的空隙一致），
-                    # 但**判有没有压住**要用真实矩形：不然只差 2px 也算压住，
-                    # 会把明明没挡路的盒子顶开（用户报的「没挡路却被挪了」）。
-                    placed.append(r_true.adjusted(-g, -g, g, g))
+                    # 用**真实**面板矩形（不撑大）：撑大 10px 的话，只差 1~2px 的盒子
+                    # 也会被当成压住、被顶开几十像素（实测「聊天工作 1588→1639」）。
+                    # 面板自己推让时留的 10px 空隙由第 2 步负责，这里只管别压住。
+                    placed.append(r_true)
                     panels.append(r_true)
                     if bool(getattr(w.box, "pinned", False)):
                         pinned_panels.append(r_true)
@@ -1857,16 +1862,21 @@ class Controller(QObject):
         grown: list = []
         rest: list = []
         for w in movable:
-            hw = int(getattr(w.box, "home_w", -1) or -1)
-            hh = int(getattr(w.box, "home_h", -1) or -1)
             cw, ch = eff_size(w)
-            if hw > 0 and hh > 0 and (cw > hw or ch > hh):
+            # ⚠️ 判「占地方」只看**现在是不是图标方块大小**（`_collapsed_h()` >
+            # TITLE_H 就说明它不是一条横杠），不看「比基准大多少」。
+            # 以前按基准比：你拖过它一次（那时它就是方块大小），基准就记成方块，
+            # 之后再从横杠长回方块就不算「变大」——于是有时推、有时不推
+            # （用户 2026-11-16 报的「把 C 从 -1 展开到 0，直接和聊天工作重叠」）。
+            # 现在是：只要是图标方块，就占地方（横杠不占）。
+            if int(ch) > TITLE_H or w is win:
                 grown.append(w)
             else:
                 rest.append(w)
-        # 顺序**只看状态**（面积大的先、再按家位置从左上往右下），不看「这次是谁
-        # 点的」：不然同一套布局会因为「先长大谁」而排出两种结果，下一次重排又
-        # 换一种——用户看到的就是盒子自己动。
+        # 顺序**只看状态**（面积大的先占位，同面积按家位置，再按 id），不看「这次
+        # 是谁点的」——不然同一套布局会因为「先长大谁」排出两种结果，下次重排又
+        # 换一种（用户看到的就是盒子自己动）。面积大的先放，位置也最省：小块围着
+        # 它找空位就行；按上下顺序放反而会把中间那块顶得很远。
         grown.sort(key=lambda w: (-int(eff_size(w)[0]) * int(eff_size(w)[1]),
                                   int(w.box.home_y), int(w.box.home_x), w.box.id))
         # 2) 长大了的先占位
@@ -2350,6 +2360,10 @@ class Controller(QObject):
 
     def _after_grow(self, win) -> None:
         """盒子自动变大之后：新压住的桌面图标挪出去，挡路的盒子/卡片让开。"""
+        try:
+            _log(f"grow: after_grow {win.box.name}")
+        except (RuntimeError, TypeError, AttributeError):
+            pass
         try:
             win._push_desktop_icons()
         except Exception:  # noqa: BLE001 - 桌面接口抽风不能挡住别的
