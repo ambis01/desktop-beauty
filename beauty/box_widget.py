@@ -574,6 +574,7 @@ class BoxWidget(GlassWindow):
         self._anim_win = QRect()
         self._paint_rect = QRect()
         self._paint_box = None
+        self._z_pending = False
         # 一次动画推「_t」（展开↔收起）或者「_bar_t」（缩略↔只剩横杠）
         self._anim_field = "t"
         self._anim_from = 0.0
@@ -1663,7 +1664,13 @@ class BoxWidget(GlassWindow):
             self._auto_expanded = False
             self._collapse_timer.stop()
             self._set_expanded_blur(False)   # 收起后立刻关掉模糊
-        self._notify_z()
+        # 层级**等动画结束再调**：`SetWindowPos` 会让半透明窗口整块重新合成一次，
+        # 动画一开始就调，肉眼就是「闪一下」（用户 2026-11-16：每个盒子展开/收起
+        # 都闪）。展开的那 0.3 秒里它先压在上面，动画完再正式排位。
+        if self._anim_timer.isActive():
+            self._z_pending = True
+        else:
+            self._notify_z()
 
     def _save_bar(self, persist: bool = True) -> None:
         """把「是不是一条横杠」记进 boxes.json，重启后还是那个样子。
@@ -1937,6 +1944,9 @@ class BoxWidget(GlassWindow):
         self._anim_win = QRect()
         self._paint_rect = QRect()
         self._paint_box = None
+        if getattr(self, "_z_pending", False):
+            self._z_pending = False
+            self._notify_z()
         if not self._expanded:
             self._bar_t = 1.0 if self._bar else 0.0
             self._apply_collapsed_geometry()
