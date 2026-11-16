@@ -1366,7 +1366,9 @@ class Controller(QObject):
         占地方，别人要给它让开；让不开返回 False，调用方抖两下。
         """
         if self._in_layout:
-            # 回调套回调（收横杠 → on_shrunk 之类）：这一轮算完就够了
+            # 回调套回调（收横杠 → on_shrunk 之类）：这一轮算完再补一轮，**不能吞掉**。
+            # 以前只在 `_relayout_more` 上记了一笔、从来没人看它：展开/变大和重排撞在
+            # 一起时，这次重排就永远不发生了——展开的盒子摆在那儿却没把邻居让开。
             self._relayout_more = True
             return True
         from .box_widget import is_dragging
@@ -1470,11 +1472,10 @@ class Controller(QObject):
             #     所以既不会把别人的位置写死，也不会「让开一次就丢」。
             #
             # ⚠️ 这里的铁律（2026-11-16 用户报「两块换位」后定的）：
-            #   * 展开面 / 长大了的盒子是**固体**，任何情况下都不许被别人推走；
+            #   * 展开面**绝不**被推；长大了的盒子只许被「家位置在它上面」的那块往下推
+            #     （见下面的 `_ok`）——上下顺序永远不变，所以不会换位；
             #   * 长大的盒子只把别人往**下 / 侧面**推，绝不往上抬（往上抬会跨到
-            #     上面那块头上，看着就是「换位」）；
-            #   * 两个盒子真叠住了，**家位置更靠上的那块留在原地**，靠下的往下让——
-            #     这样上下顺序永远不变，不会因为「先展开谁」而翻过来。
+            #     上面那块头上，看着就是「换位」）。
             if level >= 5:
                 grown = []
                 for w in boxes:
@@ -1509,7 +1510,20 @@ class Controller(QObject):
                         if plan is None:
                             continue
                         moves, collapsed, row, up, side, blocked = plan
-                        moves = [m for m in moves if id(m[0]) not in solid]
+                        # 谁能被推：不是固体的都能；**家位置在自己下面**的固体也能，
+                        # 但只许往下推。这样「两块都长大了」时不会出现「上一轮推开了、
+                        # 这一轮又缩回去」（随机压测里 展开 E 就把 B 弹回了家）；
+                        # 家位置在自己上面的固体一律不推——那才会换位。
+                        here = (int(w.box.home_y), int(w.box.home_x))
+
+                        def _ok(o, here=here):
+                            if getattr(o, "is_expanded", False):
+                                return False           # 展开面绝不推
+                            if id(o) not in solid:
+                                return True
+                            return (int(o.box.home_y), int(o.box.home_x)) > here
+
+                        moves = [m for m in moves if _ok(m[0])]
                         up = [m for m in up if id(m[0]) not in solid]
                         side = [m for m in side if id(m[0]) not in solid]
                         if not (moves or up or side):
@@ -1518,35 +1532,11 @@ class Controller(QObject):
                         self._apply_plan(w, r, (moves, collapsed, row, up, side, blocked))
                 finally:
                     self._push_level = old_level
-                # 固体之间（或被固体压住的）真叠住了：靠下的那块往下让，绝不往上抬
-                gap = self.SETTLE_GAP
-                try:
-                    scr2 = (boxes[0].screen()
-                            or self.app.primaryScreen()).availableGeometry()
-                except (RuntimeError, TypeError, AttributeError, IndexError):
-                    scr2 = None
-                order = sorted(boxes, key=lambda x: (int(x.box.home_y), int(x.box.home_x),
-                                                     x.box.id))
-                for _ in range(6):
-                    changed = False
-                    for i, low in enumerate(order):
-                        if low.is_expanded:
-                            continue
-                        for high in order[:i]:
-                            if high.is_expanded:
-                                continue
-                            if not low.collapsed_rect().intersects(high.collapsed_rect()):
-                                continue
-                            if (id(low) not in solid) and (id(high) not in solid):
-                                continue          # 两个都不是固体：用户自己摆的，不动
-                            need = high.collapsed_rect().bottom() + 1 + gap
-                            if int(low.box.y) < need:
-                                # 别推出屏幕：到底了就贴着屏幕底（宁可压一点，也不许跑出去）
-                                room = scr2.bottom() + 1 - int(low._collapsed_h())
-                                low.box.y = min(need, max(room, int(low.box.y)))
-                                changed = True
-                    if not changed:
-                        break
+                # ⚠️ 这里以前还有一段「固体之间真叠住了就把靠下的那块再往下顶」的循环。
+                # 2026-11-16 删掉：它按 SETTLE_GAP（10px）顶，本来只压住 4px 的两块会被
+                # 顶开 7px；而且它一轮一轮往下传，9 块盒子都长大之后会一路顶到屏幕底
+                # （随机压测里 外设 499→646、收纳盒 →794）。让开已经由上面的 3c 算过，
+                # 这里再顶一遍只会造成「盒子自己跑了」。
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
@@ -1594,7 +1584,10 @@ class Controller(QObject):
         finally:
             self._layout_pass = False
             self._in_layout = False
-            self._relayout_more = False
+            # 重排期间又有人要求重排：等这轮的事件处理完再补一轮（不然就丢了）
+            if self._relayout_more:
+                self._relayout_more = False
+                QTimer.singleShot(0, self._relayout)
 
     def _panel_for(self, win, allow_collapse: bool = True):
         """展开面摆哪儿：(want, side, up, plan) 或 None。全部按「家」算。"""
@@ -1639,6 +1632,10 @@ class Controller(QObject):
 
     def _on_shrunk(self, win, _freed: int = 0) -> None:
         """盒子收成横杠了（用户双击）：它那块地方腾出来了，整体重排一次。"""
+        if self._in_layout:
+            # 重排自己在第 5 步收横杠时会回到这儿：这一轮已经按新尺寸算过了，
+            # 再排一轮纯属自己踩自己（还会和「补一轮」撞成来回排）
+            return
         self._relayout()
 
     def _untangle_homes(self) -> int:
@@ -2010,7 +2007,10 @@ class Controller(QObject):
                     need = target_bottom + gap                # 只有「同一列」的上方才继续往下挤；并排的互不影响
                 for o_left, o_right, o_bottom in placed:
                     if left <= o_right and o_left <= right:
-                        need = max(need, o_bottom + gap)
+                        # 排在别人下面只要**错开**，不要硬塞 10px 空隙：用户的盒子
+                        # 本来就只隔 2~8px，按 10px 排会把本来没挡路的那块也顶开
+                        # 几像素（压测里「没回家 收纳盒 530→537」就是这么来的）。
+                        need = max(need, o_bottom + 1)
                 # pack：贴紧排（没东西压着就往上吸）；否则只往下让
                 ny = need if (pack and need) else max(cur, need)
                 if ny != cur:
@@ -2134,6 +2134,7 @@ class Controller(QObject):
         收起时同样按家重算。`target` / `remember` 只为兼容老调用留着。
         """
         if self._in_layout:
+            self._relayout_more = True      # 这一轮算完会补一轮，不会吞掉
             return True
         return self._relayout(win)
 
@@ -2146,6 +2147,7 @@ class Controller(QObject):
         盖住+模糊。
         """
         if self._in_layout:
+            self._relayout_more = True      # 这一轮算完会补一轮，不会吞掉
             return True
         return self._relayout()
 

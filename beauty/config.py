@@ -197,9 +197,11 @@ class Config:
         cfg.panel_theme = theme
         cfg.panel_dark = theme == "dark"
         cfg.auto_align = bool(raw.get("auto_align", True))
-        # 老配置里只有 box_push（布尔）：true 当年等于「四个方向全开」
+        # 老配置里只有 box_push（布尔）：true 当年等于「四个方向全开」。迁移到 3 级
+        # （正下方 + 正侧面 + 往上），4 级那条「临时收成横杠」没有能稳定复现的用例，
+        # 老配置不该一升级就被塞过去。
         try:
-            cfg.push_rules = int(raw.get("push_rules", 4 if raw.get("box_push") else 0))
+            cfg.push_rules = int(raw.get("push_rules", 3 if raw.get("box_push") else 0))
         except (TypeError, ValueError):
             cfg.push_rules = 0
         cfg.push_rules = max(0, min(5, cfg.push_rules))

@@ -912,8 +912,10 @@ class BoxWidget(GlassWindow):
             return
         try:
             cb(self)
-        except (RuntimeError, TypeError):
-            pass
+        except (RuntimeError, TypeError) as exc:
+            # 不许静默吞掉：以前这里 pass，重排中途抛个错就变成「展开了却没让开」，
+            # 日志里一个字都没有（用户报的「偶尔展开，旁边那块不动」查不到原因）
+            _log_force("expanded callback failed box=%s: %r", self.box.id, exc)
 
     def _notify_collapsed(self) -> None:
         """收起来了：让 Controller 把刚才为它让开的东西放回原位。"""
@@ -922,8 +924,8 @@ class BoxWidget(GlassWindow):
             return
         try:
             cb(self)
-        except (RuntimeError, TypeError):
-            pass
+        except (RuntimeError, TypeError) as exc:
+            _log_force("collapsed callback failed box=%s: %r", self.box.id, exc)
 
     def _flush_grow(self) -> None:
         """自动变大之后清场：让 Controller 把新压住的盒子、卡片、桌面图标挪开。
@@ -939,8 +941,8 @@ class BoxWidget(GlassWindow):
             return
         try:
             cb(self)
-        except (RuntimeError, TypeError):
-            pass
+        except (RuntimeError, TypeError) as exc:
+            _log_force("grew callback failed box=%s: %r", self.box.id, exc)
 
     def _dissolve_when_thin(self) -> None:
         """只剩 ≤1 个图标：把剩下的放回桌面，盒子自己消失。
@@ -1634,8 +1636,8 @@ class BoxWidget(GlassWindow):
                     if not cb(self):        # Controller 自己算 0 状态那块、往下还是往上
                         self.shake()
                         return
-                except (RuntimeError, TypeError):
-                    pass
+                except (RuntimeError, TypeError) as exc:
+                    _log_force("grow_request failed box=%s: %r", self.box.id, exc)
         if on:
             self._gear_up(TITLE_H, self._collapsed_h())   # 收到横杠：底边不动
         self._bar = on
@@ -1653,8 +1655,8 @@ class BoxWidget(GlassWindow):
             if cb is not None:
                 try:
                     cb(self, self._side_h)
-                except (RuntimeError, TypeError):
-                    pass
+                except (RuntimeError, TypeError) as exc:
+                    _log_force("shrunk callback failed box=%s: %r", self.box.id, exc)
         self._anim_field = "bar"
         self._anim_from = self._bar_t
         self._anim_to = target
