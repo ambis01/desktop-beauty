@@ -125,7 +125,7 @@ class Config:
     # ⚠️ 4 级（临时收横杠）目前**没有能稳定复现的用例**，所以 5 级不含它：
     # 只有等级正好是 4 才允许收横杠，免得升到 5 就顺带把没验过的规则打开。
     # **每加一级都要先过压力测试**（不压别人、不出屏、收起精确回原位、重复不漂移）。
-    push_rules: int = 0
+    push_rules: int = 5
     box_merge: bool = True                # 允许把一个收纳盒拖到另一个上面合并
     box_merge_bar: bool = False           # 两个都只剩横杠（状态 -1）的盒子也能互相合并
     box_sort: str = "name"                # 面板里收纳盒列表的排序：name / size / created
