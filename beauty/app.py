@@ -32,6 +32,7 @@ from .box_widget import (
     user32 as box_user32,
 )
 from .boxes import BoxStore, acceptable as boxable
+from . import gate
 from .calendar_widget import CalendarWidget
 from .clock_widget import ClockWidget
 from .config import (
@@ -118,6 +119,9 @@ class Controller(QObject):
             pass
         self.store = BoxStore()
         self.windows: dict[str, BoxWidget] = {}
+        # 「有盒子展开着」= 别的盒子/卡片按下时不响应，只让那个盒子自己收起。
+        # 取值函数每次实时算，不用维护状态（见 beauty/gate.py）。
+        gate.set_provider(self._any_box_expanded)
         # 布局：每次从「家」重算（见 _relayout）。`_in_layout` 防回调套回调，
         # `_layout_pass` 表示现在只在算逻辑坐标，窗口等算完统一滑过去。
         self._in_layout = False
@@ -1407,6 +1411,11 @@ class Controller(QObject):
             # 2) 展开的面板先占位；开着「挤开」才把挡路的推开
             for w in sorted((x for x in boxes if x.is_expanded),
                             key=lambda x: (float(x.box.created or 0.0), x.box.id)):
+                # 展开面按「它**现在显示在哪儿**」算，不按家：它可能刚被长大的邻居
+                # 让到了下面（5 级），按家算会在展开那一瞬间把整块拽回原位、收起时
+                # 又滑回来——用户 2026-11-16 报的「点一下盒子就抽搐」就是这个。
+                ox, oy = disp[id(w)]
+                w.box.x, w.box.y = int(ox), int(oy)
                 if align_ok:
                     got = self._panel_for(
                         w, allow_collapse=not bool(getattr(w.box, "pinned", False)))
@@ -1590,13 +1599,15 @@ class Controller(QObject):
                 QTimer.singleShot(0, self._relayout)
 
     def _panel_for(self, win, allow_collapse: bool = True):
-        """展开面摆哪儿：(want, side, up, plan) 或 None。全部按「家」算。"""
+        """展开面摆哪儿：(want, side, up, plan) 或 None。按它**现在的位置**算。"""
         try:
             m = win._win_margin()
             size = win._expanded_rect()
             w = size.width() - 2 * m
             h = size.height() - 2 * m
-            base = QRect(int(win.box.home_x), int(win.box.home_y),
+            # 位置用 box.x/box.y（现在显示在哪儿），尺寸用收起尺寸。平时它们和
+            # 「家」一样；只有被长大的邻居让开过时才会不同——那种时候按家算会跳。
+            base = QRect(int(win.box.x), int(win.box.y),
                          int(win._side_w), int(win._collapsed_h()))
             items = self._snapshot(win)
         except (RuntimeError, TypeError, AttributeError):
@@ -1637,6 +1648,20 @@ class Controller(QObject):
             # 再排一轮纯属自己踩自己（还会和「补一轮」撞成来回排）
             return
         self._relayout()
+
+    def _any_box_expanded(self) -> bool:
+        """现在有没有盒子处于展开（1）状态。
+
+        `box_widget` / `card_base` 的按下事件靠它判断「这一下该不该吞掉」：
+        有盒子展开着的时候，点别处只负责把那个盒子收起来（见 beauty/gate.py）。
+        """
+        for w in self.windows.values():
+            try:
+                if w.isVisible() and w.is_expanded:
+                    return True
+            except (RuntimeError, TypeError):
+                continue
+        return False
 
     def _untangle_homes(self) -> int:
         """启动时把互相压着的「家」分开（只动真压着的，算完存盘）。
@@ -1722,7 +1747,8 @@ class Controller(QObject):
             size = win._expanded_rect()
             w = size.width() - 2 * m
             h = size.height() - 2 * m
-            base = QRect(int(win.box.home_x), int(win.box.home_y),
+            # 同 _panel_for：按「现在显示在哪儿」算，被长大的邻居让开过才不会跳
+            base = QRect(int(win.box.x), int(win.box.y),
                          int(win._side_w), int(win._collapsed_h()))
             scr = (win.screen() or self.app.primaryScreen()).availableGeometry()
         except (RuntimeError, TypeError, AttributeError):

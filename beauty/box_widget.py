@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .glass import GlassMenu, GlassWindow, HOVER_GROW, HOVER_MS, modal
+from .gate import gated
 from .i18n import tr
 from .shortcut import target_of
 from . import desktop_icons as di
@@ -647,6 +648,8 @@ class BoxWidget(GlassWindow):
 
         # 展开状态下监听「点了盒子外面」→ 收起
         self._was_down = False
+        # 这一下按下是不是被「有别的盒子展开着」吞掉了（抬起也要一起吞）
+        self._swallow_press = False
         self._outside_timer = QTimer(self)
         self._outside_timer.setInterval(60)
         self._outside_timer.timeout.connect(self._watch_outside_click)
@@ -2713,6 +2716,14 @@ class BoxWidget(GlassWindow):
             _log("grip click at %s ignored (single)", gpos)
 
     def mousePressEvent(self, event) -> None:
+        if not self._expanded and gated():
+            # 有别的盒子正展开着（状态 1）：这一下只负责把它关掉（它自己在轮询
+            # 「点外面」），不许穿透到这块上——不展开、不拖、不弹菜单。
+            # 用户 2026-11-16 报的「点 Y 展开、接着点 X，Y 抽搐几下又收回 0」就是
+            # 一个在收、一个在开，两边抢位置。
+            self._swallow_press = True
+            event.accept()
+            return
         pos = self._to_content(event.position().toPoint())
         # 新的一次按下：上一次双击还没落地的启动作废（Qt 双击的「第二下」走的是
         # mouseDoubleClickEvent，不会进这里，所以正常双击不受影响）
@@ -2927,6 +2938,11 @@ class BoxWidget(GlassWindow):
 
     def mouseReleaseEvent(self, event) -> None:
         global _DRAGGING
+        if self._swallow_press:
+            # 这一下在按下时就被吞了（当时有别的盒子展开着）：抬起也不再做任何事
+            self._swallow_press = False
+            event.accept()
+            return
         if event.button() != Qt.LeftButton:
             # 右键松开也会走到这里。以前没判断按键，于是「右键一下」被当成
             # 「左键点了一下」→ 盒子当场展开（然后右键菜单又弹出来）。
@@ -3155,6 +3171,10 @@ class BoxWidget(GlassWindow):
     def mouseDoubleClickEvent(self, event) -> None:
         # 刚出现的盒子忽略双击，避免合并手势松手时误启动里面的图标
         if time.monotonic() - self._born < 0.8:
+            return
+        if not self._expanded and gated():
+            # 有别的盒子展开着：这一下只负责关掉那个盒子，不在这块上做任何事
+            event.accept()
             return
         # 第二下「按下」被 Qt 标成双击送过来。拖动区上的第二下必须照常开始
         # 一次按下记录，否则这次抬起落在一个没有按下状态上，收起/展开和拖动都会乱。

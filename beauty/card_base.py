@@ -25,6 +25,7 @@ from PySide6.QtWidgets import QApplication
 
 from .config import CardData
 from .dlog import dlog
+from .gate import gated
 from .glass import HOVER_GROW, HOVER_MS, GlassMenu, GlassWindow
 from . import aligner
 from . import desktop_icons as di
@@ -113,6 +114,7 @@ class CardWindow(GlassWindow):
         self._hovered = False
         self._resize_mode = False
         self._resizing = None      # (方向, 起点, 起始 scale, 起始玻璃宽高)
+        self._swallow_press = False   # 这一下被「有盒子展开着」吞掉了（抬起也吞）
         self._press_token = None
         self._press_start: QPoint | None = None
         self._drag_from: QPoint | None = None
@@ -466,6 +468,12 @@ class CardWindow(GlassWindow):
         return QPoint(pos.x() - self.inset, pos.y() - self.inset)
 
     def mousePressEvent(self, event) -> None:
+        if gated():
+            # 有收纳盒正展开着：这一下只负责把那个盒子关掉（它自己在轮询「点外面」），
+            # 卡片这边不响应（不拖、不弹菜单、不改大小）
+            self._swallow_press = True
+            event.accept()
+            return
         # 拖动卡片前先把放大收回去，否则会「在放大状态」被拖走
         if (self._hover_t > 0.001
                 or self._hover_anim.state() == QVariantAnimation.State.Running):
@@ -622,6 +630,11 @@ class CardWindow(GlassWindow):
             pass
 
     def mouseReleaseEvent(self, event) -> None:
+        if getattr(self, "_swallow_press", False):
+            # 按下时被「有盒子展开着」吞了，抬起也一起吞掉
+            self._swallow_press = False
+            event.accept()
+            return
         if self._resizing is not None:
             self._resizing = None
             self._notify_resize_drag(False)
