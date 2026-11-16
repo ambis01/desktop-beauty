@@ -1564,55 +1564,15 @@ class BoxWidget(GlassWindow):
         gap = MINI_GAP * s
         total_w = mini * cols + gap * (cols - 1)
         total_h = mini * rows + gap * (rows - 1)
-        # 收放动画里，窗口有一条边是不动的（展开面往左长时是右边、横杠往上收时是
-        # 下边），内容是照着**移动**的那条边摆的——于是图标会从不动的那条边底下
-        # 滑过去、再被切掉一层，看着就是「右边/下边在抽」（用户 2026-11-16 报的
-        # A 右边、X 下边就是这个）。动画期间把它们钉在「盒子原来那块」的正中间，
-        # 也就是屏幕上不动，只让窗口在它们周围长/收。
-        anchor = self._collapsed_box_rect() if self._anim_timer.isActive() else QRect()
-        if anchor.isNull():
-            x0 = (self._cw() - total_w) / 2.0
-            y0 = TITLE_H + (self._ch() - TITLE_H - total_h) / 2.0
-        else:
-            m = self._win_margin()
-            aw = float(anchor.width() - 2 * m)
-            ah = float(anchor.height() - 2 * m)
-            x0 = (aw - total_w) / 2.0 + (anchor.x() - self.x())
-            y0 = TITLE_H + (ah - TITLE_H - total_h) / 2.0 + (anchor.y() - self.y())
+        x0 = (self._cw() - total_w) / 2.0
+        y0 = TITLE_H + (self._ch() - TITLE_H - total_h) / 2.0
         col, row = index % cols, index // cols
         return QRectF(x0 + col * (mini + gap), y0 + row * (mini + gap), mini, mini)
-
-    def _collapsed_box_rect(self) -> QRect:
-        """这次动画里「图标方块」那一头的窗口矩形（横杠那头/展开面那头不算）。
-
-        这段动画的两个落点（`_anim_rect_from` / `_anim_rect_to`）里，高的那个就是
-        图标方块（横杠只有 TITLE_H 高，展开面虽然更高但它是面板，走另一条路）。
-        """
-        a, b = self._anim_rect_from, self._anim_rect_to
-        if a.isNull() or b.isNull():
-            return QRect()
-        return a if a.height() >= b.height() else b
-
-    def _panel_rect_for_anim(self) -> QRect:
-        """这次动画里「展开面」那一头的窗口矩形（宽的哪个；横杠/方块都是窄的）。"""
-        a, b = self._anim_rect_from, self._anim_rect_to
-        if a.isNull() or b.isNull():
-            return QRect()
-        return a if a.width() >= b.width() else b
-
-    def _anim_anchor_of(self, anchor: QRect) -> tuple[float, float]:
-        """动画中内容的平移量：让内容钉在 `anchor` 那块原来的位置上（不跟着滑）。"""
-        if anchor.isNull() or not self._anim_timer.isActive():
-            return 0.0, 0.0
-        return float(anchor.x() - self.x()), float(anchor.y() - self.y())
 
     def _mini_scale(self) -> float:
         if not self._side_w:
             return 1.0
-        # 展开成面板时，缩略图标会跟着窗口放大；放到 1.5 倍刚好和展开后那 52px
-        # 的网格图标一样大，交叉淡入淡出时才不会「突然缩小一下」（放到 2 倍多就
-        # 是先胀大、再缩回去，用户看着就是抽）。横杠那头宽度不变，这里恒为 1。
-        return min(self._cw() / float(self._side_w), 1.5)
+        return self._cw() / float(self._side_w)
 
     # ---------------------------------------------------------------- 动画
     def toggle(self, expanded: bool | None = None) -> None:
@@ -2289,14 +2249,6 @@ class BoxWidget(GlassWindow):
         # 局部重画时跳过框外的图标：省下的正是框选时最贵的那部分
         m = self._win_margin()
         clip_glass = None if clip is None else clip.translated(-m, -m)
-        # 展开/收起动画里把面板内容钉在**最终那块展开面**上：窗口左边在往左长，
-        # 内容照着窗口摆就会一路往左滑（用户 2026-11-16 报的「A 右边抽搐」）。
-        ax, ay = self._anim_anchor_of(self._panel_rect_for_anim())
-        if ax or ay:
-            if clip_glass is not None:
-                clip_glass = clip_glass.translated(-int(round(ax)), -int(round(ay)))
-            p.save()
-            p.translate(ax, ay)
         order = self._display_order()
         for slot_i, idx in enumerate(order):
             if idx == self._internal_drag:
@@ -2340,8 +2292,6 @@ class BoxWidget(GlassWindow):
             p.setBrush(QColor(104, 110, 122, 122))
             p.drawRect(band)
             p.setBrush(Qt.NoBrush)
-        if ax or ay:
-            p.restore()
 
     # ---------------------------------------------------------------- 鼠标
     def _display_order(self) -> list[int]:
