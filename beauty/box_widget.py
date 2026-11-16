@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QApplication, QFileIconProvider, QInputDialog, QLineEdit, QMenu,
 )
 
-from .glass import GlassMenu, GlassWindow, HOVER_GROW, HOVER_MS, modal
+from .glass import GlassMenu, GlassWindow, HOVER_GROW, HOVER_MS, modal, no_transitions
 from .gate import gated
 from .i18n import tr
 from .shortcut import target_of
@@ -3782,6 +3782,13 @@ class BoxWidget(GlassWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        # 半透明窗口改尺寸/挪位置时，DWM 的「过渡」会把旧画面拉过去一帧——展开/收起
+        # 那一下的闪烁、以及往左长/往上长时边框的抽动，都是这一层的（程序自己画的
+        # 每一帧都验过是对的）。把这个窗口的过渡关掉。
+        try:
+            no_transitions(int(self.winId()))
+        except (AttributeError, RuntimeError, TypeError, OSError):
+            pass
         # 滑动入场时别钳：那时窗口正停在屏幕外面，`_clamp_to_screen()` 会按
         # `box.x/y`（家位置）把它搬回来，于是「先闪一下家门口再滑进来」——就是
         # 用户看到的抽搐。滑完它本来就在家位置，不需要钳。

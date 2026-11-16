@@ -247,6 +247,24 @@ def apply_backdrop(hwnd: int, kind: int = 3) -> bool:
         return False
 
 
+def no_transitions(hwnd: int) -> bool:
+    """别让 DWM 给这个窗口做过渡动画（DWMWA_TRANSITIONS_FORCEDISABLED = 3）。
+
+    为什么：半透明工具窗口改尺寸/挪位置时，DWM 会「过渡」一下（把旧画面拉过去），
+    肉眼就是盒子展开/收起的开头闪一下、或者边在抽。用户 2026-11-16 报的这两种
+    毛病都只在 DWM 那一层，程序自己画出来的每一帧都是对的（逐帧抓图验过）。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi")
+        v = ctypes.c_int(1)
+        return dwmapi.DwmSetWindowAttribute(
+            hwnd, 3, ctypes.byref(v), ctypes.sizeof(v)) == 0
+    except (AttributeError, OSError):
+        return False
+
+
 def modal(delta: int) -> None:
     """告诉 app 的事件计时器：这段里开着模态菜单（menu.exec 的嵌套循环）。
 
