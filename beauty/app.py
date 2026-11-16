@@ -158,11 +158,8 @@ class Controller(QObject):
         for box in list(self.store.boxes):
             self._spawn(box)
         # 旧版本把「挤开的位置」也写进了配置，可能有几块的家是叠在一起的：
-        # 启动时先把它们分开一次（没重叠就一个像素都不动）
-        try:
-            self._untangle_homes()
-        except Exception:  # noqa: BLE001 - 摆位置出错不能拦着启动
-            pass
+        # 等窗口真的 show 出来（事件循环转起来）再分开一次、再归一化一次
+        QTimer.singleShot(400, self._startup_layout)
 
         # 和卡片同一套玻璃浓度（默认 212），换主题时一起跟着变
         self.toast = Toast(alpha=int(getattr(self.cfg, "glass_alpha", 212) or 212))
@@ -1367,6 +1364,8 @@ class Controller(QObject):
             return True
         self._in_layout = True
         ok = True
+        # 面板里「自适应对齐」关着：只摆自己的展开面，不去推别人（桌面立刻安静）
+        align_ok = bool(getattr(self.cfg, "auto_align", True))
         try:
             self._layout_pass = True
             boxes = [w for w in self.windows.values() if w.isVisible()]
@@ -1399,7 +1398,8 @@ class Controller(QObject):
                 except (RuntimeError, TypeError, AttributeError):
                     continue
                 _log(f"grow: expand {w.box.name} side={side} up={up} at {want.left()},{want.top()}")
-                self._apply_plan(w, want, plan)
+                if align_ok:
+                    self._apply_plan(w, want, plan)
             # 3) 刚变大的那个：它自己那块也算占地方
             if win is not None and win in boxes and not win.is_expanded:
                 from .box_widget import TITLE_H
@@ -1409,16 +1409,24 @@ class Controller(QObject):
                            else int(win._collapsed_h()))
                 r = QRect(int(win.box.home_x), int(win.box.home_y),
                           int(win._side_w), h_after)
+                # 长完之后可能顶出屏幕（比如家就在最下面、它又变高了）：先夹回来，
+                # 夹完的位置就是它这次显示的位置（收起时还是回家）
+                try:
+                    scr = (win.screen() or self.app.primaryScreen()).availableGeometry()
+                    r.moveLeft(min(max(r.left(), scr.left()),
+                                   scr.right() + 1 - r.width()))
+                    r.moveTop(min(max(r.top(), scr.top()),
+                                  scr.bottom() + 1 - r.height()))
+                except (RuntimeError, TypeError, AttributeError):
+                    pass
+                win.box.x, win.box.y = int(r.x()), int(r.y())
                 items = self._snapshot(win)
-                plan = self._plan_all(win, r, items, r)
+                plan = self._plan_all(win, r, items, r) if align_ok else None
                 if plan is None:
-                    ok = False
+                    ok = not align_ok      # 没开自适应：不推别人，但也不算「放不下」
                 else:
                     _log(f"grow: place {win.box.name} {r.left()},{r.top()} {r.width()}x{r.height()}")
                     self._apply_plan(win, r, plan)
-            # 3b) 收起的盒子之间也不许叠着：从家重算之后，谁和谁压住了就往下让
-            #     （展开面盖住是有意的，不算；这里只管「收起 × 收起」）
-            self._pack_collapsed(boxes)
             self._layout_pass = False
             # 4) 一次性落地：位置变了才滑过去（横竖各一段，互不打断）
             for w in boxes:
@@ -1482,6 +1490,23 @@ class Controller(QObject):
             return None
         return self._place(win, w, h, items, base, allow_collapse=allow_collapse)
 
+    def _startup_layout(self) -> None:
+        """启动后归一化一次布局：先把叠在一起的家分开，再按展开状态排一遍。
+
+        为什么放到事件循环里：窗口刚 `show()` 的那一下 `isVisible()` 还是 False，
+        当场算会把所有盒子都当成「不存在」，等于什么都没做。
+        """
+        try:
+            _log(f"startup layout: {len(self.windows)} boxes visible="
+                 f"{sum(1 for w in self.windows.values() if w.isVisible())}")
+            self._untangle_homes()
+        except Exception as exc:  # noqa: BLE001 - 摆位置出错不能拦着启动
+            _log(f"untangle failed: {exc!r}")
+        try:
+            self._relayout()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"startup relayout failed: {exc!r}")
+
     def _on_shrunk(self, win, _freed: int = 0) -> None:
         """盒子收成横杠了（用户双击）：它那块地方腾出来了，整体重排一次。"""
         self._relayout()
@@ -1502,7 +1527,10 @@ class Controller(QObject):
             scr = (wins[0].screen() or self.app.primaryScreen()).availableGeometry()
         except (RuntimeError, TypeError, AttributeError):
             return 0
-        gap = self.SETTLE_GAP
+        # ⚠️ 这里只管「真叠住了」，不是「离得不够远」。用户的布局里盒子之间常
+        # 只隔 2~8px，按「留一个空隙」去判会把它们每次启动都顶开几像素，
+        # 看着就是「什么都没点，盒子自己在动」。
+        gap = 0
         placed: list[QRect] = []
 
         def hits(r: QRect) -> bool:
@@ -1527,32 +1555,7 @@ class Controller(QObject):
                     moved += 1
                 placed.append(r)
                 continue
-            # 找离原位置最近的空位：先往下、再往右、最后往上（尽量不改变原来的排列）
-            step_x, step_y = w0 + gap, h0 + gap
-            cands: list[tuple[int, int]] = []
-            for by in range(hy, scr.bottom() + 2 - h0, step_y):
-                for bx in range(hx, scr.right() + 2 - w0, step_x):
-                    cands.append((bx, by))
-            for by in range(hy - step_y, scr.top() - 1, -step_y):
-                for bx in range(hx, scr.right() + 2 - w0, step_x):
-                    cands.append((bx, by))
-            for bx in range(hx + step_x, scr.right() + 2 - w0, step_x):
-                for by in range(scr.top(), scr.bottom() + 2 - h0, step_y):
-                    cands.append((bx, by))
-            best = None
-            seen: set[tuple[int, int]] = set()
-            for bx, by in cands:
-                if (bx, by) in seen:
-                    continue
-                seen.add((bx, by))
-                if bx < scr.left() or bx + w0 > scr.right() + 1:
-                    continue
-                if by < scr.top() or by + h0 > scr.bottom() + 1:
-                    continue
-                rr = QRect(bx, by, w0, h0)
-                if not hits(rr):
-                    best = rr
-                    break
+            best = self._free_slot(r, placed, scr)
             if best is None:
                 placed.append(r)      # 一个空位都没有：留着，别乱动
                 continue
@@ -1564,19 +1567,55 @@ class Controller(QObject):
                 pass
             moved += 1
             placed.append(best)
-        if moved:
-            self.store.save()
-            _log(f"homes untangled: {moved} moved")
+        self.store.save()
+        _log(f"homes untangled: {moved} moved")
         return moved
 
+    def _free_slot(self, r: QRect, placed, scr, gap: int = 0) -> QRect | None:
+        """离 r 最近的空位：不压 placed 里任何一块，整块还在屏幕内。
+
+        搜索按「一圈一圈往外」走（下 → 右 → 上 → 左），所以挪动的距离最小；
+        原地空着就直接返回原地（调用方据此判断「不用动」）。
+        """
+        def hits(rr: QRect) -> bool:
+            probe = rr.adjusted(-gap, -gap, gap, gap)
+            return any(probe.intersects(o) for o in placed)
+
+        def fixed(rr: QRect) -> QRect:
+            out = QRect(rr)
+            out.moveLeft(min(max(out.left(), scr.left()),
+                             max(scr.left(), scr.right() + 1 - out.width())))
+            out.moveTop(min(max(out.top(), scr.top()),
+                            max(scr.top(), scr.bottom() + 1 - out.height())))
+            return out
+
+        base = fixed(r)
+        if not hits(base):
+            return base
+        step_x = max(8, r.width() + 8)
+        step_y = max(8, r.height() + 8)
+        seen = {(base.x(), base.y())}
+        for k in range(1, 40):
+            for cand in (r.translated(0, k * step_y), r.translated(k * step_x, 0),
+                         r.translated(0, -k * step_y), r.translated(-k * step_x, 0)):
+                cand = fixed(cand)
+                key = (cand.x(), cand.y())
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not hits(cand):
+                    return cand
+        return None
+
     def _pack_collapsed(self, boxes) -> None:
-        """收起的盒子互相压住时，后建的那个往下让（只改临时位置，家不动）。
+        """收起的盒子互相压住时，后建的那个挪到最近的空位（只改临时位置，家不动）。
 
         为什么要有这一步：盒子变大（横杠 → 正常、拖进图标）时邻居会让开，可下
         一次重排是从家算起的，那个「让开」本来会被抹掉，于是「一会儿叠、一会儿
-        不叠」。这里按「先建的先占位」重新排一遍，让开的结果就稳定了。
+        不叠」。这里按「先建的先占位」重排一遍，让开的结果就稳定了。
+
+        只处理**真的压住**的：用户自己摆的盒子常常只隔几像素，不能当成错误顶开。
         """
-        gap = self.SETTLE_GAP
         try:
             scr = (boxes[0].screen() or self.app.primaryScreen()).availableGeometry()
         except (RuntimeError, TypeError, AttributeError, IndexError):
@@ -1589,31 +1628,11 @@ class Controller(QObject):
                           int(w._side_w), int(w._collapsed_h()))
             except (RuntimeError, TypeError, AttributeError):
                 continue
-            for _ in range(64):
-                clash = None
-                for o in placed:
-                    if r.intersects(o.adjusted(-gap, -gap, gap, gap)):
-                        clash = o
-                        break
-                if clash is None:
-                    break
-                down = clash.bottom() + 1 + gap
-                if down + r.height() <= scr.bottom() + 1:
-                    r.moveTop(max(r.top(), down))
-                    continue
-                right = clash.right() + 1 + gap
-                if right + r.width() <= scr.right() + 1:
-                    r.moveLeft(max(r.left(), right))
-                    continue
-                up = clash.top() - gap - r.height()
-                if up >= scr.top():
-                    r.moveTop(min(r.top(), up))
-                    continue
-                break
-            r.moveLeft(min(max(r.left(), scr.left()), scr.right() + 1 - r.width()))
-            r.moveTop(min(max(r.top(), scr.top()), scr.bottom() + 1 - r.height()))
-            w.box.x, w.box.y = int(r.x()), int(r.y())
-            placed.append(QRect(r))
+            best = self._free_slot(r, placed, scr)
+            if best is None:
+                best = r
+            w.box.x, w.box.y = int(best.x()), int(best.y())
+            placed.append(QRect(best))
 
     def _plan_all(self, win, target, items, base, allow_collapse: bool = True):
         """一份完整方案：(down, collapsed, row, up, side, blocked) 或 None（放不下）。"""
