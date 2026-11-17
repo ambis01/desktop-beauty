@@ -1394,9 +1394,20 @@ class BoxWidget(GlassWindow):
             # 横杠状态下不许勾「常驻展开」（用户 2026-11-16 定的）：勾着就得是 1，
             # 可它现在是一条横杠，一勾要连着变两次状态——以前就这么变出
             # 「pinned=1 但状态是 -1」的双重状态，后面一堆逻辑按 1 算，越修越乱。
+            try:
+                _log_force("pin refused box=%s: 横杠状态", self.box.id)
+            except (RuntimeError, TypeError):
+                pass
             self.shake()
             return
         if on and not getattr(self.box, "pinned", False) and not self._pin_room():
+            # 让不开就勾不上（用户 2026-11-17 问「E 点不了常驻展开」：就是被这条拦的，
+            # 而且只有抖一下，看不出原因）。记一行，方便查是哪块挡着。
+            try:
+                _log_force("pin refused box=%s: 周围让不开（%s）",
+                           self.box.id, self.box.name)
+            except (RuntimeError, TypeError):
+                pass
             self.shake()
             return
         self.box.pinned = on

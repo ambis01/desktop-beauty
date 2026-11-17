@@ -2287,6 +2287,12 @@ class Controller(QObject):
         obstacles = [(o, r) for o, _b, r in self._snapshot(win)
                      if id(o) not in pushed]
         for other, is_box, rect in row:
+            if is_box and getattr(other, "is_expanded", False):
+                # 展开着的面板**不许被推**：它的位置由阶段 0（面板之间互相让位）
+                # 定，这里再推一次就是「展开 E，E 自己被顶上去 492px，然后压在 A
+                # 上」（用户 2026-11-17 实测，日志 grow: up E 575->83）。推不动就
+                # 整份方案作废，让调用方换方向或者盖住。
+                return None
             h = rect.height()
             left, right = rect.left(), rect.right()
             cur = self._axis_pos(other, is_box, "y")
@@ -2451,6 +2457,11 @@ class Controller(QObject):
         virt: dict[int, QRect] = {}
         moves: list[tuple] = []
         for other, is_box, rect in cand:
+            if is_box and getattr(other, "is_expanded", False):
+                # 展开着的面板不许被推（同 `_plan_up`）：推它就是把别人的面板
+                # 拖着走，收起来还会留在错的位置。算「侧面没空间」，盖住。
+                blocked.append(other)
+                continue
             others = [virt.get(id(o2)) or r2 for o2, _b2, r2 in items if o2 is not other]
             here = rect.left()
             got = None
