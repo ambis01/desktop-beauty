@@ -79,7 +79,9 @@ class CardWindow(GlassWindow):
         # 默认不用 WindowStaysOnTopHint：卡片要「留在桌面上」，不能被别的
         # 窗口盖过。层级由 Controller.apply_z_order 统一管，只有用户勾了
         # 置顶才浮起来。
-        flags = Qt.FramelessWindowHint | Qt.Tool
+        # WindowDoesNotAcceptFocus 同盒子：点卡片不许激活（激活会被 Windows
+        # 抬到最前，浮在窗口上闪一下）。卡片里没有键盘输入，放心关。
+        flags = Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
         if card.always_on_top:
             flags |= Qt.WindowStaysOnTopHint
         super().__init__(None, flags, radius=radius, dark=False)

@@ -44,6 +44,16 @@ user32.GetForegroundWindow.argtypes = []
 user32.SetWindowPos.restype = wt.BOOL
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, wt.UINT]
+# 一次挪好几块时用 DeferWindowPos 拼成一批：Windows 会把它们**一次**合成上去，
+# 而不是每块各合成一遍（12 块各合成一遍就是肉眼可见的整屏闪）。
+user32.BeginDeferWindowPos.restype = ctypes.c_void_p
+user32.BeginDeferWindowPos.argtypes = [ctypes.c_int]
+user32.DeferWindowPos.restype = ctypes.c_void_p
+user32.DeferWindowPos.argtypes = [ctypes.c_void_p, wt.HWND, wt.HWND,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, wt.UINT]
+user32.EndDeferWindowPos.restype = wt.BOOL
+user32.EndDeferWindowPos.argtypes = [ctypes.c_void_p]
 dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
 dwmapi.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p,
                                          wt.DWORD]
@@ -131,8 +141,14 @@ def is_normal(hwnd) -> bool:
 def analyze(ours_bottom_to_top: list[int]) -> dict:
     """算这一轮要不要动、动哪几块、插到谁下面。
 
-    返回 {"action": "ok"|"raise"|"demote", "why": str, "anchor": hwnd,
+    返回 {"action": "ok"|"place", "why": str, "anchor": hwnd,
           "move": [hwnd, ...]}，`move` 从下往上。
+
+    ⚠️ 只有一个目标带，不再分「抬上去 / 压下来」两套，否则两边会互相打架：
+    实测 1.1.2 里出现过 raise → demote → raise 的来回（每次都是 12 块窗口整串
+    重插），用户看到的就是「整个桌面的盒子卡片一直闪」。现在先算出**唯一**的
+    落点——「桌面正上方、所有在桌面之上的普通窗口下面」——再只看谁不在这条带里，
+    插一次就收敛。
     """
     ours = [int(h) for h in ours_bottom_to_top if h]
     res = {"action": "ok", "why": "no windows", "anchor": 0, "move": []}
@@ -153,46 +169,90 @@ def analyze(ours_bottom_to_top: list[int]) -> dict:
     if not mine:
         res["why"] = "none visible"
         return res
-    if any(i > prog_i for i, _h in mine):
-        # 桌面被抬到我们上面（点了「显示桌面」）
-        anchor = int(user32.GetWindow(wt.HWND(prog), GW_HWNDPREV) or 0)
-        res.update(action="raise", why="desktop covers us", anchor=anchor,
-                   move=list(ours))
-        return res
-    # 普通窗口里最靠下的那一个：我们的窗口必须在它下面
     ours_set = set(ours)
-    low = None
-    for i in range(prog_i - 1, min(i for i, _h in mine) - 1, -1):
-        h = chain[i]
-        if h in ours_set:
-            continue
-        if is_normal(h):
-            low = i
-            break
-    if low is None:
+    # 桌面之上有哪些普通窗口：我们的窗口必须都落在它们下面
+    above = [i for i in range(prog_i)
+             if chain[i] not in ours_set and is_normal(chain[i])]
+    if above:
+        anchor_i = max(above)               # 最靠下的那个普通窗口
+        anchor = chain[anchor_i]
+        # 不在 (anchor, 桌面) 这条带里的：跑到那个窗口上面的、被桌面盖住的
+        bad = [h for i, h in sorted(mine, reverse=True)
+               if not (anchor_i < i < prog_i)]
+        why = f"below {class_of(anchor)}"
+    else:
+        # 桌面之上没有普通窗口（刚「显示桌面」）：只要在桌面上面就行
+        anchor = int(user32.GetWindow(wt.HWND(prog), GW_HWNDPREV) or 0)
+        bad = [h for i, h in sorted(mine, reverse=True) if i > prog_i]
+        why = "above desktop"
+    if not bad:
         res["why"] = "in band"
         return res
-    anchor = chain[low]
-    # 只挪「跑到那个窗口上面去」的那几块；从下往上插，插完顺序才是对的
-    move = [h for i, h in sorted(mine, reverse=True) if i < low]
-    if not move:
-        res.update(why="in band", action="ok")
+    if anchor and len(bad) == len(mine) and anchor == foreground_hwnd():
+        # 整串都跑到了**前台窗口**上面（「显示桌面」回来时最常见：外壳把窗口
+        # 放回来是插在桌面正上方的，正好在我们的窗口下面）。这时候把那一块
+        # 窗口提到我们前面去：1 次 SetWindowPos，比把 12 块窗口挨个压下去
+        # 干净得多——那是 12 次重新合成，肉眼就是所有盒子一起闪。
+        res.update(action="front", why=f"lift {class_of(anchor)}",
+                   anchor=anchor, move=[], ours=ours)
         return res
-    res.update(action="demote", why=f"above {class_of(anchor)}", anchor=anchor,
-               move=move)
+    res.update(action="place", why=why, anchor=anchor, move=bad)
     return res
+
+
+def _lift(hwnd: int, ours: list[int]) -> int:
+    """把 `hwnd` 提到我们这串窗口的最前面（只动它一块）。"""
+    chain = visible_chain()
+    pos = {h: i for i, h in enumerate(chain)}
+    if hwnd not in pos:
+        return 0
+    ours_set = set(int(h) for h in ours)
+    tops = [pos[h] for h in ours_set if h in pos]
+    if not tops:
+        return 0
+    j = min(tops) - 1
+    while j >= 0 and chain[j] in ours_set:
+        j -= 1
+    prev = chain[j] if j >= 0 else 0
+    if prev == hwnd:
+        return 0
+    try:
+        ok = user32.SetWindowPos(wt.HWND(int(hwnd)),
+                                 wt.HWND(prev) if prev else None,
+                                 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                                 | SWP_NOOWNERZORDER)
+    except OSError:
+        return 0
+    return 1 if ok else 0
 
 
 def apply_plan(plan: dict) -> int:
     """按 `analyze` 的结果动手；返回真正挪了几块。"""
+    if plan.get("action") == "front":
+        return _lift(plan.get("anchor") or 0, plan.get("ours") or [])
     anchor = plan.get("anchor") or 0
+    move = [int(h) for h in (plan.get("move") or [])]
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+    ins = wt.HWND(anchor) if anchor else None
+    if len(move) > 1:
+        hdwp = user32.BeginDeferWindowPos(len(move))
+        done = 0
+        while hdwp and done < len(move):
+            nxt = user32.DeferWindowPos(hdwp, wt.HWND(move[done]), ins,
+                                        0, 0, 0, 0, flags)
+            if not nxt:
+                break
+            hdwp = nxt
+            done += 1
+        if hdwp:
+            if done == len(move) and user32.EndDeferWindowPos(hdwp):
+                return done
+            user32.EndDeferWindowPos(hdwp)      # 丢掉半批，退回逐个
     moved = 0
-    for hwnd in plan.get("move") or []:
+    for hwnd in move:
         try:
-            ok = user32.SetWindowPos(wt.HWND(int(hwnd)), wt.HWND(anchor) if anchor else None,
-                                     0, 0, 0, 0,
-                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-                                     | SWP_NOOWNERZORDER)
+            ok = user32.SetWindowPos(wt.HWND(hwnd), ins, 0, 0, 0, 0, flags)
         except OSError:
             continue
         if ok:

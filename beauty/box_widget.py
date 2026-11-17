@@ -206,6 +206,12 @@ SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
 SWP_NOOWNERZORDER = 0x0200
+GWL_EXSTYLE = -20
+WS_EX_NOACTIVATE = 0x08000000
+user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
+user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
+user32.SetWindowLongW.restype = ctypes.c_long
 
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
@@ -442,7 +448,14 @@ class BoxWidget(GlassWindow):
     warn = Signal(str)        # 有东西被拒收（别的卷上的文件夹 / 系统目录…）
 
     def __init__(self, store, box):
-        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool, radius=20,
+        # ⚠️ WindowDoesNotAcceptFocus（WS_EX_NOACTIVATE）：点盒子**不许**把它
+        # 激活。Windows 一旦激活窗口就会顺手把它抬到整层最前，于是盒子浮到别的
+        # 窗口上面，得等下一拍校正才压回去——用户看到的就是「点一下盒子它冲到
+        # 窗口前面闪一下」（2026-11-17 报的）。禁止激活就没有这一下。鼠标事件
+        # 照常收；只有「就地改名」那个输入框需要键盘，那时临时放开（见
+        # `_begin_inline_rename`）。
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool
+                         | Qt.WindowDoesNotAcceptFocus, radius=20,
                          activate=False)
         self.store = store
         self.box = box
@@ -3858,6 +3871,21 @@ class BoxWidget(GlassWindow):
             self._busy_drop = False
 
     # ---------------------------------------------------------------- 就地改名
+    def _set_noactivate(self, on: bool) -> None:
+        """临时开/关 WS_EX_NOACTIVATE（就地改名要键盘焦点那一下）。
+
+        直接改扩展样式，不重建窗口：Qt 的 `setWindowFlag` 会 hide/show 一次，
+        玻璃会闪、还可能把位置挪掉。
+        """
+        try:
+            hwnd = int(self.winId())
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            want = (ex | WS_EX_NOACTIVATE) if on else (ex & ~WS_EX_NOACTIVATE)
+            if want != ex:
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, want)
+        except (OSError, TypeError, RuntimeError):
+            pass
+
     def _begin_inline_rename(self) -> None:
         """在标题位置直接编辑，不弹对话框。"""
         self._outside_timer.stop()
@@ -3866,6 +3894,13 @@ class BoxWidget(GlassWindow):
         self._win_pos = None
         self._moved = False
         self._pressed_item = None
+        # 要收键盘了：先放开 NOACTIVATE，不然 activateWindow 不生效、输入框
+        # 收不到任何字符。
+        self._set_noactivate(False)
+        try:
+            user32.SetForegroundWindow(int(self.winId()))
+        except (OSError, TypeError, RuntimeError):
+            pass
         self.activateWindow()
         if self._edit is None:
             self._edit = QLineEdit(self)
@@ -3905,6 +3940,8 @@ class BoxWidget(GlassWindow):
         self._edit.hide()
         if commit and text:
             self.store.rename(self.box, text)
+        # 改完名字马上恢复「点它不激活」，否则它又会被 Windows 抬到最前
+        self._set_noactivate(True)
         if self._expanded:
             self._was_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
             self._outside_timer.start()

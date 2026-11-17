@@ -208,7 +208,7 @@ class Controller(QObject):
         # 插件「贴桌面」那一层：被「显示桌面」抬起来的桌面盖住要抬回来，
         # 从别的窗口「显示回来」之后浮在窗口上面要压回去（见 `zband`）
         self._desk_timer = QTimer(self)
-        self._desk_timer.setInterval(150)
+        self._desk_timer.setInterval(50)
         self._desk_timer.timeout.connect(self._desk_tick)
         self._desk_timer.start()
         # 天气：启动先抓一次，之后每 5 分钟看一眼（20 分钟内的缓存直接复用）
@@ -1156,24 +1156,13 @@ class Controller(QObject):
         return list(self.windows.values()) + list(self.card_widgets.values())
 
     def _desk_tick(self) -> None:
-        """前台一变就校正一次层级；平时每 5 拍（约 0.75 秒）兜底查一次。
+        """每 50ms 看一眼层级对不对（`zband.analyze` 实测 0.22ms，不心疼）。
 
-        为什么盯前台：跑偏的两个来源正好都会让前台变——
-          * 点一下收纳盒：Windows 把它**激活并抬到最前**（然后浮在窗口上）；
-          * 点一下桌面：Windows 把 Progman 抬到普通窗口带最上面（盒子全被盖住）。
-        以前只有 0.7 秒一次的「被盖住就往上抬」，所以真的要等大半秒才回来，
-        看着就是「整个桌面的盒子卡片闪一下」。
+        为什么跑这么勤：跑偏的时机是「外壳把窗口放回来」「点一下盒子」「点一下
+        桌面」这些，都没有通知可等。以前 0.7 秒一轮，用户看到的就是「盒子在窗口
+        上面停半秒才消失」；现在最多 50ms，人眼基本看不到。
         """
         self._desk_tick_n += 1
-        from . import zband
-        try:
-            fg = zband.foreground_hwnd()
-        except OSError:
-            fg = 0
-        changed = fg != self._zband_fg
-        self._zband_fg = fg
-        if not changed and self._desk_tick_n % 5:
-            return
         self._keep_above_desktop()
 
     def _keep_above_desktop(self) -> None:
@@ -1193,6 +1182,12 @@ class Controller(QObject):
         now = time.monotonic()
         if now < self._zband_cool or is_dragging():
             return
+        if now - _BOOT_MONO < 4.0:
+            # 启动这几秒窗口是一个一个 show 出来的，每个新窗口都先落在最前面，
+            # 一查就是「有一块跑偏了」——会被当成「怎么摆都被抬走」，四轮之后
+            # 直接歇 15 秒，剩下那几块就一直浮在窗口上面（23:03 实测过一次
+            # 6/6 的大搬运）。所以启动先不查，4 秒后一次摆好。
+            return
         if any(getattr(w, "_window_dragging", False)
                for w in self.card_widgets.values()):
             return
@@ -1207,9 +1202,9 @@ class Controller(QObject):
         if plan["action"] == "ok":
             self._zband_streak = 0
             return
-        if now - self._zband_last < 0.4:
-            return
-        self._zband_last = now
+        # 不再按时间节流：目标带只有一个，插一次就收敛（以前 raise/demote 两套
+        # 会来回打架——每次 12 块窗口整串重插，肉眼就是整个桌面一直闪）。
+        # 真遇到「怎么摆都被抬走」时靠下面这个 streak 兜底。
         self._zband_streak += 1
         if self._zband_streak > 4:
             # 刚摆好又被抬走（外壳反复抬桌面 / 别的程序抢层级）：先歇 15 秒，
@@ -1219,8 +1214,7 @@ class Controller(QObject):
             _log(f"z-band: give up 15s ({plan['why']})")
             return
         moved = zband.apply_plan(plan)
-        _log(f"z-band: {plan['action']} ({plan['why']}) moved {moved}"
-             f"/{len(plan['move'])}")
+        _log(f"z-band: {plan['why']} moved {moved}")
 
     def _slide_widget_to(self, win, target: int, dur: int = 220,
                          axis: str = "y") -> None:
