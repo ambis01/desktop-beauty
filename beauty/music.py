@@ -775,8 +775,12 @@ class MusicService(QObject):
         browser = {k: self._is_browser(app_of.get(k, "")) for k in keys}
 
         def score(k: str) -> tuple:
-            return (2 if browser.get(k) else 0,      # 桌面播放器优先
-                    0 if playing.get(k) else 1,      # 在放的优先
+            # 在放的永远排前面（粘性之外最重要的一条）；视频排在最后，但**不排除**：
+            # 只用 B站 网页版听歌的人照样能跟上（用户 2026-11-17 澄清：他那台 B站
+            # 本来就不跟、跟的是网易云；要修的是「视频会话被当成首选并粘死」）。
+            return (0 if playing.get(k) else 1,
+                    1 if video.get(k) else 0,
+                    1 if browser.get(k) else 0,
                     app_of.get(k, ""), k)
 
         ranked = sorted(keys, key=score)
@@ -799,14 +803,14 @@ class MusicService(QObject):
                 continue
             if ch.key not in keys or ch.key in used:
                 continue
-            if video.get(ch.key):
-                continue                     # 不跟视频（B站网页版）
             if not playing.get(ch.key) and any_playing:
-                continue                     # 它停了、别人在放：换过去
+                # 它停了/暂停、而别的会话正在放：换过去。这就是朋友那台「关掉视频
+                # 改放歌，卡片还赖在 B站 上」的直接原因。
+                continue
             claim[ch.card_id] = ch.key
             used.add(ch.key)
-        # 3) 剩下的补齐：只用非视频会话
-        free = [k for k in ranked if k not in used and not video.get(k)]
+        # 3) 剩下的按排好的顺序补齐（视频会话排最后，实在没别的才用它）
+        free = [k for k in ranked if k not in used]
         for ch in self._channels:
             if ch.card_id in claim or not free or ch.prefer:
                 continue
