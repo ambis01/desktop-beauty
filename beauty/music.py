@@ -468,12 +468,43 @@ class MusicService(QObject):
         self._fallback_sig: tuple | None = None
         self._cmds: queue.Queue = queue.Queue()
         self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._respawns = 0
         try:
             import winsdk  # noqa: F401  只探一下装没装
             self.ok = True
         except Exception:  # noqa: BLE001 - 没装就只走「窗口标题」那条路
             dlog("music: winsdk 没装，只走窗口标题 + 媒体键")
-        threading.Thread(target=self._run, name="music-smtc", daemon=True).start()
+        self._spawn()
+        threading.Thread(target=self._guard, name="music-guard", daemon=True).start()
+
+    # ------------------------------------------------------------ 线程兜底
+    def _spawn(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="music-smtc",
+                                        daemon=True)
+        self._thread.start()
+
+    def _guard(self) -> None:
+        """盯着轮询线程：它死了就重新拉一个。
+
+        为什么要有这个：2026-11-17 17:43 实测轮询线程会**整个死掉**——
+        `_reconnect()` 里 `Manager.request_async()` 抛了个 COM 的
+        `RPC_E_WRONG_THREAD`（0x8001010e），那是 SEH 级的致命异常，Python 的
+        `except` 根本接不住，线程直接没了。表现就是「音乐卡片再也捕获不到任何
+        东西」，只有重启程序才好。这里每 5 秒看一眼，线程没了就重新起一个：
+        服务对象本身、通道、封面缓存都还在，新线程连上会话管理器就接着干。
+        """
+        while not self._stop.is_set():
+            time.sleep(5.0)
+            th = self._thread
+            if self._stop.is_set() or th is None or th.is_alive():
+                continue
+            self._respawns += 1
+            dlog(f"music: 轮询线程没了，第 {self._respawns} 次重新拉起")
+            try:
+                self._spawn()
+            except Exception as exc:  # noqa: BLE001
+                dlog(f"music: 重新拉起失败 {exc!r}")
 
     # ------------------------------------------------------------ 通道
     def channel(self, card) -> MusicChannel:
@@ -537,7 +568,7 @@ class MusicService(QObject):
     def _run(self) -> None:
         try:
             asyncio.run(self._loop())
-        except Exception as exc:  # noqa: BLE001
+        except BaseException as exc:  # noqa: BLE001 - SEH 级异常也尽量留一行
             dlog(f"music: 线程停了 {exc!r}")
 
     async def _loop(self) -> None:
