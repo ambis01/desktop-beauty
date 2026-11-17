@@ -2105,14 +2105,27 @@ class BoxWidget(GlassWindow):
         return QPoint(r.x() - self.x(), r.y() - self.y())
 
     def _cur_paint_rect(self) -> QRect:
-        """「现在这块玻璃」的窗口矩形——固定窗口模式下动画要从它出发，而不是整个窗口。
+        """「现在这块玻璃」的窗口矩形——新动画必须从它出发，不能从窗口矩形出发。
 
-        老模式里窗口就是玻璃（加余量），`self.geometry()` 可以直接当动画起点；固定窗口
-        模式下窗口比玻璃大一圈，拿它当起点的话，动画会从一大块（多半是透明的）外框
-        开始长——看着就是玻璃「先闪一下整窗再缩回盒子」。
+        为什么不能直接用 `self.geometry()`：动画期间窗口会被开到「起点∪终点」
+        那么大（非固定窗口模式也是），窗口比此刻的玻璃大一圈。动画被打断时
+        （用户点得太快、外面点一下、连着点两个盒子）拿窗口矩形当起点，玻璃会
+        **瞬间撑到整窗**，图标按整块面板排开——就是用户 2026-11-17 报的
+        「偶尔一帧图标冲出来」。固定窗口模式下窗口永远比玻璃大，同样只能取
+        `_paint_rect`。
+
+        `_paint_rect` 每次动画帧都会跟着插值更新，所以它就是「此刻的玻璃」。
+        兜底：万一它和现在的窗口完全不相交（窗口被滑走/刚重建），退回窗口矩形。
         """
-        if self._fixed_win and not self._paint_rect.isNull():
-            return QRect(self._paint_rect)
+        r = QRect(self._paint_rect)
+        if not r.isNull() and r.intersects(self.geometry()):
+            try:
+                _log_force("anim from glass box=%s %s win=%s", self.box.id,
+                           (r.x(), r.y(), r.width(), r.height()),
+                           (self.x(), self.y(), self.width(), self.height()))
+            except (RuntimeError, TypeError, AttributeError):
+                pass
+            return r
         return self.geometry()
 
     def _anim_frame_stat(self) -> None:
@@ -2147,8 +2160,17 @@ class BoxWidget(GlassWindow):
         # 动画结束：窗口收/放回这一帧该在的矩形（动画期间它是「起点∪终点」）
         target = QRect(self._anim_rect_to)
         self._anim_win = QRect()
-        self._paint_rect = QRect()
-        self._paint_box = None
+        # ⚠️ 顺序：先把「最终矩形里的画笔位置」算好，再去改窗口几何。
+        # 以前是先 `_paint_rect = QRect()` / `_paint_box = None` 再改几何：清空之后
+        # `_cw()` 会退回到「整个窗口」，而这时窗口还是动画用的「起点∪终点」，
+        # 于是中间任何一帧重画都会把玻璃和图标按整窗画出来——收起时肉眼就是
+        # 「面板又撑开一下、图标冲出去」（用户 2026-11-17 报的那一下）。
+        if target.isNull():
+            self._paint_rect = QRect()
+            self._paint_box = None
+        else:
+            self._paint_rect = QRect(target)
+            self._sync_paint_box(target)
         if getattr(self, "_z_pending", False):
             self._z_pending = False
             self._notify_z()
@@ -2158,6 +2180,9 @@ class BoxWidget(GlassWindow):
             self._restore_acrylic()     # 动画期间关掉的模糊，落地就开回来
             self._set_expanded_blur(False)
             self.repaint()          # 同上：尺寸变了就当场画一遍，别让那一帧空着
+            # 落地了：窗口重新等于玻璃，交回默认算法
+            self._paint_rect = QRect()
+            self._paint_box = None
             return
         if self._fixed_win:
             # 固定窗口：收尾不用改窗口，只把「现在这块玻璃」定成展开面
@@ -2169,6 +2194,8 @@ class BoxWidget(GlassWindow):
             # 面板矩形——用户看到的那一下闪，主要就是这一步（同一个几何变化走安静版）
             self._set_geometry_quiet(target)
             self.repaint()
+        self._paint_rect = QRect()
+        self._paint_box = None
         # 展开完成：收起形态回到「缩略图标」（下次收起 / 拖动按它算）
         self._bar = False
         self._bar_t = 0.0
