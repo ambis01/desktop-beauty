@@ -509,6 +509,13 @@ class Controller(QObject):
     SLIDE_IN_MS = (280, 470)
     SLIDE_STAGGER = 100            # 波的错开：越靠边的越早走，最多晚 100ms
     SLIDE_GAP = 3                  # 停到屏幕外面再多走 3px，保证一点都看不见
+    # 实验开关：滑出/滑入时要不要一起淡入淡出。半透明(WS_EX_LAYERED)窗口每帧改
+    # windowOpacity 很贵——实测启用/停用时事件循环每帧被拖到 40~50ms（日志
+    # 「slow event: Timer dt=44 gap=-44」），20fps 就是用户看到的卡。
+    # 设 BEAUTY_NO_SLIDE_FADE=1 可以先只动位置、不淡，用来判断卡是淡造成的还是动造成的。
+    SLIDE_FADE = os.environ.get("BEAUTY_NO_SLIDE_FADE") != "1"
+    SLIDE_CASCADE_MS = 26          # 启用/停用的错开：一块接一块，别让十几块同时动
+    SLIDE_TRAVEL = 110             # 有淡入淡出时只滑这么远（见 _slide_track）
 
     def _slide_track(self, w):
         """(home, off, dist)：出去和回来共用这一份几何。
@@ -524,6 +531,13 @@ class Controller(QObject):
             home = QPoint(w.pos())
             w._slide_home = QPoint(home)
         r = (w.screen() or self.app.primaryScreen()).availableGeometry()
+        if self.SLIDE_FADE:
+            # 有淡入淡出时只滑一小段：剩下的交给透明度。横穿半屏那种长距离滑动，
+            # 每帧要挪好几像素、半透明窗口的合成压力明显更大——用户 2026-11-17
+            # 实测「盒子放在屏幕两侧就不卡，很多盒子在中间时才卡」。
+            sign = -1 if home.x() + w.width() / 2.0 < r.center().x() else 1
+            off = QPoint(home.x() + sign * self.SLIDE_TRAVEL, home.y())
+            return QPoint(home), off, abs(off.x() - home.x())
         if home.x() + w.width() / 2.0 < r.center().x():
             # 整个窗口（含四周透明余量）都到屏幕左边外面
             off = QPoint(r.left() - w.width() - self.SLIDE_GAP, home.y())
@@ -542,6 +556,26 @@ class Controller(QObject):
         except (RuntimeError, AttributeError):
             width = 1
         return int(min(self.SLIDE_STAGGER, dist * self.SLIDE_STAGGER / width))
+
+    def _batch_delay(self, order: int) -> int:
+        """启用/停用：**分批**走，每批最多 4 块、一批 210ms。
+
+        实测（日志 slow event：启用/停用时每帧 40~50ms）瓶颈不是淡入淡出，是
+        「半透明窗口每帧改位置」本身：十几块同时动，一帧要合成十几次，只有 20fps。
+        分批之后同一时刻最多 4 块在动，一帧的活就下来了。
+        """
+        order = max(0, int(order))
+        group, inner = divmod(order, max(1, int(self.SLIDE_BATCH)))
+        return int(min(1400, group * int(self.SLIDE_BATCH_MS) + inner * 12))
+
+    def _cascade_delay(self, order: int) -> int:
+        """启用/停用时的错开：第 n 块等 n*26ms 再动（最多 320ms）。
+
+        原来按「离屏幕边的距离」错开，最多只有 100ms，十几块半透明窗口几乎同时
+        改位置 + 改 windowOpacity，合成器每帧重新合成十几次，肉眼看就是「有点卡、
+        不丝滑」（用户 2026-11-17）。错开之后同一时刻最多三四块在动。
+        """
+        return int(min(320, max(0, int(order)) * self.SLIDE_CASCADE_MS))
 
     def _stop_slide(self, w) -> None:
         old = getattr(w, "_slide_anim", None)
@@ -587,9 +621,19 @@ class Controller(QObject):
             group.addAnimation(QPauseAnimation(int(delay), group))
         group.addAnimation(body)
 
+        started = time.perf_counter()
+
         def _done():
             w._slide_busy = False
             w._slide_anim = None
+            try:
+                elapsed = (time.perf_counter() - started) * 1000.0
+                expect = int(dur) + int(delay)
+                if elapsed > expect * 1.35 + 30:
+                    label = getattr(getattr(w, 'box', None), 'name', type(w).__name__)
+                    _log(f'slide slow {label} expect={expect}ms actual={elapsed:.0f}ms')
+            except (RuntimeError, TypeError, AttributeError):
+                pass
             if fade is not None:
                 # 收尾兜一下：动画被中断时这里不会跑，所以半透明只可能停在半路，
                 # 而停下之后一律要么全实（看得见）要么全透（已经藏起来）两种情况。
@@ -607,7 +651,7 @@ class Controller(QObject):
         w._slide_anim = group
         group.start(QAbstractAnimation.DeleteWhenStopped)
 
-    def _slide_out(self, w) -> None:
+    def _slide_out(self, w, order: int = 0) -> None:
         """停用：往最近的屏幕边滑出去，边滑边淡出，整块出了屏幕再藏起来。"""
         if not w.isVisible():
             return
@@ -618,10 +662,12 @@ class Controller(QObject):
         self._slide_run(
             w, start, off,
             self._slide_duration(remain, self.SLIDE_OUT_MS, self.SLIDE_OUT_SPEED),
-            0 if busy else self._slide_delay(w, remain),
-            QEasingCurve.InCubic, fade=(w.windowOpacity(), 0.0), on_done=w.hide)
+            0 if busy else self._cascade_delay(order),
+            QEasingCurve.InCubic,
+            fade=(w.windowOpacity(), 0.0) if self.SLIDE_FADE else None,
+            on_done=w.hide)
 
-    def _slide_in(self, w) -> None:
+    def _slide_in(self, w, order: int = 0) -> None:
         """启用：从屏幕外面滑回来，边滑边淡入。"""
         home, off, _dist = self._slide_track(w)
         visible = w.isVisible()
@@ -632,7 +678,10 @@ class Controller(QObject):
             w._skip_show_grow = True
             w._slide_busy = True
             w.move(off)
-            w.setWindowOpacity(0.0)      # 全透明起步，滑进来的同时淡进来
+            # 全透明起步，滑进来的同时淡进来。**关掉淡入淡出时必须设回 1**：
+            # 否则窗口滑回来还是全透明，用户看到的就是「停用之后启用不回来」
+            # （2026-11-17 实测，BEAUTY_NO_SLIDE_FADE=1 时踩到）。
+            w.setWindowOpacity(0.0 if self.SLIDE_FADE else 1.0)
             w.show()
             w._skip_show_grow = False
         start = QPoint(w.pos())
@@ -641,10 +690,11 @@ class Controller(QObject):
         self._slide_run(
             w, start, home,
             self._slide_duration(remain, self.SLIDE_IN_MS, self.SLIDE_IN_SPEED),
-            0 if visible else self._slide_delay(w, remain),
-            QEasingCurve.OutQuint, fade=(a0, 1.0))
+            0 if visible else self._cascade_delay(order),
+            QEasingCurve.OutQuint,
+            fade=(a0, 1.0) if self.SLIDE_FADE else None)
 
-    def _slide_show(self, w, animate: bool) -> bool:
+    def _slide_show(self, w, animate: bool, order: int = 0) -> bool:
         """让窗口回到可见状态；**正在滑出去的也要拉回来**。
 
         以前这里只看 `isVisible()`：停用滑到一半（还没 hide）时又按启用，窗口
@@ -654,7 +704,7 @@ class Controller(QObject):
         if w.isVisible() and not getattr(w, "_slide_busy", False):
             return False
         if animate:
-            self._slide_in(w)
+            self._slide_in(w, order)
             return True
         self._stop_slide(w)
         home = getattr(w, "_slide_home", None)
@@ -978,16 +1028,27 @@ class Controller(QObject):
         if save:
             self.cfg.save()
         self.apply_cards(animate=animate)
-        for win in self.windows.values():
+        # 按「屏幕位置」（先上后下、先左后右）排一遍再动：错开时是一道整齐的波，
+        # 而不是按字典序乱跳（用户 2026-11-17：启用/停用有点卡、不丝滑）。
+        def _pos_key(w):
+            try:
+                p = w.pos()
+                return (int(p.y()), int(p.x()))
+            except (RuntimeError, TypeError, AttributeError):
+                return (0, 0)
+
+        order = 0
+        for win in sorted(self.windows.values(), key=_pos_key):
             if on:
-                self._slide_show(win, animate)
+                self._slide_show(win, animate, order)
             else:
                 if win.isVisible():
                     if animate:
-                        self._slide_out(win)
+                        self._slide_out(win, order)
                     else:
                         self._stop_slide(win)
                         win.hide()
+            order += 1
         # 总开关关掉时把收纳手势也停掉（钩子也一起摘了）
         if on:
             if not getattr(self, "_watcher_running", False):
