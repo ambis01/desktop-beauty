@@ -69,6 +69,15 @@ PLAYER_PROCS = {
     "wmplayer.exe", "itunes.exe", "potplayermini64.exe",
 }
 
+# 网页播放器的会话 AUMID 里带这些字样。它们能放歌，也能放视频（B站/YouTube），
+# 所以不能只看「有会话」就当音乐跟着走（用户 2026-11-17 朋友反馈：跟去 B站了）。
+BROWSER_MARKS = ("msedge", "chrome", "firefox", "opera", "brave", "vivaldi",
+                 "qqbrowser", "360se", "360chrome", "sogou", "safari", "arc")
+
+# GSMTC PlaybackType：1 = 音乐，2 = 视频
+MEDIA_KIND_MUSIC = 1
+MEDIA_KIND_VIDEO = 2
+
 VK_MEDIA_NEXT = 0xB0
 VK_MEDIA_PREV = 0xB1
 VK_MEDIA_PLAY_PAUSE = 0xB3
@@ -303,7 +312,7 @@ def _empty() -> dict[str, Any]:
     return {"has": False, "playing": False, "title": "", "artist": "",
             "album": "", "app": "", "pos": 0.0, "dur": 0.0,
             "mode": MODE_SEQUENTIAL, "can_prev": False, "can_next": False,
-            "can_play": False, "can_mode": False, "src": ""}
+            "can_play": False, "can_mode": False, "src": "", "kind": 0}
 
 
 class MusicChannel(QObject):
@@ -736,35 +745,68 @@ class MusicService(QObject):
             self._apply_to_channel(ch, self._snaps.get(key) if key else None)
         return len(items)
 
-    def _plan(self, keys: list[str]) -> dict[str, str]:
-        """卡片 → 会话键。先让还认得的卡片继续跟着自己那个播放器，再按顺序补齐。
+    @staticmethod
+    def _is_browser(app: str) -> bool:
+        a = (app or "").lower()
+        return any(mark in a for mark in BROWSER_MARKS)
 
-        这样「一个播放器只归一张卡片」：已经配给前面卡片的不再分给别人。
+    def _is_video(self, key: str) -> bool:
+        snap = self._snaps.get(key) or {}
+        return _int_or(snap.get("kind"), 0) == MEDIA_KIND_VIDEO
+
+    def _plan(self, keys: list[str]) -> dict[str, str]:
+        """卡片 → 会话键。规则（2026-11-17 改）：
+
+        0. 「不跟随」的卡片不参加；
+        1. 手动钉死的优先；
+        2. 上一轮认得的继续跟 —— 但两个例外：
+           * 那个会话是**视频**（B站/YouTube）→ 不自动跟，空着；
+           * 它已经暂停、而别的会话正在放 → 换到在放的那个（朋友反馈：关掉
+             视频改放歌，卡片还赖在 B站 上）；
+        3. 剩下的按「桌面音乐播放器 > 浏览器音乐 > 其它 > 视频；在放的优先」
+           补给还没着落的卡片；**视频会话不参与自动分配**，想跟就在菜单里钉。
         """
         claim: dict[str, str] = {}
         used: set[str] = set()
-        keys = list(dict.fromkeys(keys))       # 同一个键只配一次
-        # 0) 「不跟随」的卡片不参加分配：它一直空着，也不去占播放器
+        keys = list(dict.fromkeys(keys))
+        app_of = {k: str((self._snaps.get(k) or {}).get("app") or "") for k in keys}
+        playing = {k: bool((self._snaps.get(k) or {}).get("playing")) for k in keys}
+        video = {k: self._is_video(k) for k in keys}
+        browser = {k: self._is_browser(app_of.get(k, "")) for k in keys}
+
+        def score(k: str) -> tuple:
+            return (2 if browser.get(k) else 0,      # 桌面播放器优先
+                    0 if playing.get(k) else 1,      # 在放的优先
+                    app_of.get(k, ""), k)
+
+        ranked = sorted(keys, key=score)
+        any_playing = any(playing.values())
+
+        # 0) 不跟随
         for ch in self._channels:
             if ch.prefer == NO_FOLLOW:
                 claim[ch.card_id] = ""
-        # 1) 手动指定的优先（「跟随播放器」菜单里选的）
+        # 1) 手动指定的优先（视频会话也允许钉）
         for ch in self._channels:
             if ch.card_id in claim:
                 continue
             if ch.prefer and ch.prefer in keys and ch.prefer not in used:
                 claim[ch.card_id] = ch.prefer
                 used.add(ch.prefer)
-        # 2) 上一轮认得的，继续跟着自己那个播放器
+        # 2) 上一轮认得的继续跟（视频会话/该换人时除外）
         for ch in self._channels:
             if ch.card_id in claim or not ch.key:
                 continue
-            if ch.key in keys and ch.key not in used:
-                claim[ch.card_id] = ch.key
-                used.add(ch.key)
-        # 3) 剩下的播放器按顺序补给还没着落的卡片。
-        #    手动钉住的卡片不参加：它钉的那个播放器没开就空着，不偷偷换成别人。
-        free = [k for k in keys if k not in used]
+            if ch.key not in keys or ch.key in used:
+                continue
+            if video.get(ch.key):
+                continue                     # 不跟视频（B站网页版）
+            if not playing.get(ch.key) and any_playing:
+                continue                     # 它停了、别人在放：换过去
+            claim[ch.card_id] = ch.key
+            used.add(ch.key)
+        # 3) 剩下的补齐：只用非视频会话
+        free = [k for k in ranked if k not in used and not video.get(k)]
         for ch in self._channels:
             if ch.card_id in claim or not free or ch.prefer:
                 continue
@@ -806,6 +848,7 @@ class MusicService(QObject):
         status = _int_or(getattr(info, "playback_status", None), 0)   # 4=playing 5=paused
         snap = {
             "has": True,
+            "kind": _int_or(getattr(info, "playback_type", None), 0),
             "playing": status == 4,
             "title": props.title or "",
             "artist": props.artist or "",
