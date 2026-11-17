@@ -603,7 +603,11 @@ class MusicService(QObject):
                     key = ch.key if ch is not None else ""
                     cur = self._sessions.get(key) if key else None
                     if cur is not None:
-                        await self._run_smtc_command(cur, cmd, arg)
+                        ok = await self._run_smtc_command(cur, cmd, arg)
+                        if not ok and ch is not None:
+                            # 系统会话不认这条命令：跟的是浏览器就走兜底
+                            # （APPCOMMAND 递给那个进程 / 系统媒体键）
+                            self._run_fallback_command(ch, cmd, arg)
                     elif self._has_fallback(ch):
                         self._run_fallback_command(ch, cmd, arg)
                     else:
@@ -642,25 +646,67 @@ class MusicService(QObject):
         return bool(self._channels) and ch is self._channels[0]
 
     @staticmethod
-    async def _run_smtc_command(cur, cmd: str, arg) -> None:
-        if cmd == "toggle":
-            # 别用 try_toggle_play_pause_async：有的播放器暂停后不理 toggle，
-            # 按现在的真实状态明说要放还是要停，才按得动。
+    async def _try_toggle(cur, want: bool | None) -> bool:
+        """退到 toggle：只有当「当前状态」和「想要的状态」相反时才按，免得反着来。"""
+        try:
             info = cur.get_playback_info()
-            if _int_or(getattr(info, "playback_status", None), 0) == 4:
-                await cur.try_pause_async()
-            else:
-                await cur.try_play_async()
-        elif cmd == "play":
-            await cur.try_play_async()
-        elif cmd == "pause":
-            await cur.try_pause_async()
-        elif cmd == "next":
-            await cur.try_skip_next_async()
-        elif cmd == "prev":
-            await cur.try_skip_previous_async()
-        elif cmd == "mode":
-            await MusicService._apply_mode(cur, int(arg))
+            playing = _int_or(getattr(info, "playback_status", None), 0) == 4
+            if want is not None and playing == want:
+                return True              # 已经是想要的状态，不用按
+            return bool(await cur.try_toggle_play_pause_async())
+        except Exception as exc:  # noqa: BLE001
+            dlog(f"music: toggle 失败 {exc!r}")
+            return False
+
+    @staticmethod
+    async def _run_smtc_command(cur, cmd: str, arg) -> bool:
+        """返回 True = 播放器接了这条命令。浏览器的会话常常只认 toggle，所以
+        play/pause 失败时要再试一次 toggle（B站网页版按不动就是这个原因）。"""
+        if cmd == "toggle":
+            # 别一上来就用 toggle：有的播放器暂停后不理 toggle，按现在的真实状态
+            # 明说要放还是要停才按得动。浏览器反过来——它只认 toggle。
+            info = cur.get_playback_info()
+            playing = _int_or(getattr(info, "playback_status", None), 0) == 4
+            try:
+                ok = bool(await (cur.try_pause_async() if playing
+                                 else cur.try_play_async()))
+            except Exception as exc:  # noqa: BLE001
+                dlog(f"music: play/pause 失败 {exc!r}")
+                ok = False
+            if ok:
+                return True
+            return await MusicService._try_toggle(cur, not playing)
+        if cmd in ("play", "pause"):
+            want = cmd == "play"
+            try:
+                ok = bool(await (cur.try_play_async() if want
+                                 else cur.try_pause_async()))
+            except Exception as exc:  # noqa: BLE001
+                dlog(f"music: {cmd} 失败 {exc!r}")
+                ok = False
+            if ok:
+                return True
+            return await MusicService._try_toggle(cur, want)
+        if cmd == "next":
+            try:
+                return bool(await cur.try_skip_next_async())
+            except Exception as exc:  # noqa: BLE001
+                dlog(f"music: next 失败 {exc!r}")
+                return False
+        if cmd == "prev":
+            try:
+                return bool(await cur.try_skip_previous_async())
+            except Exception as exc:  # noqa: BLE001
+                dlog(f"music: prev 失败 {exc!r}")
+                return False
+        if cmd == "mode":
+            try:
+                await MusicService._apply_mode(cur, int(arg))
+                return True
+            except Exception as exc:  # noqa: BLE001
+                dlog(f"music: mode 失败 {exc!r}")
+                return False
+        return False
 
     def _fallback_send(self, ch: MusicChannel, code: int, vk: int) -> None:
         """没有系统会话时的控制：先按窗口把 APPCOMMAND 递给这个播放器，
