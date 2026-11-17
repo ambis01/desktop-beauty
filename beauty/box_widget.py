@@ -2334,8 +2334,16 @@ class BoxWidget(GlassWindow):
         # 收放动画期间内容钉在「原来那块」上（见 `_mini_rect` / `_paint_expanded`），
         # 可能会伸到当前窗口外面去；裁到玻璃圆角里，别让图标残影露到盒子外面
         # （用户 2026-11-16 报的「残影冲出收纳盒」）。
+        #
+        # ⚠️ 判断条件不能只看「定时器还开着」。动画被打断时（`toggle()` 里
+        # `_anim_timer.stop()` 之后、新动画 `_start_anim()` 之前有一段空档，
+        # 中间还要跑一次重排），这期间 `_t` 还是半截的、图标已经是整块面板的
+        # 排版，只要来一次重画就会**不裁剪**地画出去——用户 2026-11-17 报的
+        # 「图标冲出玻璃」就是这一帧。所以按「内容还在过渡态」判，而不是按
+        # 「定时器开着」判；静止状态（_t / _bar_t 正好 0 或 1）不裁，和以前一样。
         anim = self._anim_timer.isActive()
-        if anim:
+        mid = (0.0 < self._t < 0.999) or (0.0 < self._bar_t < 0.999)
+        if anim or mid:
             glass_path = QPainterPath()
             glass_path.addRoundedRect(
                 QRectF(0.0, 0.0, self._cw(), self._ch()),
