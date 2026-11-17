@@ -899,12 +899,20 @@ class BoxWidget(GlassWindow):
         return 1.0 + HOVER_GROW * self._hover_t
 
     def _set_geometry_quiet(self, rect: QRect, defer_blur: bool = False) -> None:
-        """改窗口几何，但不让合成器把「旧画面被拉一下」露出来。
+        """改窗口几何，但别让合成器把中间态露出来。
 
-        做法：同一次事件里 opacity 0 → 关亚克力 → setGeometry → 重画 → opacity 1。
-        合成器就算拿旧表面去拉伸/挪位，拉的也是全透明的；亚克力按新矩形重新采样
-        的那一帧也不会被看到（用户实测：内容不闪了，只剩玻璃背景闪一下——所以
-        模糊要整段动画都关掉，`defer_blur=True`，动画结束再打开）。
+        ⚠️ 2026-11-17 改：以前是「opacity 0 → 改几何 → 重画 → opacity 1」，想用
+        整窗全透明挡住合成器拉旧画面的那一帧。实测那一步**反而制造了用户报的
+        「整块变透明、露出壁纸一下」**：设透明度和改几何是两次独立的合成提交，
+        中间只要撞上一次垂直同步，就会实打实出一帧「窗口全透明、壁纸透出来」的
+        画面（逐帧抓图抓到了，展开开头、收起收尾各一次）。透明度的收益是躲一个
+        可能存在的旧表面拉伸，代价是必定概率出现整块消失——不划算。
+
+        现在只做真正需要的事，顺序不能换：
+        1. 调用方先把「这块玻璃在新矩形里该画在哪」算好（`_sync_paint_box`）；
+        2. 改几何；
+        3. 同步重画一次，把新矩形的画面立刻填上。
+        DWM 那层「过渡动画」（把旧画面拉过去）早就用 `no_transitions()` 关掉了。
         """
         if rect.isNull() or self.geometry() == rect:
             return
@@ -913,14 +921,18 @@ class BoxWidget(GlassWindow):
             # 还没显示（启动阶段）：没有合成画面要躲，直接改
             self.setGeometry(rect)
             return
-        self.setWindowOpacity(0.0)
+        # 老做法留个开关，只为了 A/B 对照复现问题（默认关）
+        legacy = os.environ.get("BEAUTY_QUIET_OPACITY") == "1"
+        if legacy:
+            self.setWindowOpacity(0.0)
         try:
             self.set_acrylic(False)
         except (RuntimeError, TypeError, AttributeError):
             pass
         self.setGeometry(rect)
         self.repaint()
-        self.setWindowOpacity(1.0)
+        if legacy:
+            self.setWindowOpacity(1.0)
         if defer_blur:
             # 动画还没结束：模糊先别开，免得在新尺寸上又采样一次（那就是「玻璃闪」）
             self._acrylic_off = True
