@@ -817,11 +817,58 @@ class BoxWidget(GlassWindow):
             return 1.0
         return 1.0 + HOVER_GROW * self._hover_t
 
+    def _set_geometry_quiet(self, rect: QRect, defer_blur: bool = False) -> None:
+        """改窗口几何，但不让合成器把「旧画面被拉一下」露出来。
+
+        做法：同一次事件里 opacity 0 → 关亚克力 → setGeometry → 重画 → opacity 1。
+        合成器就算拿旧表面去拉伸/挪位，拉的也是全透明的；亚克力按新矩形重新采样
+        的那一帧也不会被看到（用户实测：内容不闪了，只剩玻璃背景闪一下——所以
+        模糊要整段动画都关掉，`defer_blur=True`，动画结束再打开）。
+        """
+        if rect.isNull() or self.geometry() == rect:
+            return
+        before = self.geometry()
+        if not self.isVisible():
+            # 还没显示（启动阶段）：没有合成画面要躲，直接改
+            self.setGeometry(rect)
+            return
+        self.setWindowOpacity(0.0)
+        try:
+            self.set_acrylic(False)
+        except (RuntimeError, TypeError, AttributeError):
+            pass
+        self.setGeometry(rect)
+        self.repaint()
+        self.setWindowOpacity(1.0)
+        if defer_blur:
+            # 动画还没结束：模糊先别开，免得在新尺寸上又采样一次（那就是「玻璃闪」）
+            self._acrylic_off = True
+        else:
+            self._restore_acrylic()
+        try:
+            _log_force("geo quiet box=%s %s -> %s defer=%d", self.box.id,
+                       (before.x(), before.y(), before.width(), before.height()),
+                       (rect.x(), rect.y(), rect.width(), rect.height()),
+                       1 if defer_blur else 0)
+        except (RuntimeError, TypeError, AttributeError):
+            pass
+
+    def _restore_acrylic(self) -> None:
+        """把动画期间关掉的亚克力模糊开回来（只在真关过的时候动，避免多余的重采样）。"""
+        if not getattr(self, "_acrylic_off", False):
+            return
+        self._acrylic_off = False
+        try:
+            self.set_acrylic(True)
+            self.update()
+        except (RuntimeError, TypeError, AttributeError):
+            pass
+
     def _apply_collapsed_geometry(self) -> None:
         """窗口位置固定（含余量），尺寸固定——悬停时只改 paint_scale。"""
         m = self._win_margin()
-        self.setGeometry(self.box.x - m, self._glass_top() - m,
-                         self._win_w(), self._win_h())
+        self._set_geometry_quiet(QRect(self.box.x - m, self._glass_top() - m,
+                                       self._win_w(), self._win_h()))
 
     def _on_hover_anim(self, value) -> None:
         """老接口，保留为空实现（悬停改成窗口尺寸动画后不再用绘制缩放）。"""
@@ -1839,20 +1886,23 @@ class BoxWidget(GlassWindow):
         # 下边框在抽」——只有往左长、往上长的盒子有这个毛病（用户 2026-11-16 实测：
         # 往右长、往下长的都不抽）。窗口不动就没有这个中间态。
         union = QRect(self._anim_rect_from).united(self._anim_rect_to)
-        self._anim_win = QRect(union)
+        # 展开时如果终点矩形**完全包住**起点（面板比收起形态大），窗口一开始就定到
+        # 终点：整个动画只改一次几何，收尾不用再挪回面板矩形。用户 2026-11-17 实测：
+        # 给收尾也加了安静版之后「还闪，但不是每次都闪」——剩下的就是收尾那一次
+        # 挪原点，干脆取消它。包不住的时候（面板比收起形态矮/窄）才退回 union。
+        win = self._anim_rect_to if self._anim_rect_to.contains(
+            self._anim_rect_from) else union
+        self._anim_win = QRect(win)
         self._paint_rect = QRect(self._anim_rect_from)
-        # ⚠️ 先按「union 当窗口原点」把玻璃矩形算好，**再**改窗口尺寸：改尺寸那一下
+        # ⚠️ 先按「新窗口原点」把玻璃矩形算好，**再**改窗口尺寸：改尺寸那一下
         # Qt 可能立刻来一次 paintEvent，那时要还是「没算过」的状态，就会按整窗大小
         # 画一块大玻璃——用户看到的那一下白闪就是它（实测展开 A 第 10 帧整块区域
         # 平均亮度 116→143→116，正好一帧）。
-        self._sync_paint_box(union)
-        if union != self.geometry():
-            # 改尺寸那一瞬间把整窗透明度压到 0：合成器就算拿旧画面去拉，拉的也是
-            # 全透明的，看不到；同一次事件里马上恢复，不会真少一帧。
-            self.setWindowOpacity(0.0)
-            self.setGeometry(union)
-            self.repaint()
-            self.setWindowOpacity(1.0)
+        self._sync_paint_box(win)
+        if win != self.geometry():
+            # 改尺寸那一瞬间把整窗透明度压到 0（见 `_set_geometry_quiet`）：合成器
+            # 就算拿旧画面去拉，拉的也是全透明的，看不到。模糊整段动画先别开。
+            self._set_geometry_quiet(win, defer_blur=True)
         else:
             self.repaint()
         self._anim_p = 0.0
@@ -1956,11 +2006,14 @@ class BoxWidget(GlassWindow):
         if not self._expanded:
             self._bar_t = 1.0 if self._bar else 0.0
             self._apply_collapsed_geometry()
+            self._restore_acrylic()     # 动画期间关掉的模糊，落地就开回来
             self._set_expanded_blur(False)
             self.repaint()          # 同上：尺寸变了就当场画一遍，别让那一帧空着
             return
         if not target.isNull() and self.geometry() != target:
-            self.setGeometry(target)
+            # 收尾这一下也是「挪原点」：往左/往上长的盒子在这里把窗口从 union 挪回
+            # 面板矩形——用户看到的那一下闪，主要就是这一步（同一个几何变化走安静版）
+            self._set_geometry_quiet(target)
             self.repaint()
         # 展开完成：收起形态回到「缩略图标」（下次收起 / 拖动按它算）
         self._bar = False
@@ -1970,6 +2023,7 @@ class BoxWidget(GlassWindow):
         # 每个窗口各 grab 一次、再缩了放大，几十毫秒起步——放在动画里做，
         # 最后两帧就会明显顿一下（用户说的「不丝滑」）。
         self._set_expanded_blur(False)
+        self._restore_acrylic()     # 动画期间关掉的模糊，落地就开回来
         QTimer.singleShot(90, self._blur_after_anim)
 
     def _blur_after_anim(self) -> None:
