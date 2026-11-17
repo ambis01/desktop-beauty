@@ -54,7 +54,10 @@ MODE_NEXT = {MODE_SEQUENTIAL: MODE_LIST, MODE_LIST: MODE_ONE,
 
 POLL_S = 0.15            # 命令轮询间隔（点一下按钮要马上有反应）
 READ_EVERY = 5           # 每 5 个 tick 读一次会话状态（约 0.75s）
-EMPTY_RECONNECT = 4      # 连续几轮一个会话都看不到，就重新要一个会话管理器
+EMPTY_RECONNECT = 2      # 连续几轮一个会话都看不到，就重新要一个会话管理器
+# 原来是 4 轮（约 3 秒）：程序刚启动时拿到的管理器常常是「0 个会话」的旧快照，
+# 用户看到的就是「网页版/桌面版都识别不到」、「卡片空着」（2026-11-17 实测日志
+# 12:48:39 连上却没有会话、12:49:29 重连才看到 1 个）。改成 2 轮，空窗期减半。
 
 # 卡片钉住的三种状态（存进 CardData.bind）：
 #   ""  = 自动：谁在放跟谁
@@ -788,6 +791,12 @@ class MusicService(QObject):
                     key = "title"
                     self._snaps["title"] = fb
             ch.key = key
+            if getattr(ch, "_log_key", None) != key:
+                ch._log_key = key
+                snap_dbg = self._snaps.get(key) if key else None
+                dlog(f"music: 卡片 {ch.card_id} 跟 {key or '（空）'} "
+                     f"title={(snap_dbg or {}).get('title', '')!r} "
+                     f"kind={(snap_dbg or {}).get('kind')}")
             self._apply_to_channel(ch, self._snaps.get(key) if key else None)
         return len(items)
 
