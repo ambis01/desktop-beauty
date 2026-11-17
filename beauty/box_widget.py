@@ -923,32 +923,31 @@ class BoxWidget(GlassWindow):
             # 还没显示（启动阶段）：没有合成画面要躲，直接改
             self.setGeometry(rect)
             return
-        # 老做法留个开关，只为了 A/B 对照复现问题（默认关）
-        legacy = os.environ.get("BEAUTY_QUIET_OPACITY") == "1"
-        if legacy:
-            self.setWindowOpacity(0.0)
+        # ⚠️ 关键：**永远不要在同一帧里既挪窗口原点又改窗口尺寸**。
+        # 往左/往上展开（面板比收起形态大、原点还要动）时，合成器拿去对齐旧表面
+        # 就对不上，只能把旧画面拉一下——逐帧抓图看到的是「一整块被放大的模糊
+        # 残影」，持续约 5 帧（2026-11-17 抓的 C 展开）。而「纯移动」和「纯改尺寸」
+        # 这两种单一操作，合成器处理起来都是干净的（往右/往下展开的盒子一直不闪，
+        # 就是因为它们原点不动、只改尺寸）。
+        # 所以这里拆成两步：① 先在**旧原点**把尺寸改到位；② 再**纯移动**到新原点。
+        # 第二步挪窗口时，`_sync_paint_box()` 会按新原点和 `_paint_rect` 重算绘制
+        # 偏移，玻璃的屏幕位置一个像素都不动，肉眼不会看到跳。
+        before = self.geometry()
         try:
             self.set_acrylic(False)
         except (RuntimeError, TypeError, AttributeError):
             pass
-        # ⚠️ `SWP_NOCOPYBITS`：改尺寸时**不许**把旧表面的像素拷进新矩形。
-        # 不带它的时候，往左/往上展开（窗口原点同时动）会看到一块被放大的模糊
-        # 残影——旧的小窗口画面被贴到大窗口上，持续约 5 帧（2026-11-17 逐帧抓到
-        # C 展开时就是这样）。旧像素不拷，新矩形从空开始，紧接着的重画就把正确
-        # 内容填进去，中间没有「旧画面被拉一下」的那个状态。
-        # 写盘顺序：先改几何，再同步重画（`repaint()` 会在同一次事件里画完）。
-        nocopy = os.environ.get("BEAUTY_NO_COPYBITS", "1") == "1"
-        if nocopy:
-            try:
-                user32.SetWindowPos(
-                    int(self.winId()), 0, int(rect.x()), int(rect.y()),
-                    int(rect.width()), int(rect.height()),
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS)
-            except (OSError, ValueError, TypeError):
-                self.setGeometry(rect)
+        if before.topLeft() != rect.topLeft() and before.size() != rect.size():
+            step = QRect(before.topLeft(), rect.size())
+            self.setGeometry(step)
+            self._sync_paint_box()
+            self.repaint()
+            self.setGeometry(rect)
+            self._sync_paint_box()
+            self.repaint()
         else:
             self.setGeometry(rect)
-        self.repaint()
+            self.repaint()
         if legacy:
             self.setWindowOpacity(1.0)
         if defer_blur:
