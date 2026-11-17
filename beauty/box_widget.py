@@ -575,6 +575,21 @@ class BoxWidget(GlassWindow):
         self._paint_rect = QRect()
         self._paint_box = None
         self._z_pending = False
+        # 固定窗口模式（实验）：窗口尺寸从创建起就按「盒子 + 四面展开面」定死，
+        # 展开/收起只改窗口区域（`SetWindowRgn`）和绘制，**从不改尺寸**——改尺寸
+        # 那一帧合成器会把旧表面贴到新矩形上，就是用户看到的那一下闪。
+        # 开关：BEAUTY_FIXED_WIN=<盒子 id 或名字，逗号分隔>，或 =1 表示全部。
+        self._fixed_win = False
+        try:
+            spec = (os.environ.get("BEAUTY_FIXED_WIN") or "").strip()
+            if spec:
+                want = {s.strip().lower() for s in spec.split(",") if s.strip()}
+                keys = {str(getattr(box, "id", "")).lower(),
+                        str(getattr(box, "name", "")).lower()}
+                self._fixed_win = bool(want & keys) or bool(
+                    want & {"1", "all", "*"})
+        except (TypeError, AttributeError):
+            self._fixed_win = False
         # 一次动画推「_t」（展开↔收起）或者「_bar_t」（缩略↔只剩横杠）
         self._anim_field = "t"
         self._anim_from = 0.0
@@ -790,10 +805,11 @@ class BoxWidget(GlassWindow):
         z = self._paint_z()
         if z <= 1e-6:
             z = 1.0
-        c = self.rect().center()
+        c = self._paint_center()
         m = self._win_margin()
-        gx = (pos.x() - c.x() * (1.0 - z)) / z - m
-        gy = (pos.y() - c.y() * (1.0 - z)) / z - m
+        off = self._paint_offset()
+        gx = (pos.x() - c.x() * (1.0 - z)) / z - m - off.x()
+        gy = (pos.y() - c.y() * (1.0 - z)) / z - m - off.y()
         return 0.0 <= gx < self._cw() and 0.0 <= gy < self._ch()
 
     def _win_w(self) -> int:
@@ -801,6 +817,71 @@ class BoxWidget(GlassWindow):
 
     def _win_h(self) -> int:
         return self._collapsed_h() + self._win_margin() * 2
+
+    def _panel_px(self) -> tuple[int, int]:
+        """展开面（玻璃）的尺寸：4 列固定宽，行数跟着图标数。"""
+        n = max(1, len(self._items))
+        rows = max(1, math.ceil(n / COLS))
+        return PAD * 2 + COLS * CELL_W, HEADER + rows * CELL_H + PAD
+
+    def _win_pad(self) -> tuple[int, int]:
+        """窗口左上角比「盒子玻璃左上角 - 余量」还多出来多少（往左上）。
+
+        窗口尺寸固定成「盒子 + 四面任意一边都能展开」的那块（`_outer_w/_outer_h`），
+        所以展开/收起时窗口一个像素都不用动——改尺寸那一帧合成器会把旧画面拉过去，
+        就是用户看到的抽搐/闪烁；而**挪**窗口（拖动、挤开时滑动）从来不闪。
+        """
+        pw, ph = self._panel_px()
+        # 用「图标方块」的高度算，不用 `_collapsed_h()`：横杠只有 28 高，拿它算会
+        # 让窗口尺寸在 -1/0 之间来回变一次（又变成「改尺寸」，就白改了）。
+        return int(pw - self._side_w), int(ph - (self._side_h + TITLE_H))
+
+    def _outer_w(self) -> int:
+        pw, _ph = self._panel_px()
+        return int(pw * 2 - self._side_w + self._win_margin() * 2)
+
+    def _outer_h(self) -> int:
+        _pw, ph = self._panel_px()
+        return int(ph * 2 - (self._side_h + TITLE_H) + self._win_margin() * 2)
+
+    def _collapsed_win_rect(self) -> QRect:
+        m = self._win_margin()
+        return QRect(self.box.x - m, self._glass_top() - m,
+                     self._side_w + 2 * m, self._collapsed_h() + 2 * m)
+
+    def _paint_center(self) -> QPoint:
+        b = getattr(self, "_paint_box", None)
+        if b is not None and not b.isNull():
+            return b.center()
+        return self.rect().center()
+
+    def _set_region(self) -> None:
+        """把窗口形状裁到当前那块玻璃上（圆角），外面透明的地方让点击穿到桌面。
+
+        窗口比玻璃大一圈（给展开面留位置），不裁的话桌面上那个范围的图标就点不到了。
+        """
+        b = getattr(self, "_paint_box", None)
+        if b is None or b.isNull():
+            return
+        try:
+            hwnd = int(self.winId())
+        except (RuntimeError, TypeError, ValueError):
+            return
+        try:
+            gdi = ctypes.WinDLL("gdi32")
+            # ⚠️ 区域是窗口坐标（物理像素），Qt 这边是逻辑像素：125% 缩放下要乘 dpr，
+            # 不然盒子会被裁掉右边一截（用户 2026-11-16 的 125% 屏实测就是这样）。
+            dpr = float(self.devicePixelRatioF() or 1.0)
+            x = int(round(b.x() * dpr))
+            y = int(round(b.y() * dpr))
+            w = int(round((b.x() + b.width()) * dpr))
+            h = int(round((b.y() + b.height()) * dpr))
+            rad = int(round(float(self.radius) * dpr)) * 2
+            rgn = gdi.CreateRoundRectRgn(x, y, w + 1, h + 1, rad, rad)
+            if rgn:
+                user32.SetWindowRgn(ctypes.c_void_p(hwnd), rgn, True)
+        except (AttributeError, OSError, TypeError):
+            pass
 
     def _hover_scale(self) -> float:
         """>1 的时候整块玻璃（含阴影、图标）一起放大。
@@ -865,10 +946,30 @@ class BoxWidget(GlassWindow):
             pass
 
     def _apply_collapsed_geometry(self) -> None:
-        """窗口位置固定（含余量），尺寸固定——悬停时只改 paint_scale。"""
+        """摆窗口：固定窗口模式尺寸永远不变、只挪位置；老模式按收起尺寸改。"""
         m = self._win_margin()
-        self._set_geometry_quiet(QRect(self.box.x - m, self._glass_top() - m,
-                                       self._win_w(), self._win_h()))
+        if not self._fixed_win:
+            self._set_geometry_quiet(QRect(self.box.x - m, self._glass_top() - m,
+                                           self._win_w(), self._win_h()))
+            return
+        px, py = self._win_pad()
+        self.setGeometry(self.box.x - m - px, self._glass_top() - m - py,
+                         self._outer_w(), self._outer_h())
+        self._paint_rect = QRect(self._collapsed_win_rect())
+        self._sync_paint_box()
+
+    def _apply_expanded_geometry(self) -> None:
+        """展开态摆窗口：固定窗口模式尺寸不变，只换「现在这块玻璃」。"""
+        m = self._win_margin()
+        self._rect_expanded = self._expanded_rect()
+        if not self._fixed_win:
+            self._set_geometry_quiet(self._rect_expanded)
+            return
+        px, py = self._win_pad()
+        self.setGeometry(self.box.x - m - px, self._glass_top() - m - py,
+                         self._outer_w(), self._outer_h())
+        self._paint_rect = QRect(self._rect_expanded)
+        self._sync_paint_box()
 
     def _on_hover_anim(self, value) -> None:
         """老接口，保留为空实现（悬停改成窗口尺寸动画后不再用绘制缩放）。"""
@@ -965,7 +1066,7 @@ class BoxWidget(GlassWindow):
                                   else self._rect_collapsed)
             self._anim_geometry()
         elif self._expanded:
-            self.setGeometry(self._rect_expanded)
+            self._apply_expanded_geometry()
         elif resized:
             self._clamp_to_screen()
         self.update()
@@ -1331,7 +1432,7 @@ class BoxWidget(GlassWindow):
                                      self._win_w(), self._win_h())
         self._rect_expanded = self._expanded_rect()
         if self._expanded:
-            self.setGeometry(self._rect_expanded)
+            self._apply_expanded_geometry()
             # 展开着改大小：等收起来那一刻再清场（和自动扩容同一条路）
             self._grow_pending = grew
         else:
@@ -1448,8 +1549,7 @@ class BoxWidget(GlassWindow):
         self.box.x, self.box.y = landed.x(), landed.y()
         if self._expanded:
             # 展开态松手：按展开矩形搬，别按收起尺寸重排（那样会当场缩成小块）
-            self._rect_expanded = self._expanded_rect()
-            self.setGeometry(self._rect_expanded)
+            self._apply_expanded_geometry()
         else:
             self._apply_collapsed_geometry()
         _log("avoid overlap -> %s,%s", self.box.x, self.box.y)
@@ -1675,7 +1775,7 @@ class BoxWidget(GlassWindow):
         self._anim_from = self._t
         self._anim_to = 1.0 if target else 0.0
         self._anim_dur = 0.30 if target else 0.26
-        self._anim_rect_from = self.geometry()
+        self._anim_rect_from = self._cur_paint_rect()
         if target:
             # 先让 Controller 选好往哪边长（右/左、下/上）再算落点
             self._anim_queued = True
@@ -1785,7 +1885,7 @@ class BoxWidget(GlassWindow):
         self._anim_from = self._bar_t
         self._anim_to = target
         self._anim_dur = 0.24
-        self._anim_rect_from = self.geometry()
+        self._anim_rect_from = self._cur_paint_rect()
         self._anim_rect_to = QRect(self.box.x - self._win_margin(),
                                    self._glass_top() - self._win_margin(),
                                    self._win_w(), self._win_h())
@@ -1806,10 +1906,11 @@ class BoxWidget(GlassWindow):
     def _slide_axis(self, axis: str, target: int, dur: float = 0.22) -> None:
         """起一段滑动动画：横竖各占一个槽，互不打断（可能一边被推开一边被吸）。"""
         pad = self._win_margin()
+        px, py = self._win_pad()
         if axis == "y":
-            start, end = float(self.y()), float(target - pad)
+            start, end = float(self.y()), float(target - pad - py)
         else:
-            start, end = float(self.x()), float(target - pad)
+            start, end = float(self.x()), float(target - pad - px)
         if abs(start - end) < 0.5:
             return
         slots = self._slide if isinstance(self._slide, dict) else {}
@@ -1885,26 +1986,34 @@ class BoxWidget(GlassWindow):
         # Windows 会先把旧画面按新尺寸拉一下、等下一次重画才补上，肉眼就是「右边框 /
         # 下边框在抽」——只有往左长、往上长的盒子有这个毛病（用户 2026-11-16 实测：
         # 往右长、往下长的都不抽）。窗口不动就没有这个中间态。
-        union = QRect(self._anim_rect_from).united(self._anim_rect_to)
-        # 展开时如果终点矩形**完全包住**起点（面板比收起形态大），窗口一开始就定到
-        # 终点：整个动画只改一次几何，收尾不用再挪回面板矩形。用户 2026-11-17 实测：
-        # 给收尾也加了安静版之后「还闪，但不是每次都闪」——剩下的就是收尾那一次
-        # 挪原点，干脆取消它。包不住的时候（面板比收起形态矮/窄）才退回 union。
-        win = self._anim_rect_to if self._anim_rect_to.contains(
-            self._anim_rect_from) else union
-        self._anim_win = QRect(win)
-        self._paint_rect = QRect(self._anim_rect_from)
-        # ⚠️ 先按「新窗口原点」把玻璃矩形算好，**再**改窗口尺寸：改尺寸那一下
-        # Qt 可能立刻来一次 paintEvent，那时要还是「没算过」的状态，就会按整窗大小
-        # 画一块大玻璃——用户看到的那一下白闪就是它（实测展开 A 第 10 帧整块区域
-        # 平均亮度 116→143→116，正好一帧）。
-        self._sync_paint_box(win)
-        if win != self.geometry():
-            # 改尺寸那一瞬间把整窗透明度压到 0（见 `_set_geometry_quiet`）：合成器
-            # 就算拿旧画面去拉，拉的也是全透明的，看不到。模糊整段动画先别开。
-            self._set_geometry_quiet(win, defer_blur=True)
-        else:
+        if self._fixed_win:
+            # 固定窗口模式：窗口尺寸从创建起就是「盒子 + 四面展开面」，这里一个字
+            # 都不改窗口（改尺寸那一帧合成器会把旧表面贴到新矩形上，就是那一下闪）
+            self._anim_win = QRect()
+            self._paint_rect = QRect(self._anim_rect_from)
+            self._sync_paint_box()
             self.repaint()
+        else:
+            union = QRect(self._anim_rect_from).united(self._anim_rect_to)
+            # 展开时如果终点矩形**完全包住**起点（面板比收起形态大），窗口一开始就定到
+            # 终点：整个动画只改一次几何，收尾不用再挪回面板矩形。用户 2026-11-17 实测：
+            # 给收尾也加了安静版之后「还闪，但不是每次都闪」——剩下的就是收尾那一次
+            # 挪原点，干脆取消它。包不住的时候（面板比收起形态矮/窄）才退回 union。
+            win = self._anim_rect_to if self._anim_rect_to.contains(
+                self._anim_rect_from) else union
+            self._anim_win = QRect(win)
+            self._paint_rect = QRect(self._anim_rect_from)
+            # ⚠️ 先按「新窗口原点」把玻璃矩形算好，**再**改窗口尺寸：改尺寸那一下
+            # Qt 可能立刻来一次 paintEvent，那时要还是「没算过」的状态，就会按整窗大小
+            # 画一块大玻璃——用户看到的那一下白闪就是它（实测展开 A 第 10 帧整块区域
+            # 平均亮度 116→143→116，正好一帧）。
+            self._sync_paint_box(win)
+            if win != self.geometry():
+                # 改尺寸那一瞬间把整窗透明度压到 0（见 `_set_geometry_quiet`）：合成器
+                # 就算拿旧画面去拉，拉的也是全透明的，看不到。模糊整段动画先别开。
+                self._set_geometry_quiet(win, defer_blur=True)
+            else:
+                self.repaint()
         self._anim_p = 0.0
         self._anim_frames = 0
         self._anim_t0 = time.perf_counter()
@@ -1958,6 +2067,10 @@ class BoxWidget(GlassWindow):
         base = win if win is not None and not win.isNull() else self.geometry()
         self._paint_box = QRect(r.x() - base.x() + m, r.y() - base.y() + m,
                                 r.width() - 2 * m, r.height() - 2 * m)
+        if self._fixed_win:
+            # 只有固定窗口模式需要裁形状（窗口比玻璃大，不裁会挡住桌面图标）。
+            # 老模式窗口本来就贴着玻璃，裁了会把阴影切掉，所以不能裁。
+            self._set_region()
 
     def _paint_offset(self) -> QPoint:
         """绘制原点相对窗口原点的偏移（动画期间窗口固定，玻璃在里面长/收）。"""
@@ -1965,6 +2078,17 @@ class BoxWidget(GlassWindow):
         if r.isNull():
             return QPoint(0, 0)
         return QPoint(r.x() - self.x(), r.y() - self.y())
+
+    def _cur_paint_rect(self) -> QRect:
+        """「现在这块玻璃」的窗口矩形——固定窗口模式下动画要从它出发，而不是整个窗口。
+
+        老模式里窗口就是玻璃（加余量），`self.geometry()` 可以直接当动画起点；固定窗口
+        模式下窗口比玻璃大一圈，拿它当起点的话，动画会从一大块（多半是透明的）外框
+        开始长——看着就是玻璃「先闪一下整窗再缩回盒子」。
+        """
+        if self._fixed_win and not self._paint_rect.isNull():
+            return QRect(self._paint_rect)
+        return self.geometry()
 
     def _anim_frame_stat(self) -> None:
         now = time.perf_counter()
@@ -2010,7 +2134,12 @@ class BoxWidget(GlassWindow):
             self._set_expanded_blur(False)
             self.repaint()          # 同上：尺寸变了就当场画一遍，别让那一帧空着
             return
-        if not target.isNull() and self.geometry() != target:
+        if self._fixed_win:
+            # 固定窗口：收尾不用改窗口，只把「现在这块玻璃」定成展开面
+            if not target.isNull():
+                self._paint_rect = QRect(target)
+                self._sync_paint_box()
+        elif not target.isNull() and self.geometry() != target:
             # 收尾这一下也是「挪原点」：往左/往上长的盒子在这里把窗口从 union 挪回
             # 面板矩形——用户看到的那一下闪，主要就是这一步（同一个几何变化走安静版）
             self._set_geometry_quiet(target)
@@ -2130,6 +2259,7 @@ class BoxWidget(GlassWindow):
         # 「当前缩放」平滑过渡到 1.0
         z = (1.0 - self._t) * self._hover_scale() + self._t * 1.0
         self.paint_scale = z
+        self._paint_c = self._paint_center()
         super().paintEvent(event)
         p = QPainter(self)
         drag = self._window_dragging
@@ -2138,7 +2268,7 @@ class BoxWidget(GlassWindow):
         # 和玻璃层用同一套变换：先围绕窗口中心缩放，再平移到玻璃左上角。
         # 放大后有窗口那一圈余量接着，不需要任何裁剪，圆角也不会被切方。
         if abs(z - 1.0) > 1e-6:
-            c = self.rect().center()
+            c = self._paint_center()
             p.translate(c.x(), c.y())
             p.scale(z, z)
             p.translate(-c.x(), -c.y())
@@ -3263,7 +3393,11 @@ class BoxWidget(GlassWindow):
                 self._group_origin = None
                 self._group_starts = []
                 return
-            self.box.x, self.box.y = self.x() + pad, self.y() + pad
+            b = getattr(self, "_paint_box", None)
+            if b is not None and not b.isNull():
+                self.box.x, self.box.y = self.x() + b.x(), self.y() + b.y()
+            else:
+                self.box.x, self.box.y = self.x() + pad, self.y() + pad
             _log("before clamp pos=%s box=%s", self.pos(), (self.box.x, self.box.y))
             self._clamp_to_screen()
             _log("after clamp pos=%s box=%s", self.pos(), (self.box.x, self.box.y))
@@ -3347,9 +3481,11 @@ class BoxWidget(GlassWindow):
         `box.x/y` 要等松手才更新。按旧坐标算的话，整组收尾会把这个盒子拽回起点。
         """
         m = self._win_margin()
-        if self._expanded:
-            return QRect(self.x() + m, self.y() + m,
-                         max(1, self.width() - 2 * m), max(1, self.height() - 2 * m))
+        b = getattr(self, "_paint_box", None)
+        if b is not None and not b.isNull():
+            # 窗口比玻璃大一圈（给展开面留位置），玻璃左上角在窗口里有个偏移
+            return QRect(self.x() + b.x(), self.y() + b.y(),
+                         b.width(), b.height())
         return QRect(self.x() + m, self.y() + m, self._side_w, self._collapsed_h())
 
     def _group_shift(self, dx: int, dy: int) -> None:
@@ -3357,8 +3493,7 @@ class BoxWidget(GlassWindow):
         r = self._group_rect().translated(dx, dy)
         self.box.x, self.box.y = r.x(), r.y()
         if self._expanded:
-            self._rect_expanded = self._expanded_rect()
-            self.setGeometry(self._rect_expanded)
+            self._apply_expanded_geometry()
         else:
             self._apply_collapsed_geometry()
         self.store.place(self.box, self.box.x, self.box.y,
@@ -3737,8 +3872,10 @@ class BoxWidget(GlassWindow):
         self._edit.setFont(self._title_font())
         self._edit.setText(self.box.name)
         m = self._win_margin()
+        off = self._paint_offset()
         self._edit.setGeometry(
-            self._name_rect().toRect().adjusted(0, 1, -3, -1).translated(m, m))
+            self._name_rect().toRect().adjusted(0, 1, -3, -1).translated(
+                m + off.x(), m + off.y()))
         self._edit.show()
         self._edit.raise_()
         self._edit.setFocus(Qt.OtherFocusReason)

@@ -694,7 +694,7 @@ class GlassWindow(QWidget):
         # 玻璃轮廓是连续变大的。
         z = float(getattr(self, "paint_scale", 1.0) or 1.0)
         if abs(z - 1.0) > 1e-6:
-            c = self.rect().center()
+            c = getattr(self, "_paint_c", None) or self.rect().center()
             p.translate(c.x(), c.y())
             p.scale(z, z)
             p.translate(-c.x(), -c.y())
