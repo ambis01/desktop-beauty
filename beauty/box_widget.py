@@ -204,7 +204,9 @@ user32.SetWindowPos.argtypes = [
 ]
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
+SWP_NOCOPYBITS = 0x0100
 SWP_NOOWNERZORDER = 0x0200
 
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -929,7 +931,23 @@ class BoxWidget(GlassWindow):
             self.set_acrylic(False)
         except (RuntimeError, TypeError, AttributeError):
             pass
-        self.setGeometry(rect)
+        # ⚠️ `SWP_NOCOPYBITS`：改尺寸时**不许**把旧表面的像素拷进新矩形。
+        # 不带它的时候，往左/往上展开（窗口原点同时动）会看到一块被放大的模糊
+        # 残影——旧的小窗口画面被贴到大窗口上，持续约 5 帧（2026-11-17 逐帧抓到
+        # C 展开时就是这样）。旧像素不拷，新矩形从空开始，紧接着的重画就把正确
+        # 内容填进去，中间没有「旧画面被拉一下」的那个状态。
+        # 写盘顺序：先改几何，再同步重画（`repaint()` 会在同一次事件里画完）。
+        nocopy = os.environ.get("BEAUTY_NO_COPYBITS", "1") == "1"
+        if nocopy:
+            try:
+                user32.SetWindowPos(
+                    int(self.winId()), 0, int(rect.x()), int(rect.y()),
+                    int(rect.width()), int(rect.height()),
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS)
+            except (OSError, ValueError, TypeError):
+                self.setGeometry(rect)
+        else:
+            self.setGeometry(rect)
         self.repaint()
         if legacy:
             self.setWindowOpacity(1.0)
@@ -2160,17 +2178,14 @@ class BoxWidget(GlassWindow):
         # 动画结束：窗口收/放回这一帧该在的矩形（动画期间它是「起点∪终点」）
         target = QRect(self._anim_rect_to)
         self._anim_win = QRect()
-        # ⚠️ 顺序：先把「最终矩形里的画笔位置」算好，再去改窗口几何。
-        # 以前是先 `_paint_rect = QRect()` / `_paint_box = None` 再改几何：清空之后
-        # `_cw()` 会退回到「整个窗口」，而这时窗口还是动画用的「起点∪终点」，
-        # 于是中间任何一帧重画都会把玻璃和图标按整窗画出来——收起时肉眼就是
-        # 「面板又撑开一下、图标冲出去」（用户 2026-11-17 报的那一下）。
-        if target.isNull():
-            self._paint_rect = QRect()
-            self._paint_box = None
-        else:
-            self._paint_rect = QRect(target)
-            self._sync_paint_box(target)
+        # ⚠️ 这里必须**先清空**再去改几何，别反过来「先把画笔位置按最终矩形算好」：
+        # 收起时 `target`（开始那一刻算的）不一定等于此刻真正的收起矩形——这中间
+        # `_settle_layout` 可能把盒子挪过位置。按 target 算出来的 `_paint_box` 就会
+        # 偏，`_set_geometry_quiet()` 里那次重画正好用它，图标当场跑到玻璃外面
+        # （2026-11-17 试过这么改，普通收起也开始闪，已回退）。
+        # 清空之后 `_cw()` 退回「整个窗口」，而窗口就是这一刻的玻璃，永远对得上。
+        self._paint_rect = QRect()
+        self._paint_box = None
         if getattr(self, "_z_pending", False):
             self._z_pending = False
             self._notify_z()
@@ -2180,9 +2195,6 @@ class BoxWidget(GlassWindow):
             self._restore_acrylic()     # 动画期间关掉的模糊，落地就开回来
             self._set_expanded_blur(False)
             self.repaint()          # 同上：尺寸变了就当场画一遍，别让那一帧空着
-            # 落地了：窗口重新等于玻璃，交回默认算法
-            self._paint_rect = QRect()
-            self._paint_box = None
             return
         if self._fixed_win:
             # 固定窗口：收尾不用改窗口，只把「现在这块玻璃」定成展开面
