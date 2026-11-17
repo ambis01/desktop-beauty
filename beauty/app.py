@@ -515,7 +515,8 @@ class Controller(QObject):
     # 设 BEAUTY_NO_SLIDE_FADE=1 可以先只动位置、不淡，用来判断卡是淡造成的还是动造成的。
     SLIDE_FADE = os.environ.get("BEAUTY_NO_SLIDE_FADE") != "1"
     SLIDE_CASCADE_MS = 26          # 启用/停用的错开：一块接一块，别让十几块同时动
-    SLIDE_TRAVEL = 110             # 有淡入淡出时只滑这么远（见 _slide_track）
+    SLIDE_TRAVEL_MIN = 36          # 贴着屏幕边的盒子只滑这么点
+    SLIDE_TRAVEL_MAX = 150         # 屏幕中间的盒子最多滑这么点（再多也没意义）
 
     def _slide_track(self, w):
         """(home, off, dist)：出去和回来共用这一份几何。
@@ -536,7 +537,17 @@ class Controller(QObject):
             # 每帧要挪好几像素、半透明窗口的合成压力明显更大——用户 2026-11-17
             # 实测「盒子放在屏幕两侧就不卡，很多盒子在中间时才卡」。
             sign = -1 if home.x() + w.width() / 2.0 < r.center().x() else 1
-            off = QPoint(home.x() + sign * self.SLIDE_TRAVEL, home.y())
+            # 距离按「离要出去的那条边有多远」线性给：贴边 36px，屏幕中间 150px
+            # （用户 2026-11-17 的要求：贴边的少滑、中间的多滑一点、但别太多）。
+            if sign < 0:
+                dist_edge = max(0, home.x() - r.left())
+            else:
+                dist_edge = max(0, r.right() - (home.x() + w.width()))
+            half = max(1.0, r.width() / 2.0)
+            ratio = min(1.0, dist_edge / half)
+            travel = int(round(self.SLIDE_TRAVEL_MIN
+                               + (self.SLIDE_TRAVEL_MAX - self.SLIDE_TRAVEL_MIN) * ratio))
+            off = QPoint(home.x() + sign * travel, home.y())
             return QPoint(home), off, abs(off.x() - home.x())
         if home.x() + w.width() / 2.0 < r.center().x():
             # 整个窗口（含四周透明余量）都到屏幕左边外面
