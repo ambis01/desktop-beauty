@@ -167,6 +167,13 @@ class Controller(QObject):
         self.watcher.band_moved.connect(self._band_select)
         self.watcher.band_finished.connect(self._band_select)
 
+        # 层级校正的状态：必须**在第一批盒子 show 之前**就有，否则 showEvent →
+        # apply_z_order → _keep_above_desktop 会撞上 AttributeError（实测崩在启动）。
+        self._desk_tick_n = 0
+        self._zband_fg = 0
+        self._zband_last = 0.0
+        self._zband_streak = 0
+        self._zband_cool = 0.0
         for box in list(self.store.boxes):
             self._spawn(box)
         # 旧版本把「挤开的位置」也写进了配置，可能有几块的家是叠在一起的：
@@ -198,10 +205,11 @@ class Controller(QObject):
         self._fs_timer.setInterval(700)
         self._fs_timer.timeout.connect(self._watch_fullscreen)
         self._fs_timer.start()
-        # 点「显示桌面」会把桌面抬到所有窗口上面，贴着桌面的盒子/卡片就被盖住了
+        # 插件「贴桌面」那一层：被「显示桌面」抬起来的桌面盖住要抬回来，
+        # 从别的窗口「显示回来」之后浮在窗口上面要压回去（见 `zband`）
         self._desk_timer = QTimer(self)
-        self._desk_timer.setInterval(700)
-        self._desk_timer.timeout.connect(self._keep_above_desktop)
+        self._desk_timer.setInterval(150)
+        self._desk_timer.timeout.connect(self._desk_tick)
         self._desk_timer.start()
         # 天气：启动先抓一次，之后每 5 分钟看一眼（20 分钟内的缓存直接复用）
         self._weather_timer = QTimer(self)
@@ -1147,56 +1155,72 @@ class Controller(QObject):
     def _siblings(self):
         return list(self.windows.values()) + list(self.card_widgets.values())
 
-    def _keep_above_desktop(self) -> None:
-        """「显示桌面」之后把盒子/卡片重新摆回桌面上面。
+    def _desk_tick(self) -> None:
+        """前台一变就校正一次层级；平时每 5 拍（约 0.75 秒）兜底查一次。
 
-        那个按钮不是把窗口最小化，而是把 Progman（桌面）抬到最上层——我们的
-        窗口本来就贴着桌面放，于是一起被盖住。发现自己在 Progman 后面就把整串
-        窗口重新插回桌面正上方。
+        为什么盯前台：跑偏的两个来源正好都会让前台变——
+          * 点一下收纳盒：Windows 把它**激活并抬到最前**（然后浮在窗口上）；
+          * 点一下桌面：Windows 把 Progman 抬到普通窗口带最上面（盒子全被盖住）。
+        以前只有 0.7 秒一次的「被盖住就往上抬」，所以真的要等大半秒才回来，
+        看着就是「整个桌面的盒子卡片闪一下」。
         """
+        self._desk_tick_n += 1
+        from . import zband
         try:
-            progman = box_user32.FindWindowW("Progman", None)
+            fg = zband.foreground_hwnd()
         except OSError:
+            fg = 0
+        changed = fg != self._zband_fg
+        self._zband_fg = fg
+        if not changed and self._desk_tick_n % 5:
             return
-        if not progman:
+        self._keep_above_desktop()
+
+    def _keep_above_desktop(self) -> None:
+        """把盒子 / 卡片摆回「桌面正上方、所有普通窗口下面」这一层。
+
+        以前只做了一半：发现被桌面盖住就抬回桌面上面，从此它们就停在整条
+        普通窗口带的最顶上，再也回不去——在别的窗口里点一次「显示桌面」再点
+        回来，盒子/卡片就浮在窗口上，要再点一下窗口内容才被盖住（用户
+        2026-11-17 报的）。现在两个方向都管，判断和动手都在 `zband` 里。
+
+        ⚠️ 只有真的不对才动窗口：每块 `SetWindowPos` 都会让 DWM 重新合成
+        一遍，半透明窗口肉眼就是闪一下。另外加了节流和「抢不过就歇一会儿」，
+        免得和外壳（或别的置顶程序）来回抢层级抢成一直闪。
+        """
+        from .box_widget import is_dragging
+        from . import zband
+        now = time.monotonic()
+        if now < self._zband_cool or is_dragging():
             return
-        wins = self._z_windows()
-        hwnds = []
-        for w in wins:
-            try:
-                hwnds.append(int(w.winId()))
-            except (RuntimeError, TypeError):
-                continue
-        if not hwnds:
+        if any(getattr(w, "_window_dragging", False)
+               for w in self.card_widgets.values()):
             return
-        chain = []
-        h = box_user32.GetTopWindow(None)
-        while h and len(chain) < 600:
-            chain.append(h)
-            if h == progman:
-                break
-            h = box_user32.GetWindow(h, 2)
-        idx = {h: i for i, h in enumerate(chain)}
-        prog_i = idx.get(progman)
-        if prog_i is None:
+        wins = self._z_windows()          # 从下到上：卡片 → 收起的盒子 → 展开的盒子
+        if not wins:
             return
-        if not any(idx.get(h, 1 << 30) > prog_i for h in hwnds):
-            return
-        # 想插到 Progman 上面：不能拿 Progman 当锚点（那是插到它下面），
-        # 要插到「Progman 上方那个窗口」的下面
         try:
-            anchor = int(box_user32.GetWindow(progman, 3)) or 0     # GW_HWNDPREV
-        except OSError:
-            anchor = 0
-        for w in wins:
-            try:
-                hwnd = int(w.winId())
-                box_user32.SetWindowPos(
-                    hwnd, anchor, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
-            except (RuntimeError, TypeError, OSError):
-                continue
-        _log("desktop level restored")
+            hwnds = [int(w.winId()) for w in wins]
+        except (RuntimeError, TypeError):
+            return
+        plan = zband.analyze(hwnds)
+        if plan["action"] == "ok":
+            self._zband_streak = 0
+            return
+        if now - self._zband_last < 0.4:
+            return
+        self._zband_last = now
+        self._zband_streak += 1
+        if self._zband_streak > 4:
+            # 刚摆好又被抬走（外壳反复抬桌面 / 别的程序抢层级）：先歇 15 秒，
+            # 不然每一轮都是一次整串重插——肉眼就是盒子一直闪。
+            self._zband_cool = now + 15.0
+            self._zband_streak = 0
+            _log(f"z-band: give up 15s ({plan['why']})")
+            return
+        moved = zband.apply_plan(plan)
+        _log(f"z-band: {plan['action']} ({plan['why']}) moved {moved}"
+             f"/{len(plan['move'])}")
 
     def _slide_widget_to(self, win, target: int, dur: int = 220,
                          axis: str = "y") -> None:
@@ -2015,6 +2039,17 @@ class Controller(QObject):
         panels: list[QRect] = []         # 展开面（**真实**玻璃矩形，判「压住了没有」）
         pinned_panels: list[QRect] = []  # 勾了常驻的展开面：下面的盒子必须让开
         movable: list = []
+        # 卡片也是障碍：长大的盒子「就近安置」时不许落在卡片上。
+        # 用户 2026-11-17 报的「展开编程，左边的自学被推到上面和音乐卡片重叠」——
+        # 以前这里的障碍物只有展开面和别的盒子，卡片完全不参与，于是
+        # `_nearest_slot` 把自学摆到 y=67，正好压在 y=146 的卡片上。
+        # 卡片这边不会自己让开（它是用户手动摆的位置），所以只能盒子绕开它。
+        for _card in list(self.card_widgets.values()):
+            try:
+                if _card.isVisible():
+                    placed.append(aligner.glass_rect(_card))
+            except (RuntimeError, TypeError, AttributeError):
+                continue
 
         def true_panel(w) -> QRect | None:
             try:
@@ -2688,6 +2723,10 @@ class Controller(QObject):
         prog = pos.get(progman, len(chain))
         actual = sorted((h for h in want if h in pos), key=lambda x: pos[x])
         if actual == want and all(pos.get(h, 1 << 30) < prog for h in want):
+            # 我们自己之间的次序没变，但**是不是浮到了别的窗口上面**还得看一眼：
+            # 点一下盒子 Windows 就把它激活、抬到最前，不查的话它就浮在窗口上
+            # （用户 2026-11-17 报的第二条）。只查不动是没开销的。
+            self._keep_above_desktop()
             return   # 已经是对的，一个窗口都别动
         _log(f"z-order applied: {len(want)} windows")
         t_walk = time.perf_counter()
@@ -2735,6 +2774,7 @@ class Controller(QObject):
             _log("z-order moved %d/%d walk=%.1fms move=%.1fms"
                  % (moved, len(want), (t_walk - t_all) * 1000.0,
                     (time.perf_counter() - t_walk) * 1000.0))
+        self._keep_above_desktop()
 
     # ------------------------------------------------- 外观：盒子 / 卡片
     def _apply_box_look(self, win) -> None:
