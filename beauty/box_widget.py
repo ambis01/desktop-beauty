@@ -1906,7 +1906,9 @@ class BoxWidget(GlassWindow):
     def _slide_axis(self, axis: str, target: int, dur: float = 0.22) -> None:
         """起一段滑动动画：横竖各占一个槽，互不打断（可能一边被推开一边被吸）。"""
         pad = self._win_margin()
-        px, py = self._win_pad()
+        # 只有固定窗口模式才多减这份「窗口比玻璃多出来的 padding」；老模式减了会让
+        # 每次挤开/吸回都滑到错地方（偏 174/58 像素）。
+        px, py = self._win_pad() if self._fixed_win else (0, 0)
         if axis == "y":
             start, end = float(self.y()), float(target - pad - py)
         else:

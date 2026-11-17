@@ -1792,15 +1792,24 @@ class Controller(QObject):
         y = max(scr.top(), min(base.y(), scr.bottom() + 1 - h))
         return QRect(x, y, w, h), "right", False, None
 
-    def _free_slot(self, r: QRect, placed, scr, gap: int = 0) -> QRect | None:
+    def _free_slot(self, r: QRect, placed, scr, gap: int = 0,
+                   limit: int = 240) -> QRect | None:
         """离 r 最近的空位：不压 placed 里任何一块，整块还在屏幕内。
 
         搜索按「一圈一圈往外」走（下 → 右 → 上 → 左），所以挪动的距离最小；
         原地空着就直接返回原地（调用方据此判断「不用动」）。
+
+        `limit`：距离上限。以前没有上限，搜不到近处就把盒子甩到屏幕另一头
+        （用户 2026-11-17 报的「实在没位置就被推到外面去」，日志里
+        `settle Z 1894,482->1486,2` 就是它）。超了就返回 None，调用方保持原位。
         """
         def hits(rr: QRect) -> bool:
             probe = rr.adjusted(-gap, -gap, gap, gap)
             return any(probe.intersects(o) for o in placed)
+
+        def near(rr: QRect) -> bool:
+            return (abs(rr.x() - r.x()) <= limit and
+                    abs(rr.y() - r.y()) <= limit)
 
         def fixed(rr: QRect) -> QRect:
             out = QRect(rr)
@@ -1824,16 +1833,24 @@ class Controller(QObject):
                 if key in seen:
                     continue
                 seen.add(key)
-                if not hits(cand):
+                if not hits(cand) and near(cand):
                     return cand
         return None
 
-    def _nearest_slot(self, r: QRect, placed, scr, gap: int = 0) -> QRect | None:
+    def _nearest_slot(self, r: QRect, placed, scr, gap: int = 0,
+                      limit: int = 240) -> QRect | None:
         """离 r 最近、不压 placed、整块在屏幕里的位置（上下左右 + 斜着都试）。
 
         和 `_free_slot` 的区别：步长细一点（约 1/3 块大小），找出来的位置更贴近
         原位；`_free_slot` 是「整块挪一格」的用法（启动整理），别混用。
+
+        `limit`：距离上限（见 `_free_slot`）。超过就返回 None，调用方保持原位，
+        宁可叠着/盖住，也不把盒子甩到屏幕另一头。
         """
+        def near(rr: QRect) -> bool:
+            return (abs(rr.x() - r.x()) <= limit and
+                    abs(rr.y() - r.y()) <= limit)
+
         def fits(rr: QRect) -> bool:
             if (rr.left() < scr.left() or rr.top() < scr.top()
                     or rr.right() > scr.right() or rr.bottom() > scr.bottom()):
@@ -1856,7 +1873,7 @@ class Controller(QObject):
                 if key in seen:
                     continue
                 seen.add(key)
-                if fits(cand):
+                if fits(cand) and near(cand):
                     return cand
         return None
 
@@ -2058,6 +2075,10 @@ class Controller(QObject):
                 continue
             best = self._nearest_slot(r, placed, scr, gap)
             if best is None:
+                # 240px 内没有空位：保持首选位置（可能叠着）。记一笔，用来判断
+                # 「盖住」到底频不频繁——频繁才值得写「只朝远离面板的方向挪」。
+                _log(f"cover: settle {w.box.name} 附近无空位，原地保留 "
+                     f"{int(w.box.x)},{int(w.box.y)}")
                 best = r
             if (int(best.x()), int(best.y())) != (int(w.box.x), int(w.box.y)):
                 _log(f"grow: settle {w.box.name} {int(w.box.x)},{int(w.box.y)}"
@@ -2086,6 +2107,8 @@ class Controller(QObject):
                 continue                     # 没被压住：一个像素都不动
             best = self._nearest_slot(r, placed, scr, gap)
             if best is None:
+                # 附近没空位：不动（宁可被盖住，也不甩到屏幕另一头）。记一笔统计。
+                _log(f"cover: press {w.box.name} 附近无空位，原地保留")
                 continue
             if (int(best.x()), int(best.y())) != (int(w.box.x), int(w.box.y)):
                 _log(f"grow: settle {w.box.name} {int(w.box.x)},{int(w.box.y)}"
