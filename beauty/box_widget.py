@@ -204,9 +204,7 @@ user32.SetWindowPos.argtypes = [
 ]
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
-SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
-SWP_NOCOPYBITS = 0x0100
 SWP_NOOWNERZORDER = 0x0200
 
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -901,20 +899,12 @@ class BoxWidget(GlassWindow):
         return 1.0 + HOVER_GROW * self._hover_t
 
     def _set_geometry_quiet(self, rect: QRect, defer_blur: bool = False) -> None:
-        """改窗口几何，但别让合成器把中间态露出来。
+        """改窗口几何，但不让合成器把「旧画面被拉一下」露出来。
 
-        ⚠️ 2026-11-17 改：以前是「opacity 0 → 改几何 → 重画 → opacity 1」，想用
-        整窗全透明挡住合成器拉旧画面的那一帧。实测那一步**反而制造了用户报的
-        「整块变透明、露出壁纸一下」**：设透明度和改几何是两次独立的合成提交，
-        中间只要撞上一次垂直同步，就会实打实出一帧「窗口全透明、壁纸透出来」的
-        画面（逐帧抓图抓到了，展开开头、收起收尾各一次）。透明度的收益是躲一个
-        可能存在的旧表面拉伸，代价是必定概率出现整块消失——不划算。
-
-        现在只做真正需要的事，顺序不能换：
-        1. 调用方先把「这块玻璃在新矩形里该画在哪」算好（`_sync_paint_box`）；
-        2. 改几何；
-        3. 同步重画一次，把新矩形的画面立刻填上。
-        DWM 那层「过渡动画」（把旧画面拉过去）早就用 `no_transitions()` 关掉了。
+        做法：同一次事件里 opacity 0 → 关亚克力 → setGeometry → 重画 → opacity 1。
+        合成器就算拿旧表面去拉伸/挪位，拉的也是全透明的；亚克力按新矩形重新采样
+        的那一帧也不会被看到（用户实测：内容不闪了，只剩玻璃背景闪一下——所以
+        模糊要整段动画都关掉，`defer_blur=True`，动画结束再打开）。
         """
         if rect.isNull() or self.geometry() == rect:
             return
@@ -923,33 +913,14 @@ class BoxWidget(GlassWindow):
             # 还没显示（启动阶段）：没有合成画面要躲，直接改
             self.setGeometry(rect)
             return
-        # ⚠️ 关键：**永远不要在同一帧里既挪窗口原点又改窗口尺寸**。
-        # 往左/往上展开（面板比收起形态大、原点还要动）时，合成器拿去对齐旧表面
-        # 就对不上，只能把旧画面拉一下——逐帧抓图看到的是「一整块被放大的模糊
-        # 残影」，持续约 5 帧（2026-11-17 抓的 C 展开）。而「纯移动」和「纯改尺寸」
-        # 这两种单一操作，合成器处理起来都是干净的（往右/往下展开的盒子一直不闪，
-        # 就是因为它们原点不动、只改尺寸）。
-        # 所以这里拆成两步：① 先在**旧原点**把尺寸改到位；② 再**纯移动**到新原点。
-        # 第二步挪窗口时，`_sync_paint_box()` 会按新原点和 `_paint_rect` 重算绘制
-        # 偏移，玻璃的屏幕位置一个像素都不动，肉眼不会看到跳。
-        before = self.geometry()
+        self.setWindowOpacity(0.0)
         try:
             self.set_acrylic(False)
         except (RuntimeError, TypeError, AttributeError):
             pass
-        if before.topLeft() != rect.topLeft() and before.size() != rect.size():
-            step = QRect(before.topLeft(), rect.size())
-            self.setGeometry(step)
-            self._sync_paint_box()
-            self.repaint()
-            self.setGeometry(rect)
-            self._sync_paint_box()
-            self.repaint()
-        else:
-            self.setGeometry(rect)
-            self.repaint()
-        if legacy:
-            self.setWindowOpacity(1.0)
+        self.setGeometry(rect)
+        self.repaint()
+        self.setWindowOpacity(1.0)
         if defer_blur:
             # 动画还没结束：模糊先别开，免得在新尺寸上又采样一次（那就是「玻璃闪」）
             self._acrylic_off = True
@@ -2122,27 +2093,14 @@ class BoxWidget(GlassWindow):
         return QPoint(r.x() - self.x(), r.y() - self.y())
 
     def _cur_paint_rect(self) -> QRect:
-        """「现在这块玻璃」的窗口矩形——新动画必须从它出发，不能从窗口矩形出发。
+        """「现在这块玻璃」的窗口矩形——固定窗口模式下动画要从它出发，而不是整个窗口。
 
-        为什么不能直接用 `self.geometry()`：动画期间窗口会被开到「起点∪终点」
-        那么大（非固定窗口模式也是），窗口比此刻的玻璃大一圈。动画被打断时
-        （用户点得太快、外面点一下、连着点两个盒子）拿窗口矩形当起点，玻璃会
-        **瞬间撑到整窗**，图标按整块面板排开——就是用户 2026-11-17 报的
-        「偶尔一帧图标冲出来」。固定窗口模式下窗口永远比玻璃大，同样只能取
-        `_paint_rect`。
-
-        `_paint_rect` 每次动画帧都会跟着插值更新，所以它就是「此刻的玻璃」。
-        兜底：万一它和现在的窗口完全不相交（窗口被滑走/刚重建），退回窗口矩形。
+        老模式里窗口就是玻璃（加余量），`self.geometry()` 可以直接当动画起点；固定窗口
+        模式下窗口比玻璃大一圈，拿它当起点的话，动画会从一大块（多半是透明的）外框
+        开始长——看着就是玻璃「先闪一下整窗再缩回盒子」。
         """
-        r = QRect(self._paint_rect)
-        if not r.isNull() and r.intersects(self.geometry()):
-            try:
-                _log_force("anim from glass box=%s %s win=%s", self.box.id,
-                           (r.x(), r.y(), r.width(), r.height()),
-                           (self.x(), self.y(), self.width(), self.height()))
-            except (RuntimeError, TypeError, AttributeError):
-                pass
-            return r
+        if self._fixed_win and not self._paint_rect.isNull():
+            return QRect(self._paint_rect)
         return self.geometry()
 
     def _anim_frame_stat(self) -> None:
@@ -2177,12 +2135,6 @@ class BoxWidget(GlassWindow):
         # 动画结束：窗口收/放回这一帧该在的矩形（动画期间它是「起点∪终点」）
         target = QRect(self._anim_rect_to)
         self._anim_win = QRect()
-        # ⚠️ 这里必须**先清空**再去改几何，别反过来「先把画笔位置按最终矩形算好」：
-        # 收起时 `target`（开始那一刻算的）不一定等于此刻真正的收起矩形——这中间
-        # `_settle_layout` 可能把盒子挪过位置。按 target 算出来的 `_paint_box` 就会
-        # 偏，`_set_geometry_quiet()` 里那次重画正好用它，图标当场跑到玻璃外面
-        # （2026-11-17 试过这么改，普通收起也开始闪，已回退）。
-        # 清空之后 `_cw()` 退回「整个窗口」，而窗口就是这一刻的玻璃，永远对得上。
         self._paint_rect = QRect()
         self._paint_box = None
         if getattr(self, "_z_pending", False):
@@ -2205,8 +2157,6 @@ class BoxWidget(GlassWindow):
             # 面板矩形——用户看到的那一下闪，主要就是这一步（同一个几何变化走安静版）
             self._set_geometry_quiet(target)
             self.repaint()
-        self._paint_rect = QRect()
-        self._paint_box = None
         # 展开完成：收起形态回到「缩略图标」（下次收起 / 拖动按它算）
         self._bar = False
         self._bar_t = 0.0
@@ -2345,16 +2295,8 @@ class BoxWidget(GlassWindow):
         # 收放动画期间内容钉在「原来那块」上（见 `_mini_rect` / `_paint_expanded`），
         # 可能会伸到当前窗口外面去；裁到玻璃圆角里，别让图标残影露到盒子外面
         # （用户 2026-11-16 报的「残影冲出收纳盒」）。
-        #
-        # ⚠️ 判断条件不能只看「定时器还开着」。动画被打断时（`toggle()` 里
-        # `_anim_timer.stop()` 之后、新动画 `_start_anim()` 之前有一段空档，
-        # 中间还要跑一次重排），这期间 `_t` 还是半截的、图标已经是整块面板的
-        # 排版，只要来一次重画就会**不裁剪**地画出去——用户 2026-11-17 报的
-        # 「图标冲出玻璃」就是这一帧。所以按「内容还在过渡态」判，而不是按
-        # 「定时器开着」判；静止状态（_t / _bar_t 正好 0 或 1）不裁，和以前一样。
         anim = self._anim_timer.isActive()
-        mid = (0.0 < self._t < 0.999) or (0.0 < self._bar_t < 0.999)
-        if anim or mid:
+        if anim:
             glass_path = QPainterPath()
             glass_path.addRoundedRect(
                 QRectF(0.0, 0.0, self._cw(), self._ch()),
