@@ -59,6 +59,16 @@ EMPTY_RECONNECT = 2      # 连续几轮一个会话都看不到，就重新要�
 # 用户看到的就是「网页版/桌面版都识别不到」、「卡片空着」（2026-11-17 实测日志
 # 12:48:39 连上却没有会话、12:49:29 重连才看到 1 个）。改成 2 轮，空窗期减半。
 
+# 2026-11-18 18:10 实测到的另一种「卡片又空了」：轮询线程活着，但卡在一个
+# Windows 运行时的 await 上再也不回来（日志停在「换歌取封面」那一行，卡片一直
+# 空着、按钮全哑）。线程没死，_guard 就发现不了，只能重启程序。所以两件事：
+#   1) 每个 await 都带上限，超时算这一轮没读到，下一轮接着来；
+#   2) _guard 除了看线程死没死，还看它「多久没走过一轮」，卡住就换个新线程。
+READ_TIMEOUT = 4.0       # 读一个会话（取属性/播放状态）最多等多久
+COVER_TIMEOUT = 3.0      # 读封面最多等多久（这一首超时就直接不取，别每轮都等）
+CMD_TIMEOUT = 5.0        # 给播放器发一条命令最多等多久
+STALL_S = 20.0           # 一轮都没走完超过这么久，就当线程卡死了
+
 # 卡片钉住的三种状态（存进 CardData.bind）：
 #   ""  = 自动：谁在放跟谁
 #   key = 钉死在这个播放器上（比如 "cloudmusic.exe#0"），它没开就空着
@@ -470,6 +480,8 @@ class MusicService(QObject):
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._respawns = 0
+        self._gen = 0                     # 线程代号：换线程时 +1，老线程看到不是自己就退出
+        self._beat = time.monotonic()     # 上一轮轮询走完的时刻（_guard 靠它看卡没卡）
         try:
             import winsdk  # noqa: F401  只探一下装没装
             self.ok = True
@@ -480,27 +492,42 @@ class MusicService(QObject):
 
     # ------------------------------------------------------------ 线程兜底
     def _spawn(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="music-smtc",
-                                        daemon=True)
+        self._gen += 1
+        gen = self._gen
+        self._beat = time.monotonic()
+        self._thread = threading.Thread(target=self._run, args=(gen,),
+                                        name="music-smtc", daemon=True)
         self._thread.start()
 
     def _guard(self) -> None:
-        """盯着轮询线程：它死了就重新拉一个。
+        """盯着轮询线程：它死了、或者卡住了，就重新拉一个。
 
         为什么要有这个：2026-11-17 17:43 实测轮询线程会**整个死掉**——
         `_reconnect()` 里 `Manager.request_async()` 抛了个 COM 的
         `RPC_E_WRONG_THREAD`（0x8001010e），那是 SEH 级的致命异常，Python 的
         `except` 根本接不住，线程直接没了。表现就是「音乐卡片再也捕获不到任何
-        东西」，只有重启程序才好。这里每 5 秒看一眼，线程没了就重新起一个：
-        服务对象本身、通道、封面缓存都还在，新线程连上会话管理器就接着干。
+        东西」，只有重启程序才好。
+
+        2026-11-18 18:10 又是一种：线程没死，卡在系统运行时的 await 上不回来
+        （日志停在「换歌取封面」，卡片一直空着）。`is_alive()` 看不出来，所以
+        再加一条「多久没走完一轮」——超过 STALL_S 就当它卡死，换新的。老线程
+        醒来后会看到代号变了，自己退出（不再往卡片里写东西）。
         """
         while not self._stop.is_set():
             time.sleep(5.0)
+            if self._stop.is_set():
+                continue
             th = self._thread
-            if self._stop.is_set() or th is None or th.is_alive():
+            alive = th is not None and th.is_alive()
+            stuck = time.monotonic() - self._beat
+            if alive and stuck < STALL_S:
                 continue
             self._respawns += 1
-            dlog(f"music: 轮询线程没了，第 {self._respawns} 次重新拉起")
+            if alive:
+                dlog(f"music: 轮询线程卡了 {int(stuck)}s 没动静，第 "
+                     f"{self._respawns} 次重新拉起")
+            else:
+                dlog(f"music: 轮询线程没了，第 {self._respawns} 次重新拉起")
             try:
                 self._spawn()
             except Exception as exc:  # noqa: BLE001
@@ -565,28 +592,31 @@ class MusicService(QObject):
         self._stop.set()
 
     # ------------------------------------------------------------ 后台线程
-    def _run(self) -> None:
+    def _run(self, gen: int) -> None:
         try:
-            asyncio.run(self._loop())
+            asyncio.run(self._loop(gen))
         except BaseException as exc:  # noqa: BLE001 - SEH 级异常也尽量留一行
-            dlog(f"music: 线程停了 {exc!r}")
+            if gen == self._gen:       # 被新线程顶替的老线程就别再吵了
+                dlog(f"music: 线程停了 {exc!r}")
 
-    async def _loop(self) -> None:
+    async def _loop(self, gen: int) -> None:
         from winsdk.windows.media.control import (
             GlobalSystemMediaTransportControlsSessionManager as Manager,
         )
         mgr = None
         try:
-            mgr = await Manager.request_async()
+            mgr = await asyncio.wait_for(Manager.request_async(), READ_TIMEOUT)
             dlog("music: 已连上系统媒体会话")
         except Exception as exc:  # noqa: BLE001
             dlog(f"music: 连不上系统媒体会话 {exc!r}")
         n = 0
         while not self._stop.is_set():
+            if gen != self._gen:          # 有更新的线程在干了：这个线程退场
+                return
             try:
                 await self._drain(mgr)
                 if n % READ_EVERY == 0:
-                    seen = await self._read_all(mgr)
+                    seen = await self._read_all(mgr, gen)
                     if seen:
                         self._empty_streak = 0
                     else:
@@ -600,6 +630,8 @@ class MusicService(QObject):
                 n += 1
             except Exception as exc:  # noqa: BLE001 - 读失败就下一轮再试
                 dlog(f"music: 读会话失败 {exc!r}")
+            if gen == self._gen:
+                self._beat = time.monotonic()   # 这一轮走完了：心跳一下
             await asyncio.sleep(POLL_S)
 
     async def _reconnect(self, mgr):
@@ -609,7 +641,7 @@ class MusicService(QObject):
         )
         self._empty_streak = 0
         try:
-            new = await Manager.request_async()
+            new = await asyncio.wait_for(Manager.request_async(), READ_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             dlog(f"music: 重连会话管理器失败 {exc!r}")
             return mgr
@@ -631,13 +663,21 @@ class MusicService(QObject):
             try:
                 if cmd == "together":
                     ids, want = arg or ([], None)
-                    await self._press_together(list(ids), want)
+                    await asyncio.wait_for(self._press_together(list(ids), want),
+                                           CMD_TIMEOUT)
                 else:
                     ch = self._by_card.get(card_id)
                     key = ch.key if ch is not None else ""
                     cur = self._sessions.get(key) if key else None
                     if cur is not None:
-                        ok = await self._run_smtc_command(cur, cmd, arg)
+                        try:
+                            ok = await asyncio.wait_for(
+                                self._run_smtc_command(cur, cmd, arg), CMD_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            # 播放器收了消息不回执：别当没送出去再走一遍兜底
+                            # （那会变成按两下），也别把轮询卡在这儿。
+                            dlog(f"music: 命令 {cmd} 超时（播放器没回话）")
+                            ok = True
                         if not ok and ch is not None:
                             # 系统会话不认这条命令：跟的是浏览器就走兜底
                             # （APPCOMMAND 递给那个进程 / 系统媒体键）
@@ -788,9 +828,9 @@ class MusicService(QObject):
     def _same(cls, a: dict, b: dict) -> bool:
         return all(a.get(k) == b.get(k) for k in cls.STABLE)
 
-    async def _read_all(self, mgr) -> int:
+    async def _read_all(self, mgr, gen: int) -> int:
         """把系统里所有会话都读一遍，然后按卡片分下去。返回看到几个会话。"""
-        items: list[tuple[str, Any, dict]] = []
+        items: list[tuple[str, Any, dict, Any]] = []
         seen: dict[str, int] = {}
         try:
             sessions = list(mgr.get_sessions()) if mgr is not None else []
@@ -803,16 +843,23 @@ class MusicService(QObject):
             seen[aumid] = n + 1
             key = f"{aumid}#{n}"          # 同一个播放器开两份也能分开（顺序稳定）
             try:
-                snap, props = await self._read_one(key, s)
+                snap, props = await asyncio.wait_for(
+                    self._read_one(key, s), READ_TIMEOUT)
+            except asyncio.TimeoutError:
+                # 播放器的系统会话偶尔会「问什么都不答」：这一轮跳过它，
+                # 不能让一个卡住的播放器把整张卡片（和所有按钮）一起按住。
+                dlog(f"music: 读会话超时 {key}（>{READ_TIMEOUT:.0f}s），这轮跳过")
+                continue
             except Exception as exc:  # noqa: BLE001 - 单个播放器读挂了不影响别人
                 dlog(f"music: 读会话失败 {key} {exc!r}")
                 continue
-            items.append((key, s, snap))
-            await self._maybe_cover(key, props, snap)
+            items.append((key, s, snap, props))
+        if gen != self._gen:              # 这中间被新线程顶替了：别写卡片状态
+            return 0
 
-        self._sessions = {k: s for k, s, _snap in items}
-        self._snaps = {k: snap for k, _s, snap in items}
-        claim = self._plan([k for k, _s, _snap in items])
+        self._sessions = {k: s for k, s, _snap, _props in items}
+        self._snaps = {k: snap for k, _s, snap, _props in items}
+        claim = self._plan([k for k, _s, _snap, _props in items])
         for ch in self._channels:
             key = claim.get(ch.card_id, "")
             if not items and ch.prefer != NO_FOLLOW and self._has_fallback(ch):
@@ -829,6 +876,19 @@ class MusicService(QObject):
                      f"title={(snap_dbg or {}).get('title', '')!r} "
                      f"kind={(snap_dbg or {}).get('kind')}")
             self._apply_to_channel(ch, self._snaps.get(key) if key else None)
+
+        # 封面放在状态之后：歌名/歌手先上屏。取封面要走播放器给的图片流，
+        # 那一步偶尔会卡住（见 COVER_TIMEOUT）——它卡住也只能拖住「这张图」，
+        # 不能拖住整张卡片（以前就是卡在这儿，卡片一直空着）。
+        for key, _s, snap, props in items:
+            await self._maybe_cover(key, props, snap)
+        if gen != self._gen:
+            return 0
+        for ch in self._channels:
+            cover = self.covers.get(ch.key) if ch.key else None
+            if cover is not ch._cover_seen:
+                ch._cover_seen = cover
+                ch.cover_new.emit()
         return len(items)
 
     @staticmethod
@@ -1090,7 +1150,19 @@ class MusicService(QObject):
             return
         st["try"] += 1
         thumb = getattr(props, "thumbnail", None)
-        data = await self._read_thumb(thumb) if thumb is not None else None
+        if thumb is None:
+            return
+        try:
+            # 这里以前是裸 await：播放器给的那个封面引用**会永远不回来**（2026-11-18
+            # 18:10 实测，日志停在「换歌取封面」再没下文，卡片一直空着、按钮全哑）。
+            # 超时就直接认这一首没有封面——不能为了张图把整个轮询按住。
+            data = await asyncio.wait_for(self._read_thumb(thumb), COVER_TIMEOUT)
+        except asyncio.TimeoutError:
+            st["done"] = True
+            if st["prev"] is not None:
+                self.covers[key] = None
+            dlog(f"music: {key} 封面超时，这一首不取了 {snap['title'][:24]!r}")
+            return
         if not data:
             return                    # 这一轮没拿到：下一轮再试
         st["got"] = data

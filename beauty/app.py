@@ -3922,8 +3922,15 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # 硬崩溃（段错误 / 访问违规）不会走 excepthook，用 faulthandler 落盘。
+    # 这个文件是只追加的：某些 COM 调用（比如音乐轮询线程里的 winsdk）会
+    # 反复抛「Windows fatal exception: code 0x8001010e」，每抛一次就写一份
+    # 全部线程的栈（约 2KB）。攒了 95MB 之后才发现——每次启动超过 8MB 就清空，
+    # 只留最近这一轮的现场。
     try:
-        _crash_fh = (DATA_DIR / "crash.log").open("a", encoding="utf-8")
+        _crash_path = DATA_DIR / "crash.log"
+        if _crash_path.exists() and _crash_path.stat().st_size > 8 * 1024 * 1024:
+            _crash_path.write_text("", encoding="utf-8")
+        _crash_fh = _crash_path.open("a", encoding="utf-8")
         faulthandler.enable(file=_crash_fh, all_threads=True)
         _log("faulthandler 已启用")
     except Exception:  # noqa: BLE001
