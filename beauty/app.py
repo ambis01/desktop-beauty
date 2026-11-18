@@ -1306,7 +1306,14 @@ class Controller(QObject):
         """
         moved = (rect.translated(value - rect.left(), 0) if axis == "x"
                  else rect.translated(0, value - rect.top()))
-        probe = moved.adjusted(-gap, -gap, gap, gap)
+        # ⚠️ 只沿**移动方向**留空隙，垂直方向只要求「不压住」：
+        # 以前横着推的时候纵向也要求 10px，于是上下叠着两根横杠（实测间隔 7px，
+        # 用户 2026-11-18 报「展开游戏为 1 推不开系统软件，只推开了外设控制」）
+        # 永远判成「没地方」——上面那根推走了，下面那根还是卡在原位被面板盖住。
+        if axis == "x":
+            probe = moved.adjusted(-gap, 0, gap, 0)
+        else:
+            probe = moved.adjusted(0, -gap, 0, gap)
         for other in others:
             try:
                 if probe.intersects(other):
@@ -2549,47 +2556,58 @@ class Controller(QObject):
                 continue
             cand.append((other, is_box, rect))
 
-        def need(item) -> int:
-            rect = item[2]
-            return min(target.right() + 1 + gap - rect.left(),
-                       rect.right() - (target.left() - gap - 1))
+        # 先把「正侧面」那几块按**排**分组（纵向有重叠的算一排），每排从左到右
+        # 依次摆在展开面外侧。以前是「谁挪得少谁先摆」（右边那块先落位），左边
+        # 那块再被挤到它外面——两根并排的横杠当场左右对调（用户 2026-11-18：
+        # 展开游戏，外设控制和系统控制换位了）。按排从左往右摆，次序不会乱。
+        rows: list[list[tuple]] = []
+        for it in sorted(cand, key=lambda x: (x[2].top(), x[2].left())):
+            rect = it[2]
+            for row in rows:
+                if any(rect.top() < r[2].bottom() and r[2].top() < rect.bottom()
+                       for r in row):
+                    row.append(it)
+                    break
+            else:
+                rows.append([it])
 
-        cand.sort(key=need)          # 挪得少的先落位，后面的按新位置算
         virt: dict[int, QRect] = {}
         moves: list[tuple] = []
-        for other, is_box, rect in cand:
-            if is_box and getattr(other, "is_expanded", False):
-                # 展开着的面板不许被推（同 `_plan_up`）：推它就是把别人的面板
-                # 拖着走，收起来还会留在错的位置。算「侧面没空间」，盖住。
-                blocked.append(other)
-                continue
-            others = [virt.get(id(o2)) or r2 for o2, _b2, r2 in items if o2 is not other]
-            here = rect.left()
-            got = None
-            right = target.right() + 1 + gap
-            left = target.left() - gap - rect.width()
-            # 同一排已经让开的那几个要连起来：它们先走了，后面的就跟在它们外侧，
-            # 一排东西一起往右让，而不是第二块又叠回第一个的位置上
-            for vr in virt.values():
-                if rect.top() < vr.bottom() and vr.top() < rect.bottom():
-                    right = max(right, vr.right() + 1 + gap)
-                    left = min(left, vr.left() - gap - rect.width())
-            # 只能往**自己那一侧**推：右边的东西往右让，左边的东西往左让。
-            # 以前只看哪边有地方——右边被挡住（比如同一排已经排满）时会把它推到
-            # 左边去，整块跨过展开面，看着就是「展开外设控制，它跟收纳盒换位了」。
-            on_right = rect.center().x() > target.center().x()
-            for want, roomy in ((right, right + rect.width() - 1 <= scr.right()),
-                                (left, left >= scr.left())):
-                if not roomy or (want == right) != on_right:
+        for row in rows:
+            row.sort(key=lambda x: x[2].left())
+            # 这一排是一起挪的：算「有没有地方」时不能拿**它自己还没挪走的老位置**
+            # 当障碍（否则第一块永远被第二块的老位置挡住，整排留在原地被面板盖住）
+            row_ids = {id(it[0]) for it in row}
+            cur_right = target.right() + 1 + gap
+            cur_left = target.left() - gap
+            for other, is_box, rect in row:
+                if is_box and getattr(other, "is_expanded", False):
+                    # 展开着的面板不许被推（同 `_plan_up`）：推它就是把别人的面板
+                    # 拖着走，收起来还会留在错的位置。算「侧面没空间」，盖住。
+                    blocked.append(other)
                     continue
-                if self._free_at(rect, others, gap, "x", want):
+                others = [virt.get(id(o2)) or r2 for o2, _b2, r2 in items
+                          if id(o2) not in row_ids]
+                here = rect.left()
+                # 只能往**自己那一侧**推：右边的东西往右让，左边的东西往左让。
+                # 以前只看哪边有地方——右边被挡住时会把它推到左边去，整块跨过
+                # 展开面，看着就是「展开外设控制，它跟收纳盒换位了」。
+                on_right = rect.center().x() > target.center().x()
+                want = cur_right if on_right else cur_left - rect.width()
+                got = None
+                if on_right and want + rect.width() - 1 <= scr.right() \
+                        and self._free_at(rect, others, gap, "x", want):
                     got = want
-                    break
-            if got is None:
-                blocked.append(other)
-                continue
-            virt[id(other)] = rect.translated(got - here, 0)
-            moves.append((other, is_box, "x", here, got))
+                    cur_right = want + rect.width() + gap
+                elif not on_right and want >= scr.left() \
+                        and self._free_at(rect, others, gap, "x", want):
+                    got = want
+                    cur_left = want
+                if got is None:
+                    blocked.append(other)
+                    continue
+                virt[id(other)] = rect.translated(got - here, 0)
+                moves.append((other, is_box, "x", here, got))
         return moves, blocked
 
     def _grow_request(self, win, target=None, remember: bool = True) -> bool:
