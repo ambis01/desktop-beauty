@@ -488,8 +488,15 @@ class MusicService(QObject):
             self.ok = True
         except Exception:  # noqa: BLE001 - 没装就只走「窗口标题」那条路
             dlog("music: winsdk 没装，只走窗口标题 + 媒体键")
-        self._spawn()
-        threading.Thread(target=self._guard, name="music-guard", daemon=True).start()
+        # ⚠️ 没装 winsdk 就**不要**起轮询线程，也不要起看守线程：打包版默认不带
+        # winsdk（requirements.txt 里是可选项），以前照样起线程 → `_run` 里 import
+        # 失败、线程秒死 → `_guard` 每 5 秒重拉一次，日志里刷出「第 2000 多次重新
+        # 拉起 ModuleNotFoundError」，app.log 几分钟就被刷满（用户朋友 2026-11-19
+        # 的日志就是这样）。没有它就走兜底那条路，安静正常。
+        if self.ok:
+            self._spawn()
+            threading.Thread(target=self._guard, name="music-guard",
+                             daemon=True).start()
 
     # ------------------------------------------------------------ 线程兜底
     def _spawn(self) -> None:
@@ -518,6 +525,10 @@ class MusicService(QObject):
             time.sleep(5.0)
             if self._stop.is_set():
                 continue
+            if not self.ok:
+                # 这条通道本来就不可用（没装 winsdk / 装上但坏了）：别再拉线程了，
+                # 否则每 5 秒一条「重新拉起」把日志刷爆
+                return
             th = self._thread
             alive = th is not None and th.is_alive()
             stuck = time.monotonic() - self._beat
@@ -601,9 +612,14 @@ class MusicService(QObject):
                 dlog(f"music: 线程停了 {exc!r}")
 
     async def _loop(self, gen: int) -> None:
-        from winsdk.windows.media.control import (
-            GlobalSystemMediaTransportControlsSessionManager as Manager,
-        )
+        try:
+            from winsdk.windows.media.control import (
+                GlobalSystemMediaTransportControlsSessionManager as Manager,
+            )
+        except Exception as exc:  # noqa: BLE001 - 没装/装坏了：这条路整个不走
+            self.ok = False               # 别让 _guard 每 5 秒重拉一次把日志刷满
+            dlog(f"music: 没有 winsdk，这条通道停用 {exc!r}")
+            return
         mgr = None
         retry_at = 0.0
         retry_log = 0.0

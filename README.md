@@ -92,6 +92,7 @@ D:\tmp\buildenv\Scripts\python.exe -m pip install pyinstaller
 D:\tmp\buildenv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed ^
   --name desktopbeauty-app --icon assets\app.ico --paths . ^
   --hidden-import beauty.install --hidden-import beauty.setup_window ^
+  --collect-all winsdk ^
   --add-data "assets;assets" --distpath <产物目录> --workpath <临时> --specpath <临时> run.pyw
 ```
 

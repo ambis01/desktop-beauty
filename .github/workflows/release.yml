@@ -33,6 +33,7 @@ jobs:
             --name desktopbeauty-app --icon "$env:GITHUB_WORKSPACE\assets\app.ico" `
             --paths "$env:GITHUB_WORKSPACE" `
             --hidden-import beauty.install --hidden-import beauty.setup_window `
+            --collect-all winsdk `
             --add-data "$env:GITHUB_WORKSPACE\assets;assets" `
             --distpath dist-app --workpath build --specpath build run.pyw
 
