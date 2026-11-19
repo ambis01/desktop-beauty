@@ -20,7 +20,7 @@ from PySide6.QtGui import (
     QPixmap, QRadialGradient,
 )
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFileIconProvider, QInputDialog, QLineEdit, QMenu,
+    QApplication, QFileIconProvider, QLineEdit, QMenu,
 )
 
 from .glass import GlassMenu, GlassWindow, HOVER_GROW, HOVER_MS, modal, no_transitions
@@ -492,6 +492,13 @@ class BoxWidget(GlassWindow):
         self._drag_set: list[int] = []   # 这次拖出去的是哪几个（框选多个时）
         self._editing = False
         self._edit: QLineEdit | None = None
+        # 图标改名：名字那个位置上的输入框（不是弹窗）
+        self._item_edit: QLineEdit | None = None
+        self._item_editing = False
+        self._item_edit_index: int | None = None
+        self._item_edit_path = None
+        self._item_edit_old = ""
+        self._edit_mask: QRect | None = None   # 原地改名时输入框占的那块（玻璃坐标）
         self._born = time.monotonic()
         self._side_w, self._side_h = self._collapsed_size()   # 收起尺寸（随图标数量变）
         self._hover_t = 0.0                   # 悬停放大进度 0→1
@@ -691,6 +698,11 @@ class BoxWidget(GlassWindow):
         self._outside_timer = QTimer(self)
         self._outside_timer.setInterval(60)
         self._outside_timer.timeout.connect(self._watch_outside_click)
+        # 图标改名时盯 Esc / 回车 / 点外面的兜底（不看键盘焦点）
+        self._item_edit_keys = QTimer(self)
+        self._item_edit_keys.setInterval(60)
+        self._item_edit_keys.timeout.connect(self._watch_item_edit_keys)
+        self._item_edit_down = False
 
         self._apply_collapsed_geometry()
         self._clamp_to_screen()
@@ -1638,46 +1650,145 @@ class BoxWidget(GlassWindow):
             self._delete_item(index)
 
     def _rename_item(self, index: int) -> None:
-        """给图标改名。
+        """给图标改名：就在它名字那个位置直接改（和桌面上按 F2 一样）。
 
-        ⚠️ 以前是 `QInputDialog.getText(...)`——那是个**会阻塞**的模态循环。2026-11-19
-        12:27 实测出过一次：进程卡在 getText 里（py-spy 栈就是这一行），可枚举出来的
-        窗口里**一个对话框都没有**——模态在、窗口不在，整个程序就永远等下去：盒子点
-        不动、卡片全哑、Windows 报「python 未响应」。现在对话框弹出来就返回，改名放在
-        finished 回调里做；最坏情况只是这次对话框没显示，程序照常用。
+        以前弹的是 `QInputDialog` 那种小窗口——用户 2026-11-19 直接问「为什么不能
+        在文件位置直接改名，还要搞个窗口出来」。现在名字本身变成输入框：原地改、
+        回车确认、Esc 取消、点别处也算确认。
         """
+        if not (0 <= index < len(self._items)):
+            return
         path = self._items[index]
-        old = path.stem if path.suffix.lower() in (".lnk", ".url") else path.name
-        dlg = QInputDialog(self)
-        dlg.setInputMode(QInputDialog.TextInput)
-        dlg.setWindowTitle("重命名")
-        dlg.setLabelText("新名字：")
-        dlg.setTextValue(old)
-        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        name = path.stem if path.suffix.lower() in (".lnk", ".url") else path.name
+        self._begin_item_rename(index, path, name)
 
-        def on_finished(result: int) -> None:
-            try:
-                text = (dlg.textValue() or "").strip()
-                if int(result) != int(QDialog.Accepted):
-                    return
-                if not text or text == old:
-                    return
+    def _begin_item_rename(self, index: int, path, name: str) -> None:
+        """在图标下面那行名字的位置放一个输入框（玻璃是半透明的，输入框得有点底）。
+
+        ⚠️ 输入框必须是**独立的弹出窗口**（`Qt.Popup`），不能当盒子的子控件：盒子
+        是 `WS_EX_NOACTIVATE` 的 Tool 窗口，叫不动前台就收不到任何按键——2026-11-19
+        实机就卡在这（回车、Esc、点别处全没用，输入框一直挂着）。弹出窗口自己会
+        抓键盘和鼠标，点外面自动关掉，和资源管理器原位改名的手感一样。
+        """
+        self._finish_item_rename(True)          # 上一个还没收的，先结掉
+        self._outside_timer.stop()
+        self._press_global = None
+        self._win_pos = None
+        self._moved = False
+        self._pressed_item = None
+        if self._item_edit is None:
+            # 带 parent 的弹出窗口：盒子销毁时它跟着销毁，不会留一块孤儿窗口
+            ed = QLineEdit(self)
+            # NoDropShadowWindowHint：不要系统给弹出窗口画的那圈阴影/描边，
+            # 否则透明底下面会多出一条灰线，看着像残影
+            ed.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint
+                              | Qt.NoDropShadowWindowHint)
+            ed.setFrame(False)
+            # 不要底色、不要边框：就是原来那行名字本身变成能编辑的（和改盒子
+            # 标题同一个样子）。它盖住的那几行字会让开，所以透明底也不会叠字。
+            ed.setAttribute(Qt.WA_TranslucentBackground, True)
+            ed.setStyleSheet(
+                "QLineEdit { background: transparent; border: none;"
+                " padding: 0px 2px; color: rgb(26,32,42);"
+                " selection-background-color: rgba(92,112,146,70);"
+                " selection-color: rgb(26,32,42); }")
+            ed.returnPressed.connect(lambda: self._finish_item_rename(True))
+            ed.installEventFilter(self)
+            self._item_edit = ed
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(11)
+        self._item_edit.setFont(f)
+        self._item_edit.setText(name)
+        self._item_editing = True
+        self._item_edit_index = index
+        self._item_edit_path = path
+        self._item_edit_old = name
+        # 位置：屏幕坐标 = 盒子窗口位置 + 玻璃偏移 + 格子里那行名字的位置
+        slot = self._item_rect(index)
+        fm = QFontMetrics(f)
+        m = self._win_margin()
+        off = self._paint_offset()
+        w = max(CELL_W + 10, min(int(self._cw()) - PAD,
+                                 fm.horizontalAdvance(name) + 20))
+        x = slot.center().x() - w // 2
+        x = max(PAD // 2, min(x, int(self._cw()) - PAD // 2 - w))
+        gx = self.x() + m + off.x() + x
+        gy = self.y() + m + off.y() + slot.top() + 57
+        self._item_edit.setGeometry(QRect(gx, gy, w, 24))
+        # 输入框在玻璃上占的那块：只算「名字那一行」，别碰到图标——以前从
+        # 57 起算，和图标底边差 1px 就重叠，结果改名时**自己的图标**也被让开了
+        # （用户 2026-11-19 问「重命名的时候图标呢」）
+        self._edit_mask = QRect(x, slot.top() + 60, w, 20)
+        self._item_edit.show()
+        self._item_edit.setFocus(Qt.PopupFocusReason)
+        # 像资源管理器那样只选中主名，不选后缀（.lnk/.url 显示的就是主名，全选）
+        if path.suffix.lower() in (".lnk", ".url"):
+            self._item_edit.selectAll()
+        else:
+            self._item_edit.setSelection(0, len(path.stem))
+        self._item_edit_keys.start()
+        self.update()
+
+    def _finish_item_rename(self, commit: bool) -> None:
+        if not self._item_editing or self._item_edit is None:
+            return
+        text = self._item_edit.text().strip()
+        path = self._item_edit_path
+        old = self._item_edit_old
+        self._item_editing = False
+        self._item_edit_index = None
+        self._edit_mask = None
+        self._item_edit_keys.stop()
+        self._item_edit.hide()
+        if commit and text and text != old and path is not None:
+            # 快捷方式：输入框里只有主名，后缀（.lnk/.url）替它留着；普通文件：
+            # 名字框里显示的就是带后缀的全名，不能再补一次后缀（2026-11-19 实测
+            # 出过 hello.txt.txt）
+            if path.suffix.lower() in (".lnk", ".url"):
                 target = path.with_name(text + path.suffix)
-                try:
-                    path.rename(target)
-                except OSError:
-                    self.toast_error("改名失败（名字被占用或者字符不合法）")
-                    return
+            else:
+                target = path.with_name(text)
+            try:
+                path.rename(target)
+            except (OSError, ValueError):
+                self.toast_error("改名失败（名字被占用或者字符不合法）")
+            else:
                 self.store.renamed(self.box, path.name, target.name)
                 self.refresh()
                 self.changed.emit()
-            finally:
-                dlg.deleteLater()
+        if self._expanded:
+            self._was_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+            self._outside_timer.start()
+        self.update()
 
-        dlg.finished.connect(on_finished)
-        dlg.open()
-        dlg.raise_()
-        dlg.activateWindow()
+    def _watch_item_edit_keys(self) -> None:
+        """输入框开着的时候，用系统键状态兜底盯 Esc / 回车 / 点外面。
+
+        弹出窗口正常能收到键盘；但万一焦点被别的窗口抢走（比如输入法、别的程序
+        跳到前台），Qt 就收不到按键了，输入框会一直挂着。这里不看焦点，直接问
+        Windows「现在这些键按着没有」，保证一定有退出的路。
+        """
+        if not self._item_editing or self._item_edit is None:
+            self._item_edit_keys.stop()
+            return
+
+        def down(vk: int) -> bool:
+            return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+        if down(0x1B):                    # Esc
+            self._finish_item_rename(False)
+            return
+        if down(0x0D):                    # 回车
+            self._finish_item_rename(True)
+            return
+        lmb = down(VK_LBUTTON)
+        if lmb and not getattr(self, "_item_edit_down", False):
+            ed = self._item_edit
+            local = ed.mapFromGlobal(QCursor.pos())
+            if not ed.rect().contains(local):
+                self._finish_item_rename(True)      # 点到别处 = 确认
+                return
+        self._item_edit_down = lmb
 
     def _restore_item(self, index: int) -> None:
         path = self._items[index]
@@ -1821,6 +1932,9 @@ class BoxWidget(GlassWindow):
         if self._editing:
             # 收起/展开时先把改名结束掉，别留一个输入框挂在窗口上
             self._finish_inline_rename(True)
+        if self._item_editing:
+            # 图标改名同理：先落地再动窗口
+            self._finish_item_rename(True)
         if not target:
             # 收起一截：底边不动，把「往上长」的偏移折回去（收到横杠时归 0，
             # 盒子就回到 box.y；不收的话每来一轮就往上漂一截）
@@ -2603,6 +2717,9 @@ class BoxWidget(GlassWindow):
                 _fm = QFontMetrics(label_font)
                 if _fm.horizontalAdvance(_n) > CELL_W - 8:
                     full_item = _only
+        # 正在原地改名的那一个：名字交给输入框，别再画一份折行全名盖上去
+        if self._item_editing and full_item == self._item_edit_index:
+            full_item = None
         p.setFont(label_font)
         # 局部重画时跳过框外的图标：省下的正是框选时最贵的那部分
         m = self._win_margin()
@@ -2620,6 +2737,12 @@ class BoxWidget(GlassWindow):
                    if self._items[full_item].suffix.lower() in (".lnk", ".url")
                    else self._items[full_item].name)
             full_rect = self._full_name_rect(_slot, _nm)
+        # 正在原地改名：透明输入框占的那块（玻璃坐标）。它盖住谁，谁就让开——
+        # 不然输入框里的字和下面的标签叠在一起，看着就是一团糊。
+        mask_rect = None
+        if self._item_editing and getattr(self, "_edit_mask", None) is not None:
+            mask_rect = QRect(self._edit_mask)
+        block = full_rect if full_rect is not None else mask_rect
         for slot_i, idx in enumerate(order):
             if idx == self._internal_drag:
                 continue            # 拖着的那个原地消失，跟着光标画
@@ -2641,9 +2764,11 @@ class BoxWidget(GlassWindow):
             label_rect = QRect(slot.left() + 2, slot.top() + 62, CELL_W - 4, 18)
             # 全名压到谁身上，谁就先让开（这一帧不画那行字/那个图标）——不然
             # 两行字叠在一起就是一团糊。点走就都回来。
-            covered = (full_rect is not None and idx != full_item
-                       and full_rect.intersects(slot))
-            covers_icon = covered and full_rect.intersects(icon_rect)
+            covered = (block is not None and idx != full_item
+                       and not (self._item_editing
+                                and idx == self._item_edit_index)
+                       and block.intersects(slot))
+            covers_icon = covered and block.intersects(icon_rect)
             if not covers_icon:
                 pm = self._icon(path, 52)
                 # 鼠标停在这个图标上：往上跳一下、落回去、再弹一小下
@@ -2654,8 +2779,10 @@ class BoxWidget(GlassWindow):
                            icon_rect.top() + (52 - pm.height()) // 2 + lift), pm)
             if idx == full_item:
                 continue            # 标签交给 _paint_full_name 画成折行全名
-            if covered and full_rect.intersects(label_rect):
-                continue            # 被全名压住的那一行字让开，别叠成一团
+            if self._item_editing and idx == self._item_edit_index:
+                continue            # 这行名字正在输入框里改，别在下面再画一遍
+            if covered and block.intersects(label_rect):
+                continue            # 被全名/输入框压住的那一行字让开，别叠成一团
             p.setPen(QColor(26, 32, 42, 244))
             key = str(path)
             text = self._label_cache.get(key)
@@ -4044,6 +4171,35 @@ class BoxWidget(GlassWindow):
         except (OSError, TypeError, RuntimeError):
             pass
 
+    def _grab_keyboard(self) -> None:
+        """把键盘真正抢过来。
+
+        盒子是 `WS_EX_NOACTIVATE` 的 Tool 窗口，光调 `activateWindow` 经常不生效
+        （Windows 的前台锁：不是前台进程就叫不动前台窗口），输入框收不到一个字。
+        这里临时把本线程和前台线程的输入队列接在一起再叫前台，叫完就断开——
+        这是改标题、改图标名字之前都要走的一步。
+        """
+        try:
+            user32.GetForegroundWindow.restype = wt.HWND
+            user32.GetWindowThreadProcessId.argtypes = [
+                wt.HWND, ctypes.POINTER(wt.DWORD)]
+            user32.GetWindowThreadProcessId.restype = wt.DWORD
+            hwnd = int(self.winId())
+            fg = user32.GetForegroundWindow()
+            tid_self = user32.GetWindowThreadProcessId(hwnd, None)
+            tid_fg = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            attached = False
+            if tid_fg and tid_self and tid_self != tid_fg:
+                attached = bool(user32.AttachThreadInput(tid_self, tid_fg, True))
+            try:
+                user32.SetForegroundWindow(hwnd)
+                user32.SetFocus(hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(tid_self, tid_fg, False)
+        except (OSError, TypeError, RuntimeError, AttributeError):
+            pass
+
     def _begin_inline_rename(self) -> None:
         """在标题位置直接编辑，不弹对话框。"""
         self._outside_timer.stop()
@@ -4055,10 +4211,7 @@ class BoxWidget(GlassWindow):
         # 要收键盘了：先放开 NOACTIVATE，不然 activateWindow 不生效、输入框
         # 收不到任何字符。
         self._set_noactivate(False)
-        try:
-            user32.SetForegroundWindow(int(self.winId()))
-        except (OSError, TypeError, RuntimeError):
-            pass
+        self._grab_keyboard()
         self.activateWindow()
         if self._edit is None:
             self._edit = QLineEdit(self)
@@ -4113,6 +4266,14 @@ class BoxWidget(GlassWindow):
             if ev.type() == QEvent.Type.FocusOut:
                 # 点到别处（包括盒子外面）就当场确认，不用非得按回车
                 self._finish_inline_rename(True)
+        if obj is self._item_edit:
+            if ev.type() == QEvent.Type.KeyPress and ev.key() == Qt.Key_Escape:
+                self._finish_item_rename(False)
+                return True
+            if ev.type() in (QEvent.Type.Close, QEvent.Type.Hide):
+                # 弹出窗口被系统/点外面关掉：当成「确认」，别把输入框留在那儿
+                if self._item_editing:
+                    self._finish_item_rename(True)
         return super().eventFilter(obj, ev)
 
     def focusOutEvent(self, event) -> None:
@@ -4123,6 +4284,10 @@ class BoxWidget(GlassWindow):
     def dispose(self) -> None:
         self._refresh_timer.stop()
         self._outside_timer.stop()
+        try:
+            self._item_edit_keys.stop()
+        except (RuntimeError, AttributeError):
+            pass
         if getattr(self, "_icon_ready_conn", False):
             self._icon_ready_conn = False
             try:
