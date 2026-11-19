@@ -200,11 +200,28 @@ class Config:
         # 老配置里只有 box_push（布尔）：true 当年等于「四个方向全开」。迁移到 3 级
         # （正下方 + 正侧面 + 往上），4 级那条「临时收成横杠」没有能稳定复现的用例，
         # 老配置不该一升级就被塞过去。
+        #
+        # ⚠️ 2026-11-19：以前写的是 `push_rules if 有 else (3 if box_push else 0)`——
+        # 于是「两个键都没有」的老配置（以及从没动过设置的机器）会被迁成 **0**（=谁都不
+        # 推，展开直接盖住邻居）。用户朋友的机器就是这样：三个盒子摆一起，一展开就叠成
+        # 一团。现在：只有 box_push 明确写成 false 才是 0，其余一律 3 级。
         try:
-            cfg.push_rules = int(raw.get("push_rules", 3 if raw.get("box_push") else 0))
+            if "push_rules" in raw:
+                cfg.push_rules = int(raw.get("push_rules") or 0)
+            else:
+                cfg.push_rules = 0 if raw.get("box_push") is False else 3
         except (TypeError, ValueError):
-            cfg.push_rules = 0
+            cfg.push_rules = 3
         cfg.push_rules = max(0, min(5, cfg.push_rules))
+        # 已经被老迁移写成 0 的机器：补偿一次（写 push_rules_fixed 记号，之后用户要是
+        # 真把 0 写回去就尊重他，不再每次启动都改）
+        if (cfg.push_rules == 0 and not raw.get("push_rules_fixed")
+                and raw.get("box_push") is not False):
+            cfg.push_rules = 3
+            try:
+                print("push_rules: 老配置迁成 0，补成 3（展开时推开挡路的盒子）", flush=True)
+            except OSError:
+                pass
         cfg.box_merge = bool(raw.get("box_merge", True))
         cfg.box_merge_bar = bool(raw.get("box_merge_bar", False))
         sort = str(raw.get("box_sort", "name") or "name")
@@ -284,6 +301,9 @@ class Config:
             "panel_theme": str(self.panel_theme),
             "auto_align": bool(self.auto_align),
             "push_rules": int(self.push_rules),
+            # 记号：这个配置文件已经做过「0 补成 3」的补偿。之后用户要是把
+            # push_rules 手动改成 0，就按他的来，不再每次启动都改回去。
+            "push_rules_fixed": True,
             "box_merge": bool(self.box_merge),
             "box_merge_bar": bool(self.box_merge_bar),
             "box_sort": str(self.box_sort),
