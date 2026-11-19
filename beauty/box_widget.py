@@ -20,7 +20,7 @@ from PySide6.QtGui import (
     QPixmap, QRadialGradient,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFileIconProvider, QInputDialog, QLineEdit, QMenu,
+    QApplication, QDialog, QFileIconProvider, QInputDialog, QLineEdit, QMenu,
 )
 
 from .glass import GlassMenu, GlassWindow, HOVER_GROW, HOVER_MS, modal, no_transitions
@@ -488,6 +488,7 @@ class BoxWidget(GlassWindow):
         self._band_at = 0.0                          # 上一次重算的时间
         self._hover_at = 0.0                         # 上一次算悬停的时间
         self._selected: set[int] = set()
+        self._extra_shown = 0            # 当前为「长名字折行」让出去的高度
         self._drag_set: list[int] = []   # 这次拖出去的是哪几个（框选多个时）
         self._editing = False
         self._edit: QLineEdit | None = None
@@ -835,7 +836,35 @@ class BoxWidget(GlassWindow):
         """展开面（玻璃）的尺寸：4 列固定宽，行数跟着图标数。"""
         n = max(1, len(self._items))
         rows = max(1, math.ceil(n / COLS))
-        return PAD * 2 + COLS * CELL_W, HEADER + rows * CELL_H + PAD
+        return (PAD * 2 + COLS * CELL_W,
+                HEADER + rows * CELL_H + PAD + self._label_extra()[1])
+
+    # ---------------------------------------------------- 选中后名字折行（让位）
+    def _label_extra(self) -> tuple[int, int]:
+        """(选中图标所在行, 名字折行多出来的高度)。
+
+        **永远是 (-1, 0)**：用户 2026-11-19 明确要求盒子不要为显示全名长高，
+        所以这里不再预留任何额外高度，全名就地画在自己的位置上（见
+        `_paint_full_name`）。保留这个函数只是为了让上面那些算几何的地方不用改。
+        """
+        return -1, 0
+
+    def _extra_for_row(self, row: int) -> int:
+        """这一行要不要为上面那个展开的名字往下让。"""
+        r, extra = self._label_extra()
+        return extra if (extra > 0 and row > r) else 0
+
+    def _set_sel(self, sel: set[int]) -> None:
+        """改选中集合：只记录选中，几何一点不动（长名字就地折行画）。"""
+        if sel == self._selected:
+            return
+        self._selected = sel
+        self.update()
+
+    def _apply_label_grow(self) -> None:
+        """以前是「选中长名字就把盒子长高、下面让开」；用户不要盒子变高，已停用。"""
+        return
+
 
     def _win_pad(self) -> tuple[int, int]:
         """窗口左上角比「盒子玻璃左上角 - 余量」还多出来多少（往左上）。
@@ -1609,21 +1638,46 @@ class BoxWidget(GlassWindow):
             self._delete_item(index)
 
     def _rename_item(self, index: int) -> None:
+        """给图标改名。
+
+        ⚠️ 以前是 `QInputDialog.getText(...)`——那是个**会阻塞**的模态循环。2026-11-19
+        12:27 实测出过一次：进程卡在 getText 里（py-spy 栈就是这一行），可枚举出来的
+        窗口里**一个对话框都没有**——模态在、窗口不在，整个程序就永远等下去：盒子点
+        不动、卡片全哑、Windows 报「python 未响应」。现在对话框弹出来就返回，改名放在
+        finished 回调里做；最坏情况只是这次对话框没显示，程序照常用。
+        """
         path = self._items[index]
         old = path.stem if path.suffix.lower() in (".lnk", ".url") else path.name
-        text, ok = QInputDialog.getText(self, "重命名", "新名字：", text=old)
-        text = (text or "").strip()
-        if not ok or not text or text == old:
-            return
-        target = path.with_name(text + path.suffix)
-        try:
-            path.rename(target)
-        except OSError:
-            self.toast_error("改名失败（名字被占用或者字符不合法）")
-            return
-        self.store.renamed(self.box, path.name, target.name)
-        self.refresh()
-        self.changed.emit()
+        dlg = QInputDialog(self)
+        dlg.setInputMode(QInputDialog.TextInput)
+        dlg.setWindowTitle("重命名")
+        dlg.setLabelText("新名字：")
+        dlg.setTextValue(old)
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        def on_finished(result: int) -> None:
+            try:
+                text = (dlg.textValue() or "").strip()
+                if int(result) != int(QDialog.Accepted):
+                    return
+                if not text or text == old:
+                    return
+                target = path.with_name(text + path.suffix)
+                try:
+                    path.rename(target)
+                except OSError:
+                    self.toast_error("改名失败（名字被占用或者字符不合法）")
+                    return
+                self.store.renamed(self.box, path.name, target.name)
+                self.refresh()
+                self.changed.emit()
+            finally:
+                dlg.deleteLater()
+
+        dlg.finished.connect(on_finished)
+        dlg.open()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _restore_item(self, index: int) -> None:
         path = self._items[index]
@@ -1704,7 +1758,7 @@ class BoxWidget(GlassWindow):
         n = max(1, len(self._items))
         rows = max(1, math.ceil(n / COLS))
         w = PAD * 2 + COLS * CELL_W
-        h = HEADER + rows * CELL_H + PAD
+        h = HEADER + rows * CELL_H + PAD + self._label_extra()[1]
         avail = self._screen()
         x = self.box.x
         if getattr(self, "_expand_side", "right") == "left":
@@ -1721,7 +1775,8 @@ class BoxWidget(GlassWindow):
     def _item_rect(self, index: int) -> QRect:
         col = index % COLS
         row = index // COLS
-        return QRect(PAD + col * CELL_W, HEADER + row * CELL_H, CELL_W, CELL_H)
+        y = HEADER + row * CELL_H + self._extra_for_row(row)
+        return QRect(PAD + col * CELL_W, y, CELL_W, CELL_H)
 
     def _item_at(self, pos: QPoint) -> int | None:
         if not self._expanded:
@@ -2535,11 +2590,36 @@ class BoxWidget(GlassWindow):
         label_font.setPixelSize(11)
         selected = self._selected
         band = self._band
+        # 名字一行放不下时，那个图标的**标签本身**就是折行全名：只画这一遍，
+        # 不再先画一行截断的再往上面盖一层（那就是「贴上去的一张字」，不是标签）。
+        # 盒子**不变高**（用户 2026-11-19 明确要求）：字就在原处、按格子宽度往下
+        # 折行，压到下面的东西上也就压着——不加宽、不让别人让开、不缩字号。
+        full_item = None
+        if len(selected) == 1:
+            _only = next(iter(selected))
+            if 0 <= _only < len(self._items):
+                _p = self._items[_only]
+                _n = _p.stem if _p.suffix.lower() in (".lnk", ".url") else _p.name
+                _fm = QFontMetrics(label_font)
+                if _fm.horizontalAdvance(_n) > CELL_W - 8:
+                    full_item = _only
         p.setFont(label_font)
         # 局部重画时跳过框外的图标：省下的正是框选时最贵的那部分
         m = self._win_margin()
         clip_glass = None if clip is None else clip.translated(-m, -m)
         order = self._display_order()
+        # 名字放不下时按「盒子宽度」折行（见 `_full_name_rect`）：盒子不长高，
+        # 名字就地折成两三行，齐着盒子内边，不会顶到图标上去。
+        full_rect = None
+        if full_item is not None and full_item in order:
+            _slot = self._item_rect(order.index(full_item))
+            _ox, _oy = self._slot_offset(full_item)
+            if _ox or _oy:
+                _slot = _slot.translated(int(round(_ox)), int(round(_oy)))
+            _nm = (self._items[full_item].stem
+                   if self._items[full_item].suffix.lower() in (".lnk", ".url")
+                   else self._items[full_item].name)
+            full_rect = self._full_name_rect(_slot, _nm)
         for slot_i, idx in enumerate(order):
             if idx == self._internal_drag:
                 continue            # 拖着的那个原地消失，跟着光标画
@@ -2558,22 +2638,38 @@ class BoxWidget(GlassWindow):
                                         CELL_W - 4, CELL_H - 4), 9.0, 9.0)
                 p.setBrush(Qt.NoBrush)
             icon_rect = QRect(slot.left(), slot.top() + 6, CELL_W, 52)
-            pm = self._icon(path, 52)
-            # 鼠标停在这个图标上：往上跳一下、落回去、再弹一小下
-            # _bounce_offset 返回负值表示「往上」，所以这里是 + lift
-            lift = int(round(self._bounce_offset(idx)))
-            p.drawPixmap(
-                QPoint(icon_rect.center().x() - pm.width() // 2,
-                       icon_rect.top() + (52 - pm.height()) // 2 + lift), pm)
+            label_rect = QRect(slot.left() + 2, slot.top() + 62, CELL_W - 4, 18)
+            # 全名压到谁身上，谁就先让开（这一帧不画那行字/那个图标）——不然
+            # 两行字叠在一起就是一团糊。点走就都回来。
+            covered = (full_rect is not None and idx != full_item
+                       and full_rect.intersects(slot))
+            covers_icon = covered and full_rect.intersects(icon_rect)
+            if not covers_icon:
+                pm = self._icon(path, 52)
+                # 鼠标停在这个图标上：往上跳一下、落回去、再弹一小下
+                # _bounce_offset 返回负值表示「往上」，所以这里是 + lift
+                lift = int(round(self._bounce_offset(idx)))
+                p.drawPixmap(
+                    QPoint(icon_rect.center().x() - pm.width() // 2,
+                           icon_rect.top() + (52 - pm.height()) // 2 + lift), pm)
+            if idx == full_item:
+                continue            # 标签交给 _paint_full_name 画成折行全名
+            if covered and full_rect.intersects(label_rect):
+                continue            # 被全名压住的那一行字让开，别叠成一团
             p.setPen(QColor(26, 32, 42, 244))
-            name = path.stem if path.suffix.lower() in (".lnk", ".url") else path.name
             key = str(path)
             text = self._label_cache.get(key)
             if text is None:
+                name = path.stem if path.suffix.lower() in (".lnk", ".url") else path.name
                 text = _elide(name, label_font, CELL_W - 8)
                 self._label_cache[key] = text
-            p.drawText(QRect(slot.left() + 2, slot.top() + 62, CELL_W - 4, 18),
-                       Qt.AlignHCenter | Qt.AlignTop, text)
+            p.drawText(label_rect, Qt.AlignHCenter | Qt.AlignTop, text)
+
+        if full_rect is not None:
+            _fp = self._items[full_item]
+            _fname = (_fp.stem if _fp.suffix.lower() in (".lnk", ".url")
+                      else _fp.name)
+            self._paint_full_name(p, full_rect, _fname)
 
         # 拉框时把框住的区域铺一层灰（不画边框）
         if band is not None and band.width() > 2 and band.height() > 2:
@@ -2582,6 +2678,55 @@ class BoxWidget(GlassWindow):
             p.setBrush(QColor(104, 110, 122, 122))
             p.drawRect(band)
             p.setBrush(Qt.NoBrush)
+
+    def _full_name_rect(self, slot: QRect, name: str) -> QRect | None:
+        """全名要占的那块矩形（玻璃坐标）。一行放得下就返回 None。
+
+        名字还是画在图标下面那一行、同一个字号；盒子不长高（用户 2026-11-19
+        要求），所以就把行数压少：先按格子宽度折，格子太窄就往两边借宽度（最多
+        借到盒子内边），借到下面那一行装得下为止——名字因此会横着铺开两三行，
+        但一个字不少、字号不变、盒子尺寸不动，也不会顶到图标上去。
+        """
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(11)
+        fm = QFontMetrics(f)
+        flags = int(Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap)
+        if fm.horizontalAdvance(name) <= CELL_W - 8:
+            return None
+        line_h = max(1, fm.height())
+        y = slot.top() + 62
+        glass_bottom = int(self._ch()) - 8
+        row = max(0, (slot.top() - HEADER) // CELL_H)
+        has_next = (row + 1) * COLS < len(self._items)
+        room_below = (HEADER + (row + 1) * CELL_H + 6) if has_next else glass_bottom
+        avail_h = max(line_h, min(room_below, glass_bottom) - y)
+        max_w = max(CELL_W - 4, int(self._cw()) - PAD)   # 最多能借到盒子内边
+        w = CELL_W - 4
+        need = fm.boundingRect(QRect(0, 0, w, 4000), flags, name)
+        while need.height() > avail_h and w < max_w:
+            w = min(max_w, w + CELL_W)
+            need = fm.boundingRect(QRect(0, 0, w, 4000), flags, name)
+        h = min(need.height(), max(line_h, glass_bottom - y))
+        x = slot.center().x() - w // 2
+        # 借宽之后左右可能顶出玻璃，往盒子里推回来
+        x = max(PAD // 2, min(x, int(self._cw()) - PAD // 2 - w))
+        return QRect(x, y, w, h)
+
+    def _paint_full_name(self, p: QPainter, rect: QRect, name: str) -> None:
+        """把全名画进 `_full_name_rect` 算出来的那块矩形（不描边、不画第二遍）。"""
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(11)
+        p.setFont(f)
+        flags = int(Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap)
+        p.save()
+        # 裁到玻璃圆角里：名字宽一点压住旁边可以，画到盒子外面不行
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0.0, 0.0, self._cw(), self._ch()),
+                            float(self.radius), float(self.radius))
+        p.setClipPath(path)
+        p.setPen(QColor(26, 32, 42, 250))
+        p.drawText(rect, flags, name)
+        p.restore()
 
     # ---------------------------------------------------------------- 鼠标
     def _display_order(self) -> list[int]:
@@ -2597,8 +2742,15 @@ class BoxWidget(GlassWindow):
         if n <= 0:
             return 0
         col = int((pos.x() - PAD) // CELL_W)
-        row = int((pos.y() - HEADER) // CELL_H)
         col = max(0, min(COLS - 1, col))
+        rows = max(1, math.ceil(n / COLS))
+        # 行高不一定是 CELL_H（选中长名字那一行下面让出过地方），按实际行位置找
+        row = rows - 1
+        for r in range(rows):
+            top = HEADER + r * CELL_H + self._extra_for_row(r)
+            if pos.y() < top + CELL_H:
+                row = r
+                break
         row = max(0, row)
         return max(0, min(n - 1, row * COLS + col))
 
@@ -3162,17 +3314,18 @@ class BoxWidget(GlassWindow):
             self._band_origin = pos
             self._band = QRect(pos, QSize(1, 1))
             if not (event.modifiers() & Qt.ControlModifier):
-                self._selected = set()
+                self._set_sel(set())
             self.update()
         elif self._expanded and item is not None \
                 and (event.modifiers() & Qt.ControlModifier):
             # Ctrl + 点图标：把这一个加进选择 / 从选择里去掉
-            if item in self._selected:
-                self._selected.discard(item)
+            sel = set(self._selected)
+            if item in sel:
+                sel.discard(item)
             else:
-                self._selected.add(item)
+                sel.add(item)
             self._pressed_item = None
-            self.update()
+            self._set_sel(sel)
         event.accept()
 
     def _apply_drag_move(self) -> None:
@@ -3455,8 +3608,13 @@ class BoxWidget(GlassWindow):
         if not self._expanded:
             self.toggle(True)
         elif pos.y() >= TITLE_H:
-            self._selected = set()
-            self.update()
+            # 单击图标 = 选中它（和桌面一样）：选中之后长名字会在原处折行显示全，
+            # 用户 2026-11-19 要的「点了能看到完整文件名」。点在空白处才清空选择。
+            item = self._item_at(pos)
+            if item is not None and not (event.modifiers() & Qt.ControlModifier):
+                self._set_sel({item})
+            elif item is None:
+                self._set_sel(set())
 
     def _log_state_drag(self) -> None:
         _log_force("DRAGSTAT box=%s icons=%d size=%dx%d paints=%d move_ms=%.1f",
@@ -4062,6 +4220,51 @@ class BoxWidget(GlassWindow):
             pass
 
 
+_JOB_CACHE: bool | None = None
+
+
+def _in_job() -> bool:
+    """本程序是不是被套在一个「作业对象」（Job object）里。
+
+    作业对象会被子进程继承。本程序要是从沙箱、某些启动器里拉起来的，它拉起来的
+    程序就全在同一个作业里——2026-11-18 实测：同样两个快捷方式，让 explorer 打开
+    bilibili / WorkBuddy 都正常；本程序直接 ShellExecute 打开，bilibili 报
+    0xC0000005 闪退、WorkBuddy 建完窗口就自己退出（日志里 before-quit，不是崩溃）。
+    所以要在作业里的时候换条路走，见 QDesktopServices_open。
+    """
+    global _JOB_CACHE
+    if _JOB_CACHE is not None:
+        return _JOB_CACHE
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wt.HANDLE
+        kernel32.IsProcessInJob.argtypes = [wt.HANDLE, wt.HANDLE,
+                                            ctypes.POINTER(wt.BOOL)]
+        flag = wt.BOOL()
+        ok = kernel32.IsProcessInJob(kernel32.GetCurrentProcess(), None,
+                                     ctypes.byref(flag))
+        _JOB_CACHE = bool(ok) and bool(flag.value)
+    except Exception:  # noqa: BLE001 - 查不出来就当没在作业里
+        _JOB_CACHE = False
+    return _JOB_CACHE
+
+
 def QDesktopServices_open(path) -> None:
+    """打开一个文件 / 快捷方式。
+
+    正常情况直接用 Qt 的 QDesktopServices（等于 ShellExecuteW "open"，和双击桌面
+    图标一样）。但本程序自己在作业对象里的时候，它拉起来的子进程会继承那个作业，
+    于是有的程序活不下来（见 _in_job 的说明）。那就让 explorer.exe 代劳：它是外壳，
+    不在我们的作业里，由它启动的程序就是干净的。
+    """
+    target = str(path)
+    if _in_job():
+        try:
+            subprocess.Popen(["explorer.exe", target],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            _log("launch via shell: %s", target)
+            return
+        except OSError:  # noqa: BLE001 - explorer 拉不起来就退回普通方式
+            _log("launch via shell failed, fallback: %s", target)
     from PySide6.QtGui import QDesktopServices
-    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+    QDesktopServices.openUrl(QUrl.fromLocalFile(target))

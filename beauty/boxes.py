@@ -12,6 +12,8 @@ import re
 import shutil
 import time
 import uuid
+import ctypes
+from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -135,6 +137,69 @@ def _size_within(path: Path, cap: int) -> bool:
             continue
         if total > cap:
             return False
+    return True
+
+
+class _SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("wFunc", wintypes.UINT),
+        ("pFrom", wintypes.LPCWSTR),
+        ("pTo", wintypes.LPCWSTR),
+        ("fFlags", ctypes.c_ushort),
+        ("fAnyOperationsAborted", wintypes.BOOL),
+        ("hNameMappings", ctypes.c_void_p),
+        ("lpszProgressTitle", wintypes.LPCWSTR),
+    ]
+
+
+def _shell_move(src: Path, dest: Path) -> bool:
+    """让外壳（资源管理器那一套）把 src 整个搬到 dest。
+
+    跨卷时 `shutil.move` 是「拷完整棵、再删源」；删源那一刻 explorer 常常还攥着
+    文件夹句柄，于是拷是拷过去了、源目录删不掉，桌面上就剩一个**空文件夹**
+    （用户 2026-11-19 报的）。外壳的 FO_MOVE 是 explorer 自己搬东西用的那一套，
+    会自己重试、自己把空目录收掉。
+    """
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        op = _SHFILEOPSTRUCTW()
+        op.wFunc = 1                       # FO_MOVE
+        op.pFrom = str(src) + "\0\0"
+        op.pTo = str(dest) + "\0\0"
+        # SILENT | NOCONFIRMATION | NOCONFIRMMKDIR | NOERRORUI
+        op.fFlags = 0x0004 | 0x0010 | 0x0200 | 0x0400
+        rc = shell32.SHFileOperationW(ctypes.byref(op))
+        if rc != 0 or op.fAnyOperationsAborted:
+            _log("shell move rc=%s %s", rc, src)
+            return False
+        return True
+    except (OSError, AttributeError, TypeError):
+        return False
+
+
+def _move_path(src: Path, dest: Path) -> bool:
+    """把 src 整个搬到 dest；成功返回 True。
+
+    同卷一次 rename 搞定（瞬间、没有中间态）；跨卷交给外壳搬。搬完源目录要是
+    还留着（空壳），能收就收掉——不能让它留在桌面上。
+    """
+    try:
+        os.rename(str(src), str(dest))
+        return True
+    except OSError:
+        pass
+    if dest.exists():
+        return False
+    if not _shell_move(src, dest):
+        return False
+    try:
+        if src.is_dir():
+            src.rmdir()                    # 只删空目录：里面还有东西就会失败
+        elif src.exists():
+            src.unlink()
+    except OSError:
+        _log("source left behind: %s", src)
     return True
 
 
@@ -435,10 +500,21 @@ class BoxStore:
                     continue  # 已经在这个盒子里
                 owner = self._owner_of(src)
                 dest = _unique_path(folder, src.name)
-                _log("move %s -> %s", src, dest)
-                shutil.move(str(src), str(dest))
-            except (OSError, shutil.Error):
+            except OSError:
+                _log("skip %s", src)
+                continue
+            _log("move %s -> %s", src, dest)
+            if not _move_path(src, dest):
                 _log("move failed %s", src)
+                # 搬失败了但盒子目录里已经躺了半份（跨卷拷到一半）：那是垃圾，
+                # 清掉，别让盒子里出现一个残缺的文件夹
+                try:
+                    if dest.is_dir():
+                        shutil.rmtree(dest, ignore_errors=True)
+                    elif dest.exists():
+                        dest.unlink()
+                except OSError:
+                    pass
                 continue
             # 文件已经离开桌面，但 explorer 的桌面视图要攒着批量刷新（半秒到
             # 一秒）。主动通知它「这个没了」，图标当场消失。

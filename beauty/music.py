@@ -68,6 +68,7 @@ READ_TIMEOUT = 4.0       # 读一个会话（取属性/播放状态）最多等�
 COVER_TIMEOUT = 3.0      # 读封面最多等多久（这一首超时就直接不取，别每轮都等）
 CMD_TIMEOUT = 5.0        # 给播放器发一条命令最多等多久
 STALL_S = 20.0           # 一轮都没走完超过这么久，就当线程卡死了
+CONNECT_RETRY_S = 5.0    # 连不上会话管理器时，隔多久再试（睡眠唤醒后 WinRT 会闹一阵）
 
 # 卡片钉住的三种状态（存进 CardData.bind）：
 #   ""  = 自动：谁在放跟谁
@@ -604,15 +605,30 @@ class MusicService(QObject):
             GlobalSystemMediaTransportControlsSessionManager as Manager,
         )
         mgr = None
+        retry_at = 0.0
+        retry_log = 0.0
         try:
             mgr = await asyncio.wait_for(Manager.request_async(), READ_TIMEOUT)
             dlog("music: 已连上系统媒体会话")
         except Exception as exc:  # noqa: BLE001
+            retry_at = time.monotonic() + CONNECT_RETRY_S
+            retry_log = time.monotonic()
             dlog(f"music: 连不上系统媒体会话 {exc!r}")
         n = 0
         while not self._stop.is_set():
             if gen != self._gen:          # 有更新的线程在干了：这个线程退场
                 return
+            if mgr is None and time.monotonic() >= retry_at:
+                # 以前这里一失败就再也不试：2026-11-19 睡眠唤醒后 WinRT 连不上，
+                # 卡片从此永远空着（重启程序才好）。现在隔 5 秒再问一次，自己恢复。
+                try:
+                    mgr = await asyncio.wait_for(Manager.request_async(), READ_TIMEOUT)
+                    dlog("music: 重新连上系统媒体会话")
+                except Exception as exc:  # noqa: BLE001
+                    retry_at = time.monotonic() + CONNECT_RETRY_S
+                    if time.monotonic() - retry_log > 60.0:   # 一直连不上也别刷屏
+                        retry_log = time.monotonic()
+                        dlog(f"music: 还是连不上系统媒体会话 {exc!r}")
             try:
                 await self._drain(mgr)
                 if n % READ_EVERY == 0:

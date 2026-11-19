@@ -142,6 +142,7 @@ class Controller(QObject):
         # 框选多选的窗口（收纳盒 + 卡片，键是 box:<id> / card:<id>）
         self.sel_items: set[str] = set()
         self._cards_hidden = False      # 全屏应用正开着，卡片全体收起来
+        self._fs_hits = 0               # 连续几拍判成全屏（要 2 拍才收卡片）
         self._todo_day: date | None = None   # 今天的待办提醒报过了没有再报
         # 待办 / 纪念日：所有卡片共用这一份数据，改完通知所有卡片重画
         self.agenda = Agenda(self)
@@ -1012,12 +1013,20 @@ class Controller(QObject):
             self.apply_cards(animate=False)
 
     def _watch_fullscreen(self) -> None:
-        wanted = bool(getattr(self.cfg, "hide_fullscreen", True)) \
+        """前台是全屏应用就把卡片收起来。
+
+        ⚠️ 要**连着两拍**看到全屏才收：2026-11-19 12:22 睡眠唤醒后判过一拍假的
+        全屏，卡片当场全消失，而且这一下之后一直不回（用户报的「卡片直接消失」）。
+        收起是「消失」这种显眼动作，宁可慢 0.7 秒也不能凭一次读数就干。
+        """
+        on = bool(getattr(self.cfg, "hide_fullscreen", True)) \
             and fullscreen.foreground_is_fullscreen()
+        self._fs_hits = min(2, self._fs_hits + 1) if on else 0
+        wanted = on and self._fs_hits >= 2
         if wanted == self._cards_hidden:
             return
         self._cards_hidden = wanted
-        _log(f"fullscreen: cards hidden={wanted}")
+        _log(f"fullscreen: cards hidden={wanted} hits={self._fs_hits}")
         self.apply_cards(animate=False)
 
     def remove_card(self, card_id: str) -> None:
